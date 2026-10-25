@@ -660,7 +660,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         continue;
       }
       const s = await settle(u.repo, pr, autoMerge, meta);
-      result({ ...common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: `${s.detail} ${how}` });
+      result({ ...common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: s.state === "merged" ? s.detail : `${s.detail} ${how}` });
     } catch (e) {
       result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
     }
