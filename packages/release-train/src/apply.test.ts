@@ -302,3 +302,13 @@ describe("redaction", () => {
     expect(redactName("my-secret-repo2", "secret-repo", "H")).toBe("my-secret-repo2");
   });
 });
+
+describe("merge method", () => {
+  it("uses a merge commit when the repository permits it", async () => {
+    const { mergeMethod } = await import("./apply.ts");
+    expect(mergeMethod(null)).toBe("merge");
+    expect(mergeMethod({ allow_merge_commit: true })).toBe("merge");
+    expect(mergeMethod({ allow_merge_commit: false, allow_squash_merge: true })).toBe("squash");
+    expect(mergeMethod({ allow_merge_commit: false, allow_squash_merge: false })).toBe("rebase");
+  });
+});

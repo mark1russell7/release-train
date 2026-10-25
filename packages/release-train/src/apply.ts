@@ -224,6 +224,15 @@ interface Pull {
 interface RepoMeta {
   default_branch: string;
   allow_auto_merge?: boolean;
+  allow_merge_commit?: boolean;
+  allow_squash_merge?: boolean;
+  allow_rebase_merge?: boolean;
+}
+
+/** This function gives the merge method of a repository: a merge commit when the repository permits it. */
+export function mergeMethod(meta: { allow_merge_commit?: boolean; allow_squash_merge?: boolean } | null): "merge" | "squash" | "rebase" {
+  if (!meta || meta.allow_merge_commit !== false) return "merge";
+  return meta.allow_squash_merge !== false ? "squash" : "rebase";
 }
 
 /** This function gives the title of the pull request of an update. */
@@ -385,11 +394,12 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
 
   const enableAutoMerge = async (repo: string, pr: Pull, meta: RepoMeta): Promise<"native" | "train"> => {
     if (pr.auto_merge) return "native";
-    const mutation = "mutation($id: ID!) { enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: MERGE }) { clientMutationId } }";
-    let res = await gh.graphql(mutation, { id: pr.node_id });
+    const mutation = "mutation($id: ID!, $m: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $m }) { clientMutationId } }";
+    const vars = { id: pr.node_id, m: mergeMethod(meta).toUpperCase() };
+    let res = await gh.graphql(mutation, vars);
     if (res.errors.length > 0 && !meta.allow_auto_merge && res.errors.some((e) => /auto.?merge is not allowed|not allowed for this repository/i.test(e))) {
       const set = await gh.request("PATCH", `${base}/${repo}`, { allow_auto_merge: true });
-      if (set.ok) res = await gh.graphql(mutation, { id: pr.node_id });
+      if (set.ok) res = await gh.graphql(mutation, vars);
     }
     return res.errors.length === 0 ? "native" : "train";
   };
@@ -403,14 +413,14 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const hasLabel = (pr: Pull, name: string): boolean => (pr.labels ?? []).some((l) => l.name === name);
 
   /** This function merges a green pull request, or labels a red one. It gives the new state. */
-  const settle = async (repo: string, pr: Pull, autoMerge: "native" | "train"): Promise<{ state: RepoState; ci: CiState; detail: string }> => {
+  const settle = async (repo: string, pr: Pull, autoMerge: "native" | "train", meta: RepoMeta | null): Promise<{ state: RepoState; ci: CiState; detail: string }> => {
     const ci = await ciOf(repo, pr.head.sha);
     if (ci === "failed") {
       if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
       return { state: "blocked", ci, detail: "CI failed. The pull request stays open with the blocked label." };
     }
     if (ci === "green" && autoMerge === "train") {
-      const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: "merge", sha: pr.head.sha });
+      const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
         await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${TRAIN_BRANCH}`);
         return { state: "merged", ci, detail: "CI was green. The train merged the pull request." };
@@ -439,7 +449,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const pr = open.get(w.repo);
     const base0 = { repo: w.repo, private: w.private, actionId: w.actionId, kind: null, wave: w.wave, items: 0, autoMerge: null };
     if (pr && !o.dryRun) {
-      const s = await settle(w.repo, pr, pr.auto_merge ? "native" : "train");
+      const meta = (await gh.request<RepoMeta>("GET", `${base}/${w.repo}`)).data;
+      const s = await settle(w.repo, pr, pr.auto_merge ? "native" : "train", meta);
       result({ ...base0, state: s.state === "unchanged" ? "waiting" : s.state, pr: { number: pr.number, url: pr.html_url }, ci: s.ci, detail: `${s.detail} The rest of the update waits for ${w.dependsOn.join(", ") || "npm"}.` });
       continue;
     }
@@ -520,7 +531,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         result({ ...common, state, pr: prRef(pr), autoMerge, ci: "none", detail: `${how}${r.unresolved.length > 0 ? ` Unresolved: ${r.unresolved.join(", ")}.` : ""}` });
         continue;
       }
-      const s = await settle(u.repo, pr, autoMerge);
+      const s = await settle(u.repo, pr, autoMerge, meta);
       result({ ...common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: `${s.detail} ${how}` });
     } catch (e) {
       result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
