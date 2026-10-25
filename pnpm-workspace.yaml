@@ -6,3 +6,8 @@ packages:
 allowBuilds:
   "@mark1russell7/cue@git+https://github.com/mark1russell7/cue.git": true
   esbuild: true
+
+# Our own packages: the release train updates them, so the release age check of pnpm does not apply to them.
+minimumReleaseAgeExclude:
+  - "@mark1russell7/*"
+  - "@procedures/*"
