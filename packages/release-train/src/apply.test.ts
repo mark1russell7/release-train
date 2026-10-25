@@ -127,17 +127,6 @@ describe("selection", () => {
     expect(s.needed.has("stale-repo")).toBe(false);
   });
 
-  it("holds a breaking adoption that needs a cascade release", () => {
-    const repos = [
-      repo("core-repo", { "": { name: "@ex/core", version: "2.0.0" } }),
-      repo("pub-repo", { "": { name: "@ex/pub", version: "1.0.0", dependencies: { "@ex/core": "^1.0.0" } } }, { resolved: { "": { "@ex/core": "1.0.0" } } }),
-    ];
-    const p = plan(buildGraph({ owner: OWNER, repos, npm: { "@ex/core": npm("2.0.0"), "@ex/pub": npm("1.0.0") }, now: new Date("2026-01-01T00:00:00Z") }));
-    const s = selectUpdates(p);
-    expect(s.ready).toEqual([]);
-    expect(s.waiting.map((w) => [w.repo, w.dependsOn])).toEqual([["pub-repo", ["cascade-release-support"]]]);
-  });
-
   it("limits the run to the repositories of --only", () => {
     const s = selectUpdates(fixture(), ["lib-repo"]);
     expect(s.ready.map((u) => u.repo)).toEqual(["lib-repo"]);

@@ -2,7 +2,7 @@
 
 The release train reads the npm packages of the GitHub account `mark1russell7`. It makes the dependency graph of these packages and a plan of the next releases and updates.
 
-Stage 1 only reads. Stage 2 (`apply`) opens a pull request for each update of the current wave. The train publishes nothing.
+Stage 1 only reads. Stage 2 (`apply`) opens a pull request for each update of the current wave. The train does not publish to npm itself: the release workflow of each repository publishes.
 
 ## What it reads
 
@@ -56,7 +56,6 @@ node packages/release-train/src/bin.ts plan --write-db <folder>
 - When CI fails, the pull request stays open with the label `release-train:blocked`.
 - The train closes its pull request when the plan has no update for the repository.
 - The train does not open a pull request again when a person closed one with the same changes.
-- Releases are not in stage 2.
 
 ```sh
 GH_TOKEN=<token> node packages/release-train/src/bin.ts apply --dry-run
@@ -68,11 +67,35 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 - `--report <file>` writes the report without private names.
 - `--author "Name <email>"` sets the author of the commits.
 - `--show-private` shows the private names in the output. Do not use it in CI.
+- `--cascade <repos>` sets the repositories (comma-separated) whose breaking adoptions carry a release, or `all` (the default). The adoptions of other repositories with a release wait.
+- `--release-dispatch` starts the release workflows that start only by hand. Refer to "Releases".
+
+## Releases
+
+When a dependency gets a new major version, the range of the dependent changes. The dependent must then have a new release too, else its users do not get the change. The train puts this release into the same pull request as the range change.
+
+- The release type comes from the public types of the dependent. The train reads the typed files (`.d.ts` and TypeScript sources) of the version of the dependent on npm.
+- When these files name the changed dependency (for example `from "@scope/dep"`), the types of the dependency can reach the users, so the change breaks the API. A change of a peer range also breaks the API. When npm gives no typed files, the case is not clear, so the change counts as a break of the API.
+- When the files do not name the dependency, the release is a patch.
+- A break of the API gives MINOR before `1.0.0` and MAJOR after.
+- A repository with changesets (`.changeset/config.json`) gets the changeset file `.changeset/release-train-cascade.md`. Another repository gets the new version in `package.json`.
+- The body of the pull request has a table "Releases" with each package, its version, the release type and the reason.
+- A private repository gets the pull request, but its packages are not published.
+- When the release of the dependent is blocked, its range change waits too.
+
+After the merge, the release workflow of the repository publishes the new version with OIDC. Some release workflows start only by hand (for example with changesets: one start makes the version pull request, and one start after its merge publishes). With `--release-dispatch`, the train merges a green version pull request (branch `changeset-release/main`) and starts such a workflow when CI on `main` is green. This needs the permission Actions: write of the GitHub App.
+
+The report of `apply` lists the versions in flight: the public versions on `main` that npm does not have. The command `await-release --report <file> --minutes <n>` checks npm every 30 seconds. When npm has one of these versions, it sends the `released` event to the train, and the next wave starts at once.
+
+When CI of a train pull request fails, the pull request gets the label `release-train:blocked`. `plan --write-db` then writes an alert into the collection `alerts` of the tracker. The strategist tells the role that owns the repository.
 
 ## The train workflow
 
 `train.yml` starts every 30 minutes, on a manual start and on the `released` event of `repository_dispatch`. It makes a token of the GitHub App `mark1russell7-release-train` with `actions/create-github-app-token`. Pull requests with that token start CI in the repositories.
 
-- A manual start has the inputs `dry-run` (default true) and `only`. Give only public names to `only`, because GitHub shows the inputs.
+- A manual start has the inputs `dry-run` (default true), `only` and `cascade`. Give only public names to `only` and `cascade`, because GitHub shows the inputs.
 - The schedule and `repository_dispatch` change repositories only when `LIVE` in `train.yml` is `"true"`. It is `"true"` since 2026-10-25. Set it to `"false"` to stop the train.
 - The log, the step summary and the artifact `apply` give each private repository only as a count or a hash. The run also masks each private name in the log.
+- After `apply`, the step "Wait for a release" waits up to 15 minutes for a version in flight.
+- `CASCADE` in `train.yml` gives the value of `--cascade`.
+- The run starts release workflows only when `RELEASE_DISPATCH` in `train.yml` is `"true"`.

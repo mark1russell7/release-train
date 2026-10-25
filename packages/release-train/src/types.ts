@@ -53,6 +53,8 @@ export interface RepoSnapshot {
   pnpmWorkspace?: string | null;
   /** The `packageManager` field of the root `package.json`, for example `pnpm@12.0.0`. */
   packageManager?: string | null;
+  /** The count of the changeset files on the default branch (`.changeset/*.md`, not the README). */
+  pendingChangesets?: number;
 }
 
 /** The state of one package on the npm registry. */
@@ -108,6 +110,8 @@ export interface RepoInfo {
   warnings: string[];
   /** True when the release train must put the scopes of the owner into `minimumReleaseAgeExclude` of pnpm. */
   needsAgeRule?: boolean;
+  /** The count of the changeset files on the default branch. */
+  pendingChangesets?: number;
 }
 
 /** The dependency graph of the packages of one owner. */

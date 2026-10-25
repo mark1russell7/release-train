@@ -223,6 +223,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     else if (blobs.has("package-lock.json")) [lockKind, lockPath] = ["npm", "package-lock.json"];
     else if (blobs.has("yarn.lock")) lockKind = "yarn";
     snap.lockKind = lockKind;
+    snap.pendingChangesets = [...blobs].filter((b) => b.startsWith(".changeset/") && b.endsWith(".md") && b !== ".changeset/README.md").length;
     return { snap, lockPath };
   });
   const snaps = phase1.filter((p): p is Partial1 => p !== null);
@@ -256,7 +257,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   // A package is foreign when its npm repository is not of the owner and no maintainer is the owner.
   const npmUser = (opts.npmUser ?? opts.owner).toLowerCase();
   const isForeign = async (n: string, version: string): Promise<boolean> => {
-    const res = await f(`${registry}/${n.replace("/", "%2f")}/${encodeURIComponent(version)}`, { headers: { "user-agent": "release-train" } });
+    const res = await f(`${registry}/${n.replaceAll("/", "%2f")}/${encodeURIComponent(version)}`, { headers: { "user-agent": "release-train" } });
     if (!res.ok) return false;
     const m = (await res.json()) as { repository?: string | { url?: string }; maintainers?: { name?: string }[] };
     const repoUrl = (typeof m.repository === "string" ? m.repository : (m.repository?.url ?? "")).toLowerCase();
@@ -268,7 +269,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   // Phase 3: the npm state of each package.
   const names = [...owned].sort();
   const infos = await pool(names, limit, async (n): Promise<[string, NpmInfo]> => {
-    const url = `${registry}/${n.replace("/", "%2f")}`;
+    const url = `${registry}/${n.replaceAll("/", "%2f")}`;
     const res = await f(url, { headers: { accept: "application/vnd.npm.install-v1+json", "user-agent": "release-train" } });
     if (res.status === 404) return [n, { exists: false, latest: null }];
     if (!res.ok) {
