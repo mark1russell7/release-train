@@ -90,25 +90,35 @@ export interface ReleaseAgePolicy {
  * When the files do not set it, pnpm 11 and later use 1440 minutes (1 day), and older versions use 0.
  */
 export function releaseAgePolicy(workspaceYaml: string, npmrc: string, pnpmVersion: string): ReleaseAgePolicy {
-  const fromYaml = /^minimumReleaseAge:\s*(\d+)\s*$/m.exec(workspaceYaml)?.[1];
-  const fromRc = /^\s*minimum-release-age\s*=\s*(\d+)\s*$/m.exec(npmrc)?.[1];
-  const major = semver.coerce(pnpmVersion)?.major ?? 0;
-  const minutes = Number(fromYaml ?? fromRc ?? (major >= 11 ? 1440 : 0));
-  const exclude: string[] = [];
   const lines = workspaceYaml.split(/\r?\n/);
-  const start = lines.findIndex((l) => /^minimumReleaseAgeExclude:/.test(l));
-  if (start >= 0) {
-    const inline = /^minimumReleaseAgeExclude:\s*\[(.*)\]\s*$/.exec(lines[start] ?? "")?.[1];
-    if (inline !== undefined) exclude.push(...inline.split(",").map((s) => s.trim()));
-    else {
-      for (const l of lines.slice(start + 1)) {
-        const m = /^\s+-\s*(.+?)\s*$/.exec(l);
-        if (!m) break;
-        exclude.push(m[1] ?? "");
-      }
+  const fromYaml = settingOf(lines, "minimumReleaseAge", ":");
+  const fromRc = settingOf(npmrc.split(/\r?\n/), "minimum-release-age", "=");
+  const major = semver.coerce(pnpmVersion)?.major ?? 0;
+  const number = (v: string | null): number | null => (v !== null && /^\d+$/.test(v) ? Number(v) : null);
+  const minutes = number(fromYaml) ?? number(fromRc) ?? (major >= 11 ? 1440 : 0);
+  const exclude: string[] = [];
+  const list = settingOf(lines, "minimumReleaseAgeExclude", ":");
+  if (list !== null && list.startsWith("[") && list.endsWith("]")) exclude.push(...list.slice(1, -1).split(","));
+  else if (list === "") {
+    const start = lines.findIndex((l) => l.trim().startsWith("minimumReleaseAgeExclude"));
+    for (const l of lines.slice(start + 1)) {
+      const t = l.trim();
+      if (l === l.trimStart() || !t.startsWith("-")) break;
+      exclude.push(t.slice(1));
     }
   }
-  return { minutes, exclude: exclude.map((s) => s.replace(/^["']|["']$/g, "")).filter(Boolean) };
+  return { minutes, exclude: exclude.map((x) => x.trim().replace(/^["']|["']$/g, "")).filter(Boolean) };
+}
+
+/** This function gives the value of a "key: value" or "key=value" line, or null. */
+function settingOf(lines: readonly string[], key: string, sep: string): string | null {
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line.startsWith(key)) continue;
+    const rest = line.slice(key.length).trimStart();
+    if (rest.startsWith(sep)) return rest.slice(sep.length).trim();
+  }
+  return null;
 }
 
 /** This function tells if a pattern of `minimumReleaseAgeExclude` matches a version of a package. */
@@ -117,9 +127,25 @@ export function ageExcluded(patterns: readonly string[], name: string, version: 
     const at = p.indexOf("@", 1);
     const namePart = at > 0 ? p.slice(0, at) : p;
     const versions = at > 0 ? p.slice(at + 1).split("||").map((s) => s.trim()) : null;
-    const re = new RegExp(`^${namePart.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\/]/g, "\\$&")).join(".*")}$`);
-    return re.test(name) && (versions === null || versions.includes(version));
+    return globMatch(namePart, name) && (versions === null || versions.includes(version));
   });
+}
+
+/** This function matches a text against a pattern in which `*` stands for any text. It uses no regular expression. */
+function globMatch(pattern: string, text: string): boolean {
+  const parts = pattern.split("*");
+  if (parts.length === 1) return pattern === text;
+  const first = parts[0] ?? "";
+  const last = parts[parts.length - 1] ?? "";
+  if (text.length < first.length + last.length || !text.startsWith(first) || !text.endsWith(last)) return false;
+  let pos = first.length;
+  const end = text.length - last.length;
+  for (const p of parts.slice(1, -1)) {
+    const i = text.indexOf(p, pos);
+    if (i < 0 || i + p.length > end) return false;
+    pos = i + p.length;
+  }
+  return true;
 }
 
 /** The options of the updater that uses git and the package manager of the repository. */
@@ -156,7 +182,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
   const now = o.now ?? Date.now;
   const publishTimes = async (dep: string): Promise<Record<string, string>> => {
     try {
-      const res = await f(`${registry}/${dep.replace("/", "%2f")}`, { headers: { accept: "application/json" } });
+      const res = await f(`${registry}/${dep.replaceAll("/", "%2f")}`, { headers: { accept: "application/json" } });
       if (!res.ok) return {};
       return ((await res.json()) as { time?: Record<string, string> }).time ?? {};
     } catch {
