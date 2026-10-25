@@ -1,4 +1,6 @@
 // All repository and package names in these tests are made up.
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   BLOCKED_LABEL,
@@ -391,5 +393,47 @@ describe("minimumReleaseAge", () => {
     expect(r.status).toBe("young");
     expect(r.young).toEqual([{ dep: "@ex/core", version: "2.0.0", readyAt: "2026-01-02T12:00:00.000Z" }]);
     expect(cmds.some((c) => c.startsWith("pnpm update"))).toBe(false);
+  });
+});
+
+describe("gitUpdater with pnpm", () => {
+  it("pins each target version first, then restores the final range, and does not use pnpm update", async () => {
+    const u = selectUpdates(fixture(), ["lib-repo"]).ready[0] as RepoUpdate;
+    const pnpmU = { ...u, lockKind: "pnpm" as const };
+    const cmds: string[] = [];
+    const seen: Record<string, string>[] = [];
+    const specs = (cwd: string): Record<string, string> => {
+      const out: Record<string, string> = {};
+      for (const i of pnpmU.items) {
+        const m = JSON.parse(readFileSync(join(cwd, i.path, "package.json"), "utf8")) as Record<string, Record<string, string>>;
+        out[`${i.path}|${i.dep}`] = m[i.type]?.[i.dep] ?? "";
+      }
+      return out;
+    };
+    const run: RunFn = async (cmd, args, opts) => {
+      cmds.push(`${cmd} ${args.join(" ")}`);
+      if (cmd === "git" && args[0] === "clone") {
+        for (const path of [...new Set(pnpmU.items.map((i) => i.path))]) {
+          const m: Record<string, Record<string, string>> = {};
+          for (const i of pnpmU.items.filter((x) => x.path === path)) m[i.type] = { ...m[i.type], [i.dep]: i.range };
+          mkdirSync(join(opts.cwd, path), { recursive: true });
+          writeFileSync(join(opts.cwd, path, "package.json"), `${JSON.stringify({ name: "x", ...m }, null, 2)}\n`);
+        }
+      }
+      if (cmd === "pnpm" && args[0] === "install") seen.push(specs(opts.cwd));
+      return { code: 0, stdout: cmd === "pnpm" && args[0] === "--version" ? "10.0.0\n" : "", stderr: "" };
+    };
+    const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run });
+    await up.update(pnpmU, { defaultBranch: "main", rebuild: false });
+    expect(cmds.some((c) => c.startsWith("pnpm update"))).toBe(false);
+    expect(cmds.filter((c) => c.startsWith("pnpm install"))).toEqual([
+      "pnpm install --lockfile-only",
+      "pnpm install --lockfile-only",
+      "pnpm install --lockfile-only --frozen-lockfile",
+    ]);
+    for (const i of pnpmU.items) {
+      expect(seen[0]?.[`${i.path}|${i.dep}`]).toBe(i.to);
+      expect(seen[1]?.[`${i.path}|${i.dep}`]).toBe(i.newRange ?? i.range);
+    }
   });
 });

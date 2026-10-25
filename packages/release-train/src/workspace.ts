@@ -171,9 +171,10 @@ function tail(s: string, n = 800): string {
 }
 
 /**
- * This function makes the updater that works in a shallow clone of each repository. It changes the ranges and starts
- * `pnpm update --lockfile-only --no-save <dep>@<version>`, `pnpm install --lockfile-only` and a frozen check (or the npm equivalents).
- * Then it checks the lockfile and pushes one commit to the branch of the train. The token goes to git in the environment, not in a URL.
+ * This function makes the updater that works in a shallow clone of each repository. For pnpm, it first sets each range to the
+ * exact target version and starts `pnpm install --lockfile-only`. Then it sets each range to its final value and starts the install
+ * again and a frozen check. For npm, it uses the npm equivalents. Then it checks the lockfile and pushes one commit to the branch
+ * of the train. The token goes to git in the environment, not in a URL.
  */
 export function gitUpdater(o: GitUpdaterOptions): Updater {
   const run = o.run ?? runCommand;
@@ -241,20 +242,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
         const u: RepoUpdate = { ...u0, items: u0.items.filter((i) => !youngBy.has(i.dep)) };
         if (u.items.length === 0) return { status: "young", sha: null, changes: [], unresolved: [], young, tool, error: null };
 
-        // 1. The ranges of the breaking items.
-        const byPath = new Map<string, { type: string; dep: string; range: string; newRange: string }[]>();
-        for (const i of u.items) {
-          if (!i.newRange) continue;
-          byPath.set(i.path, [...(byPath.get(i.path) ?? []), { type: i.type, dep: i.dep, range: i.range, newRange: i.newRange }]);
-        }
-        for (const [path, edits] of byPath) {
-          const file = join(dir, path, "package.json");
-          const { text, failed } = editManifest(readFileSync(file, "utf8"), edits);
-          if (failed.length > 0) return fail(`The range of ${failed.join(", ")} in ${path || "."}/package.json is not the range of the plan.`);
-          writeFileSync(file, text);
-        }
-
-        // 2. The lockfile, made by the package manager of the repository.
+        // 1. The lockfile and the ranges. The package manager of the repository makes the lockfile.
         const lockFile = u.lockKind === "pnpm" ? "pnpm-lock.yaml" : u.lockKind === "npm" ? "package-lock.json" : null;
         const paths = [...new Set(u.items.map((i) => i.path))];
         const names = [...new Set(u.items.map((i) => i.dep))];
@@ -264,21 +252,50 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           return u.lockKind === "pnpm" ? parsePnpmLock(text) : parseNpmLock(text, paths, names);
         };
         const before = read();
+        /** This function changes ranges in the manifests. It gives the "path|dep" keys that it could not change. */
+        const editAll = (edits: readonly { path: string; type: string; dep: string; range: string; newRange: string }[]): Set<string> => {
+          const failed = new Set<string>();
+          for (const path of [...new Set(edits.map((e) => e.path))]) {
+            const file = join(dir, path, "package.json");
+            const r = editManifest(readFileSync(file, "utf8"), edits.filter((e) => e.path === path));
+            for (const d of r.failed) failed.add(`${path}|${d}`);
+            writeFileSync(file, r.text);
+          }
+          return failed;
+        };
+        const notPlanRange = (keys: Iterable<string>): string =>
+          `The range of ${[...keys].map((k) => `${k.split("|")[1]} in ${k.split("|")[0] || "."}/package.json`).join(", ")} is not the range of the plan.`;
+        const breaking = u.items.filter((i) => i.newRange);
         const inRange = [...new Set(u.items.filter((i) => !i.newRange).map((i) => i.dep))];
         if (u.lockKind === "pnpm") {
-          const recursive = existsSync(join(dir, "pnpm-workspace.yaml")) ? ["-r"] : [];
-          // An exact version gives the target of the plan. Step 0 left out each version younger than the minimumReleaseAge.
-          const exact = [...new Map(u.items.map((i) => [i.dep, `${i.dep}@${i.to}`])).values()];
-          await sh("pnpm", ["update", ...recursive, "--lockfile-only", "--no-save", ...exact], "pnpm update --lockfile-only");
-          // This install aligns each other part of the lockfile with the changed ranges. Then the frozen check must pass, as in CI.
+          // First each range gets the exact target version, so pnpm resolves only these packages, to the version of the plan.
+          // Then each range gets its final value, and pnpm keeps the locked version. `pnpm update` also updates the
+          // dependencies of each package, so the train uses it only for a range that it cannot change (for example `catalog:`).
+          const failed = editAll(u.items.map((i) => ({ path: i.path, type: i.type, dep: i.dep, range: i.range, newRange: i.to })));
+          const failedBreaking = breaking.filter((i) => failed.has(`${i.path}|${i.dep}`)).map((i) => `${i.path}|${i.dep}`);
+          if (failedBreaking.length > 0) return fail(notPlanRange(failedBreaking));
           await sh("pnpm", ["install", "--lockfile-only"], "pnpm install --lockfile-only");
+          const done = u.items.filter((i) => !failed.has(`${i.path}|${i.dep}`));
+          editAll(done.map((i) => ({ path: i.path, type: i.type, dep: i.dep, range: i.to, newRange: i.newRange ?? i.range })));
+          const rest = [...new Set(u.items.filter((i) => failed.has(`${i.path}|${i.dep}`)).map((i) => `${i.dep}@${i.to}`))];
+          if (rest.length > 0) {
+            const recursive = existsSync(join(dir, "pnpm-workspace.yaml")) ? ["-r"] : [];
+            await sh("pnpm", ["update", ...recursive, "--lockfile-only", "--no-save", ...rest], "pnpm update --lockfile-only");
+          }
+          await sh("pnpm", ["install", "--lockfile-only"], "pnpm install --lockfile-only");
+          // The frozen check must pass, as in CI.
           await sh("pnpm", ["install", "--lockfile-only", "--frozen-lockfile"], "pnpm install --frozen-lockfile");
         } else if (u.lockKind === "npm") {
           const v = await run("npm", ["--version"], { cwd: dir, env });
           tool = `npm ${v.stdout.trim() || "?"}`;
+          const failed = editAll(breaking.map((i) => ({ path: i.path, type: i.type, dep: i.dep, range: i.range, newRange: i.newRange ?? i.range })));
+          if (failed.size > 0) return fail(notPlanRange(failed));
           const quiet = ["--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"];
-          if (byPath.size > 0) await sh("npm", ["install", ...quiet], "npm install --package-lock-only");
+          if (breaking.length > 0) await sh("npm", ["install", ...quiet], "npm install --package-lock-only");
           if (inRange.length > 0) await sh("npm", ["update", ...quiet, ...inRange], "npm update --package-lock-only");
+        } else {
+          const failed = editAll(breaking.map((i) => ({ path: i.path, type: i.type, dep: i.dep, range: i.range, newRange: i.newRange ?? i.range })));
+          if (failed.size > 0) return fail(notPlanRange(failed));
         }
         const after = read();
 
