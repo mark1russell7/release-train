@@ -668,65 +668,75 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
 
   // 4. The releases. A public package whose version on main is newer than npm is in flight: its release workflow publishes it.
   // A repository whose release workflow starts only by hand (for example with changesets) needs a dispatch after green CI on main.
+  // Only a version that a release workflow publishes soon is in flight: a workflow that starts on a push, a workflow that runs,
+  // or a workflow that this run started. A version of a workflow that waits for a start by hand is not in flight.
   const inFlight: { name: string; version: string }[] = [];
   const infoOf = new Map(o.plan.repos.map((r) => [r.name, r]));
-  const releaseRepos = new Set<string>();
+  const pendingOf = new Map<string, { name: string; version: string }[]>();
   for (const a of o.plan.actions) {
     if (a.kind !== "release" || a.repoPrivate || a.blocked || (o.only && !o.only.includes(a.repo))) continue;
-    const pending = a.packages.filter((x) => x.bump === null && x.to !== null);
-    for (const x of pending) inFlight.push({ name: x.name, version: x.to as string });
-    if (pending.length > 0) releaseRepos.add(a.repo);
+    const pending = a.packages.filter((x) => x.bump === null && x.to !== null).map((x) => ({ name: x.name, version: x.to as string }));
+    if (pending.length > 0) pendingOf.set(a.repo, pending);
   }
+  const releaseRepos = new Set(pendingOf.keys());
   for (const r of o.plan.repos) if (!r.private && (r.pendingChangesets ?? 0) > 0 && (!o.only || o.only.includes(r.name))) releaseRepos.add(r.name);
-  if (o.releaseDispatch) {
-    for (const repo of releaseRepos) {
-      const info = infoOf.get(repo);
-      const changesets = info?.pendingChangesets ?? 0;
-      const base0 = { repo, private: false, actionId: `release:${repo}`, kind: "release", wave: null, items: 0, autoMerge: null };
-      try {
-        const wf = await gh.request<{ content?: string }>("GET", `${base}/${repo}/contents/.github/workflows/release.yml`);
-        const text = wf.data?.content ? Buffer.from(wf.data.content, "base64").toString("utf8") : "";
-        if (!dispatchOnly(text)) continue;
-        const metaRes = await gh.request<RepoMeta>("GET", `${base}/${repo}`);
-        const meta = metaRes.data;
-        if (!meta) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
-        // A version pull request of changesets merges on green. Its merge makes the version on main newer than npm.
-        const vpr = (await gh.request<Pull[]>("GET", `${base}/${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(VERSION_BRANCH)}&per_page=5`)).data?.[0];
-        if (vpr) {
-          if (o.dryRun) {
-            result({ ...base0, state: "planned", pr: { number: vpr.number, url: vpr.html_url }, ci: null, detail: "The run merges the version pull request when CI is green." });
-            continue;
-          }
-          const s = await settle(repo, vpr, "train", meta, VERSION_BRANCH);
-          result({ ...base0, state: s.state, pr: { number: vpr.number, url: vpr.html_url }, ci: s.ci, detail: `Version pull request: ${s.detail}` });
-          continue;
-        }
-        const runs = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(meta.default_branch)}&per_page=5`);
-        if ((runs.data?.workflow_runs ?? []).some((x) => x.status !== "completed")) {
-          result({ ...base0, state: "waiting", pr: null, ci: null, detail: "The release workflow runs." });
-          continue;
-        }
-        const head = (await gh.request<{ sha: string }>("GET", `${base}/${repo}/commits/${encodeURIComponent(meta.default_branch)}`)).data?.sha;
-        const ci = head ? await ciOf(repo, head) : "none";
-        if (ci !== "green") {
-          result({ ...base0, state: "waiting", pr: null, ci, detail: `The release waits for green CI on ${meta.default_branch}.` });
-          continue;
-        }
-        const what = changesets > 0 ? "the version pull request" : "the publish";
-        if (o.dryRun) {
-          result({ ...base0, state: "planned", pr: null, ci, detail: `The run starts the release workflow for ${what}.` });
-          continue;
-        }
-        const d = await gh.request("POST", `${base}/${repo}/actions/workflows/release.yml/dispatches`, { ref: meta.default_branch });
-        if (!d.ok) {
-          const need = d.status === 403 || d.status === 404 ? " The GitHub App needs the permission Actions: write." : "";
-          result({ ...base0, state: "error", pr: null, ci, detail: `The dispatch of the release workflow failed (HTTP ${d.status}).${need}` });
-          continue;
-        }
-        result({ ...base0, state: "opened", pr: null, ci, detail: `The train started the release workflow for ${what}.` });
-      } catch (e) {
-        result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
+  const fly = (repo: string): void => void inFlight.push(...(pendingOf.get(repo) ?? []));
+  for (const repo of releaseRepos) {
+    const info = infoOf.get(repo);
+    const changesets = info?.pendingChangesets ?? 0;
+    const base0 = { repo, private: false, actionId: `release:${repo}`, kind: "release", wave: null, items: 0, autoMerge: null };
+    try {
+      const wf = await gh.request<{ content?: string }>("GET", `${base}/${repo}/contents/.github/workflows/release.yml`);
+      const text = wf.data?.content ? Buffer.from(wf.data.content, "base64").toString("utf8") : "";
+      if (!text) continue;
+      if (!dispatchOnly(text)) {
+        // A last release run that failed does not publish again by itself, so its versions are not in flight.
+        const last = (await gh.request<{ workflow_runs: { status: string; conclusion: string | null }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?per_page=1`)).data?.workflow_runs?.[0];
+        if (!last || last.status !== "completed" || last.conclusion === "success") fly(repo);
+        continue;
       }
+      if (!o.releaseDispatch) continue;
+      const metaRes = await gh.request<RepoMeta>("GET", `${base}/${repo}`);
+      const meta = metaRes.data;
+      if (!meta) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
+      // A version pull request of changesets merges on green. Its merge makes the version on main newer than npm.
+      const vpr = (await gh.request<Pull[]>("GET", `${base}/${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(VERSION_BRANCH)}&per_page=5`)).data?.[0];
+      if (vpr) {
+        if (o.dryRun) {
+          result({ ...base0, state: "planned", pr: { number: vpr.number, url: vpr.html_url }, ci: null, detail: "The run merges the version pull request when CI is green." });
+          continue;
+        }
+        const s = await settle(repo, vpr, "train", meta, VERSION_BRANCH);
+        result({ ...base0, state: s.state, pr: { number: vpr.number, url: vpr.html_url }, ci: s.ci, detail: `Version pull request: ${s.detail}` });
+        continue;
+      }
+      const runs = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(meta.default_branch)}&per_page=5`);
+      if ((runs.data?.workflow_runs ?? []).some((x) => x.status !== "completed")) {
+        fly(repo);
+        result({ ...base0, state: "waiting", pr: null, ci: null, detail: "The release workflow runs." });
+        continue;
+      }
+      const head = (await gh.request<{ sha: string }>("GET", `${base}/${repo}/commits/${encodeURIComponent(meta.default_branch)}`)).data?.sha;
+      const ci = head ? await ciOf(repo, head) : "none";
+      if (ci !== "green") {
+        result({ ...base0, state: "waiting", pr: null, ci, detail: `The release waits for green CI on ${meta.default_branch}.` });
+        continue;
+      }
+      const what = changesets > 0 ? "the version pull request" : "the publish";
+      if (o.dryRun) {
+        result({ ...base0, state: "planned", pr: null, ci, detail: `The run starts the release workflow for ${what}.` });
+        continue;
+      }
+      const d = await gh.request("POST", `${base}/${repo}/actions/workflows/release.yml/dispatches`, { ref: meta.default_branch });
+      if (!d.ok) {
+        const need = d.status === 403 || d.status === 404 ? " The GitHub App needs the permission Actions: write." : "";
+        result({ ...base0, state: "error", pr: null, ci, detail: `The dispatch of the release workflow failed (HTTP ${d.status}).${need}` });
+        continue;
+      }
+      fly(repo);
+      result({ ...base0, state: "opened", pr: null, ci, detail: `The train started the release workflow for ${what}.` });
+    } catch (e) {
+      result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
     }
   }
 

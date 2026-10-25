@@ -85,7 +85,7 @@ When a dependency gets a new version outside the range of a dependent (a new maj
 
 After the merge, the release workflow of the repository publishes the new version with OIDC. Some release workflows start only by hand (for example with changesets: one start makes the version pull request, and one start after its merge publishes). With `--release-dispatch`, the train merges a green version pull request (branch `changeset-release/main`) and starts such a workflow when CI on `main` is green. This needs the permission Actions: write of the GitHub App.
 
-The report of `apply` lists the versions in flight: the public versions on `main` that npm does not have. The command `await-release --report <file> --minutes <n>` checks npm every 30 seconds. When npm has one of these versions, it sends the `released` event to the train, and the next wave starts at once.
+The report of `apply` lists the versions in flight: the public versions on `main` that npm does not have and that a release workflow publishes soon. Such a workflow starts on a push and its last run did not fail, or it runs, or the train started it. The command `await-release --report <file> --minutes <n>` checks npm every 30 seconds. When npm has one of these versions, it sends the `released` event to the train, and the next wave starts at once.
 
 When CI of a train pull request fails, the pull request gets the label `release-train:blocked`. `plan --write-db` then writes an alert into the collection `alerts` of the tracker. The strategist tells the role that owns the repository.
 

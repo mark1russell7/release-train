@@ -40,7 +40,7 @@ env:
   RELEASE_DISPATCH: "false"
   # The public repositories (comma-separated) whose breaking adoptions carry a cascade release, "all", or "none".
   # The adoptions of other repositories with a cascade release wait.
-  CASCADE: "none"
+  CASCADE: "all"
 
 jobs:
   train:
