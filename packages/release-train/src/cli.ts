@@ -244,7 +244,7 @@ async function runAwait(o: CliOptions): Promise<number> {
     return 0;
   }
   const published = async (name: string, version: string): Promise<boolean> => {
-    const res = await fetch(`https://registry.npmjs.org/${name.replace("/", "%2F")}/${encodeURIComponent(version)}`, { headers: { accept: "application/json" } });
+    const res = await fetch(`https://registry.npmjs.org/${name.replaceAll("/", "%2F")}/${encodeURIComponent(version)}`, { headers: { accept: "application/json" } });
     return res.ok;
   };
   const first = await awaitRelease({
