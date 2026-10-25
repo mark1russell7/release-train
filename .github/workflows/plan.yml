@@ -1,0 +1,48 @@
+# The release train plan. This workflow reads the public repositories of the owner and the npm registry,
+# computes the plan, and keeps plan.json as a workflow artifact. It commits nothing and changes no repository.
+# It uses only the default token, so it sees only public repositories. --public-only also removes each private one.
+name: Plan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plan
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Compute the plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node packages/release-train/src/bin.ts plan --owner "${{ github.repository_owner }}" --public-only --out plan.json | tee plan.txt
+          {
+            echo '```'
+            cat plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plan
+          path: |
+            plan.json
+            plan.txt
+          retention-days: 30

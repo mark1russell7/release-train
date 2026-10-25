@@ -1,0 +1,8 @@
+packages:
+  - "packages/*"
+
+# Packages allowed to run install scripts. Since pnpm 11 every other package that has one fails the install.
+# A git-hosted package is approved by its repository URL, so a new commit of cue needs no new approval.
+allowBuilds:
+  "@mark1russell7/cue@git+https://github.com/mark1russell7/cue.git": true
+  esbuild: true

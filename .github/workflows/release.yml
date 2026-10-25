@@ -1,0 +1,100 @@
+# The standard npm release of a repository made from mark1russell7/template (RELEASING.md, CI.md).
+#
+#   verify    The gates of ci.yml.
+#   build     reusable-release-build.yml: stops when the commit is not on main, builds and packs
+#             each published package (scripts/release/pack.mjs), and writes the plan of the git tags
+#             and the GitHub releases (scripts/release/tags.mjs).
+#   publish   The npm-publish action of the template: publishes each tarball whose version npm does
+#             not have. Only this job holds "id-token: write", and it runs no code of the
+#             repository: no checkout, no install.
+#   tag       reusable-release-tag.yml: makes a git tag and a GitHub release for each version that
+#             publish published. Only this job holds "contents: write", and it also runs no code of
+#             the repository: gh creates each tag on GitHub, from the data of the plan.
+#
+# The publish job stays in this file. Only its steps are shared (the npm-publish action). npm
+# trusted publishing matches the OIDC token of the run to the trusted publisher of each package:
+# this repository and the workflow file release.yml. A shared workflow of a different repository can
+# change what npm sees (CI.md). A composite action runs in this job, so npm sees this file. The other
+# jobs need no OIDC token, so they are shared workflows of the template. Renovate does not change
+# this file: the release session moves its pins (RELEASING.md).
+#
+# A release: change the version in a package.json and merge it to main. The workflow also starts
+# by hand (workflow_dispatch), for example to publish again after a failure. It skips each
+# version that is already on npm. A release publishes only a commit on main: the first step of the
+# build job stops a run on a commit that main does not have (RELEASING.md).
+#
+# npm trusted publishing uses the OIDC token of GitHub Actions: no npm token, and each version
+# gets a provenance statement. The trusted publisher of each package names this repository and
+# the workflow file release.yml, with NO environment (npm refused an environment for a repository
+# with the immutable OIDC subject, npm/cli#9969). A version with a hyphen (1.2.0-rc.1) gets the
+# dist-tag "next". The others get "latest".
+#
+# npm trusts a workflow only for a package that exists. The owner bootstraps a new package once:
+# scripts/release/npm-bootstrap.mjs (RELEASING.md tells the procedure). Without it, this workflow
+# publishes the other packages and then fails with the names of the new ones.
+#
+# The git tag of a version is "v<version>" in a repository with one published package, else
+# "<name>@<version>" (the convention of Changesets). Its GitHub release has the section of the
+# version in the CHANGELOG.md of the package. A tag ruleset of the repository must not block the
+# creation of tags by GitHub Actions (RELEASING.md).
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: ["package.json", "packages/*/package.json"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    name: Build and pack
+    needs: verify
+    uses: mark1russell7/template/.github/workflows/reusable-release-build.yml@c51e91e385e2d84e1f01d269489a24b9a6910286 # main
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+    outputs:
+      # The versions that this run published, "name@version" with a space between them
+      published: ${{ steps.publish.outputs.published }}
+    steps:
+      # The action of the template, pinned to a commit. It runs in this job, so the OIDC token names
+      # this repository and release.yml. It downloads the artifact "release" and publishes each
+      # version that npm does not have, with provenance (.github/actions/npm-publish of the template).
+      #
+      # Also in the template, the pin stays remote, not "uses: ./.github/actions/npm-publish". A
+      # local action needs a checkout first. This job holds "id-token: write" and checks out no code
+      # on purpose, so it runs only the pinned commit of main. new-repo.ps1 copies this file with
+      # the pin. Renovate does not move it: the release session moves it at a quiet time, because a
+      # workflow change between a version merge and its tag job makes GitHub refuse the tag (HTTP 403).
+      - id: publish
+        uses: mark1russell7/template/.github/actions/npm-publish@c51e91e385e2d84e1f01d269489a24b9a6910286 # main
+
+  tag:
+    name: Git tag and GitHub release
+    needs: [build, publish]
+    # Also after a failed publish: each version that it published before the failure gets its tag.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    uses: mark1russell7/template/.github/workflows/reusable-release-tag.yml@c51e91e385e2d84e1f01d269489a24b9a6910286 # main
+    permissions:
+      contents: write
+    with:
+      published: ${{ needs.publish.outputs.published }}

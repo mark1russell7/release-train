@@ -1,0 +1,103 @@
+# Claude Code
+.claude/
+.mcp.json
+
+# Local data
+_db/
+
+# Project-root MD files. Only intentional ones are allowlisted below; everything else
+# (e.g. scratch dumps from Explore agents during research) is ignored so they don't
+# accidentally get committed via `git add .`. If a future doc legitimately belongs at
+# repo root, add an explicit allowlist line here.
+/*.md
+!/AI-REVIEW.md
+!/CLAUDE.md
+!/README.md
+!/RELEASING.md
+!/CI.md
+
+# Local ste-lint dictionaries. The ASD-STE100 dictionary is copyrighted: do not commit it.
+.ste/
+*.ste-dictionary.json
+
+# Tokens / API keys
+*.token
+*sensitive*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+ehthumbs.db
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+credentials.*
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python (only Python names: a bare "build/", "lib/", "var/" or "env/" pattern also hides TypeScript folders)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build output
+dist/
+
+# The npm build of each package (tsdown): release.yml builds it, and git does not keep it
+build/
+
+# Node / JS
+node_modules/
+.npm
+.yarn/
+.pnp.*
+.next/
+.nuxt/
+.parcel-cache/
+.turbo/
+.svelte-kit/
+.cache/
+
+# DuckDB / data
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp/
+*.db
+*.sqlite
+*.sqlite3
+
+# Build / temp
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig

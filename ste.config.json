@@ -1,0 +1,38 @@
+{
+  "$schema": "./node_modules/@mark1russell7/ste-lint/ste.config.schema.json",
+  "include": [
+    "README.md",
+    "AI-REVIEW.md",
+    "CLAUDE.md",
+    "RELEASING.md",
+    "CI.md",
+    "packages/*/README.md",
+    "packages/*/src/**/*.{ts,tsx}",
+    "packages/*/*.config.{ts,mts}"
+  ],
+  "ignore": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/*.d.ts",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx"
+  ],
+  "technicalNouns": [],
+  "technicalVerbs": [],
+  "properNouns": [
+    "ASD",
+    "ASD-STE100",
+    "Claude",
+    "GitHub",
+    "pnpm",
+    "Simplified Technical English",
+    "TSDoc",
+    "TypeScript",
+    "npm",
+    "OIDC",
+    "SemVer",
+    "Mark"
+  ]
+}
