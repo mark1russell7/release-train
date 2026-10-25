@@ -246,3 +246,12 @@ describe("release dispatch", () => {
     expect(two.calls.some((c) => c.includes("release.yml"))).toBe(false);
   });
 });
+
+describe("cascade switch", () => {
+  it("holds the adoption of a repository whose cascade is off", () => {
+    const s = selectUpdates(cascadePlan(), null, ["other-repo"]);
+    expect(s.ready.some((x) => x.repo === "pub-repo")).toBe(false);
+    expect(s.waiting.find((w) => w.repo === "pub-repo")?.dependsOn).toEqual(["cascade-off:release:pub-repo"]);
+    expect(selectUpdates(cascadePlan(), null, ["pub-repo"]).ready.some((x) => x.repo === "pub-repo")).toBe(true);
+  });
+});

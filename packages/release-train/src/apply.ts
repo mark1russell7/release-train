@@ -108,7 +108,7 @@ function isAdopt(a: Action): a is Action & { kind: "adopt-in-range" | "adopt-bre
  * This function selects the adoptions that the train applies in this run. An adoption is ready when it waits for no action
  * of the plan and npm has the target version of each of its items. Each other adoption waits for a later run.
  */
-export function selectUpdates(p: Plan, only: readonly string[] | null = null): Selection {
+export function selectUpdates(p: Plan, only: readonly string[] | null = null, cascade: readonly string[] | "all" = "all"): Selection {
   const latest = new Map(p.nodes.filter((n) => n.kind === "package").map((n) => [n.name, n.npmLatest]));
   const lock = new Map(p.repos.map((r) => [r.name, r.lockKind]));
   const scopes = ownScopes(p.owner);
@@ -130,7 +130,9 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null): S
       return Boolean(l && semver.valid(l) && semver.valid(i.to) && semver.gte(l, i.to));
     });
     const rel = a.kind === "adopt-breaking" ? releaseOf.get(a.repo) : undefined;
-    const relWaits = rel ? (rel.blocked ? [`blocked:${rel.id}`] : rel.dependsOn.filter((d) => d !== a.id)) : [];
+    // A cascade that is not on for the repository (option --cascade) holds the adoption too.
+    const off = rel && cascade !== "all" && !cascade.includes(a.repo);
+    const relWaits = rel ? (off ? [`cascade-off:${rel.id}`] : rel.blocked ? [`blocked:${rel.id}`] : rel.dependsOn.filter((d) => d !== a.id)) : [];
     if (a.dependsOn.length > 0 || !onNpm || relWaits.length > 0) {
       waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: [...a.dependsOn, ...relWaits] });
       continue;
@@ -290,6 +292,8 @@ export interface ApplyOptions {
   now?: Date;
   /** Start the release workflow of a repository whose release starts only by hand, and merge its green version pull request. */
   releaseDispatch?: boolean;
+  /** The repositories whose breaking adoptions carry a cascade release, or "all". The adoptions of other repositories with a release wait. Default: "all". */
+  cascade?: readonly string[] | "all";
 }
 
 interface Pull {
@@ -474,7 +478,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const gh = o.gh;
   const owner = o.owner;
   const base = `/repos/${owner}`;
-  const sel = selectUpdates(o.plan, o.only ?? null);
+  const sel = selectUpdates(o.plan, o.only ?? null, o.cascade ?? "all");
   const privateOf = new Map(o.plan.repos.map((r) => [r.name, r.private]));
   const scan = o.plan.repos.map((r) => r.name).filter((n) => !o.only || o.only.includes(n));
   const results: RepoResult[] = [];

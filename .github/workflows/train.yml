@@ -34,6 +34,9 @@ env:
   # The run starts the release workflows that start only by hand (for example with changesets) when RELEASE_DISPATCH
   # is "true". This needs the permission Actions: write of the GitHub App.
   RELEASE_DISPATCH: "false"
+  # The public repositories (comma-separated) whose breaking adoptions carry a cascade release, "all", or "none".
+  # The adoptions of other repositories with a cascade release wait.
+  CASCADE: "none"
 
 jobs:
   train:
@@ -80,6 +83,7 @@ jobs:
           if [ "$dry" != "false" ]; then args+=(--dry-run); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
           if [ "$RELEASE_DISPATCH" = "true" ]; then args+=(--release-dispatch); fi
+          args+=(--cascade "$CASCADE")
           node packages/release-train/src/bin.ts "${args[@]}"
       # When npm has a version in flight, the next wave starts at once with the released event.
       - name: Wait for a release

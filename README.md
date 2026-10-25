@@ -67,6 +67,7 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 - `--report <file>` writes the report without private names.
 - `--author "Name <email>"` sets the author of the commits.
 - `--show-private` shows the private names in the output. Do not use it in CI.
+- `--cascade <repos>` sets the repositories (comma-separated) whose breaking adoptions carry a release, or `all` (the default). The adoptions of other repositories with a release wait.
 - `--release-dispatch` starts the release workflows that start only by hand. Refer to "Releases".
 
 ## Releases
@@ -96,4 +97,5 @@ When CI of a train pull request fails, the pull request gets the label `release-
 - The schedule and `repository_dispatch` change repositories only when `LIVE` in `train.yml` is `"true"`. It is `"true"` since 2026-10-25. Set it to `"false"` to stop the train.
 - The log, the step summary and the artifact `apply` give each private repository only as a count or a hash. The run also masks each private name in the log.
 - After `apply`, the step "Wait for a release" waits up to 15 minutes for a version in flight.
+- `CASCADE` in `train.yml` gives the value of `--cascade`.
 - The run starts release workflows only when `RELEASE_DISPATCH` in `train.yml` is `"true"`.

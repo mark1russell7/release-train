@@ -33,6 +33,8 @@ export interface CliOptions {
   showPrivate: boolean;
   /** `apply`: the run starts the release workflows that start only by hand, and merges their version pull requests. */
   releaseDispatch: boolean;
+  /** `apply`: the repositories whose breaking adoptions carry a cascade release, or "all". */
+  cascade: string[] | "all";
   /** `await-release`: the maximum time of the wait, in minutes. */
   minutes: number;
 }
@@ -54,6 +56,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     showPrivate: false,
     releaseDispatch: false,
     minutes: 20,
+    cascade: "all",
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -75,6 +78,10 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--show-private") o.showPrivate = true;
     else if (a === "--release-dispatch") o.releaseDispatch = true;
     else if (a === "--minutes") o.minutes = Number(value());
+    else if (a === "--cascade") {
+      const v = value().trim();
+      o.cascade = v === "all" ? "all" : v.split(",").map((x) => x.trim()).filter(Boolean);
+    }
     else if (a !== undefined && !a.startsWith("-")) o.command = a;
     else throw new Error(`Unknown option ${a}.`);
   }
@@ -204,6 +211,7 @@ async function runApply(o: CliOptions): Promise<number> {
       dryRun: o.dryRun,
       only: o.only,
       releaseDispatch: o.releaseDispatch,
+      cascade: o.cascade,
       log,
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
     });
