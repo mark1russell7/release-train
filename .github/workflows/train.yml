@@ -31,6 +31,9 @@ concurrency:
 env:
   # The schedule and repository_dispatch change repositories only when LIVE is "true". Else they do a dry run.
   LIVE: "true"
+  # The run starts the release workflows that start only by hand (for example with changesets) when RELEASE_DISPATCH
+  # is "true". This needs the permission Actions: write of the GitHub App.
+  RELEASE_DISPATCH: "false"
 
 jobs:
   train:
@@ -62,6 +65,7 @@ jobs:
           id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
           echo "author=${SLUG}[bot] <${id}+${SLUG}[bot]@users.noreply.github.com>" >> "$GITHUB_OUTPUT"
       - name: Plan and apply
+        id: apply
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_APP_KEY }}
@@ -75,7 +79,15 @@ jobs:
           args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR")
           if [ "$dry" != "false" ]; then args+=(--dry-run); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
+          if [ "$RELEASE_DISPATCH" = "true" ]; then args+=(--release-dispatch); fi
           node packages/release-train/src/bin.ts "${args[@]}"
+      # When npm has a version in flight, the next wave starts at once with the released event.
+      - name: Wait for a release
+        if: steps.apply.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: node packages/release-train/src/bin.ts await-release --owner "$OWNER" --report apply.json --minutes 15
       # The report has no private name: apply writes each private repository as a hash.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()

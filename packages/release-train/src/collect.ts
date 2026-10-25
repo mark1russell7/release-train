@@ -223,6 +223,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     else if (blobs.has("package-lock.json")) [lockKind, lockPath] = ["npm", "package-lock.json"];
     else if (blobs.has("yarn.lock")) lockKind = "yarn";
     snap.lockKind = lockKind;
+    snap.pendingChangesets = [...blobs].filter((b) => b.startsWith(".changeset/") && b.endsWith(".md") && b !== ".changeset/README.md").length;
     return { snap, lockPath };
   });
   const snaps = phase1.filter((p): p is Partial1 => p !== null);

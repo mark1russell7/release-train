@@ -89,6 +89,26 @@ export function writeDb(dir: string, p: Plan, progress: Readonly<Record<string, 
   }
   removeStale(dir, "actions", actionIds);
 
+  // A pull request with red CI gets an alert. The strategist relays each alert to the role that owns the repository.
+  const alertIds = new Set<string>();
+  for (const a of p.actions) {
+    const pr = progress[a.id];
+    if (pr?.state !== "ci-failed") continue;
+    alertIds.add(docId(a.id));
+    const old = readCollection(dir, "alerts").get(docId(a.id));
+    writeDoc(dir, "alerts", a.id, {
+      action: a.id,
+      repo: a.repo,
+      kind: a.kind,
+      url: pr.url,
+      detail: pr.detail,
+      since: typeof old?.["since"] === "string" ? old["since"] : at,
+      relay: "The strategist tells the role that owns the repository. The pull request has the label release-train:blocked.",
+      updatedAt: at,
+    });
+  }
+  removeStale(dir, "alerts", alertIds);
+
   writeDoc(dir, "meta", "summary", {
     owner: p.owner,
     generatedAt: p.generatedAt,

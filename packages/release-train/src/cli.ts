@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { apply, applySummary, hashName, publicReport } from "./apply.ts";
 import { collect } from "./collect.ts";
 import { writeDb } from "./db.ts";
@@ -9,6 +9,7 @@ import type { Plan } from "./plan.ts";
 import { gitHub } from "./github.ts";
 import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
+import { awaitRelease } from "./release.ts";
 import { gitUpdater } from "./workspace.ts";
 
 /** The options of the command line. */
@@ -30,6 +31,10 @@ export interface CliOptions {
   author: string | null;
   /** `apply`: this option shows the names of the private repositories in the output. */
   showPrivate: boolean;
+  /** `apply`: the run starts the release workflows that start only by hand, and merges their version pull requests. */
+  releaseDispatch: boolean;
+  /** `await-release`: the maximum time of the wait, in minutes. */
+  minutes: number;
 }
 
 /** This function reads the arguments of the command line. */
@@ -47,6 +52,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     report: null,
     author: null,
     showPrivate: false,
+    releaseDispatch: false,
+    minutes: 20,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -66,6 +73,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--report") o.report = value();
     else if (a === "--author") o.author = value();
     else if (a === "--show-private") o.showPrivate = true;
+    else if (a === "--release-dispatch") o.releaseDispatch = true;
+    else if (a === "--minutes") o.minutes = Number(value());
     else if (a !== undefined && !a.startsWith("-")) o.command = a;
     else throw new Error(`Unknown option ${a}.`);
   }
@@ -127,8 +136,9 @@ export function redactName(text: string, name: string, by: string): string {
 /** This function starts the command line. */
 export async function main(argv: readonly string[]): Promise<number> {
   const o = parseArgs(argv);
+  if (o.command === "await-release") return runAwait(o);
   if (o.command !== "plan" && o.command !== "apply") {
-    process.stderr.write(`Unknown command ${o.command}. The commands are "plan" and "apply".\n`);
+    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply" and "await-release".\n`);
     return 2;
   }
   return o.command === "apply" ? runApply(o) : runPlan(o);
@@ -193,6 +203,7 @@ async function runApply(o: CliOptions): Promise<number> {
       updater: gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author) }),
       dryRun: o.dryRun,
       only: o.only,
+      releaseDispatch: o.releaseDispatch,
       log,
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
     });
@@ -207,4 +218,49 @@ async function runApply(o: CliOptions): Promise<number> {
     process.stderr.write(`${redact(e instanceof Error ? e.message : String(e))}\n`);
     return 1;
   }
+}
+
+/**
+ * The await-release command: it reads the versions in flight from the apply report and waits until npm has one of them.
+ * Then it sends the `released` event of `repository_dispatch` to the repository of the train, so the next wave starts.
+ */
+async function runAwait(o: CliOptions): Promise<number> {
+  if (!o.report) {
+    process.stderr.write("await-release needs --report <file>.\n");
+    return 2;
+  }
+  const report = JSON.parse(readFileSync(o.report, "utf8")) as { dryRun?: boolean; inFlight?: { name: string; version: string }[] };
+  const inFlight = report.inFlight ?? [];
+  if (report.dryRun || inFlight.length === 0) {
+    process.stdout.write("No release is in flight.\n");
+    return 0;
+  }
+  const published = async (name: string, version: string): Promise<boolean> => {
+    const res = await fetch(`https://registry.npmjs.org/${name.replace("/", "%2F")}/${encodeURIComponent(version)}`, { headers: { accept: "application/json" } });
+    return res.ok;
+  };
+  const first = await awaitRelease({
+    inFlight,
+    published,
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    maxMs: Math.max(0, o.minutes) * 60_000,
+    intervalMs: 30_000,
+  });
+  if (!first) {
+    process.stdout.write(`npm has no version in flight after ${o.minutes} minutes. The next scheduled run continues.\n`);
+    return 0;
+  }
+  const tok = token();
+  const repo = process.env["GITHUB_REPOSITORY"] ?? `${o.owner}/release-train`;
+  const res = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${tok ?? ""}`, accept: "application/vnd.github+json", "content-type": "application/json" },
+    body: JSON.stringify({ event_type: "released", client_payload: { name: first.name, version: first.version } }),
+  });
+  if (!res.ok) {
+    process.stderr.write(`npm has ${first.name}@${first.version}, but the dispatch failed (HTTP ${res.status}).\n`);
+    return 1;
+  }
+  process.stdout.write(`npm has ${first.name}@${first.version}. The train starts the next wave.\n`);
+  return 0;
 }

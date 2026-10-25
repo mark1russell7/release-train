@@ -3,8 +3,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import semver from "semver";
+import { changesetText, decideBump, setManifestVersion, typedFiles } from "./release.ts";
 import { ageRuleEdit, globMatch } from "./settings.ts";
-import type { LockChange, RepoUpdate, UpdateResult, Updater, YoungItem } from "./apply.ts";
+import type { LockChange, ReleaseDone, RepoUpdate, UpdateResult, Updater, YoungItem } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
 import { TRAIN_BRANCH } from "./apply.ts";
 import { parseNpmLock, parsePnpmLock } from "./parse.ts";
@@ -167,13 +168,36 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
   const f: FetchFn = o.fetch ?? ((u, i) => fetch(u, i));
   const registry = o.registry ?? "https://registry.npmjs.org";
   const now = o.now ?? Date.now;
-  const publishTimes = async (dep: string): Promise<Record<string, string>> => {
+  interface Packument {
+    time?: Record<string, string>;
+    versions?: Record<string, { dist?: { tarball?: string } }>;
+  }
+  const packuments = new Map<string, Promise<Packument>>();
+  /** This function reads the document of a package from the npm registry. It gives an empty document on an error. */
+  const packument = (dep: string): Promise<Packument> => {
+    const known = packuments.get(dep);
+    if (known) return known;
+    const p = (async (): Promise<Packument> => {
+      try {
+        const res = await f(`${registry}/${dep.replaceAll("/", "%2f")}`, { headers: { accept: "application/json" } });
+        return res.ok ? ((await res.json()) as Packument) : {};
+      } catch {
+        return {};
+      }
+    })();
+    packuments.set(dep, p);
+    return p;
+  };
+  const publishTimes = async (dep: string): Promise<Record<string, string>> => (await packument(dep)).time ?? {};
+  /** This function reads the typed files of a published version. It gives null when npm does not give them. */
+  const publishedTypes = async (name: string, version: string): Promise<Map<string, string> | null> => {
+    const url = (await packument(name)).versions?.[version]?.dist?.tarball;
+    if (!url) return null;
     try {
-      const res = await f(`${registry}/${dep.replaceAll("/", "%2f")}`, { headers: { accept: "application/json" } });
-      if (!res.ok) return {};
-      return ((await res.json()) as { time?: Record<string, string> }).time ?? {};
+      const res = await f(url, {});
+      return res.ok ? typedFiles(new Uint8Array(await res.arrayBuffer())) : null;
     } catch {
-      return {};
+      return null;
     }
   };
   const basic = Buffer.from(`x-access-token:${o.token}`).toString("base64");
@@ -241,6 +265,33 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
         const u: RepoUpdate = { ...u0, items: u0.items.filter((i) => !youngBy.has(i.dep)) };
         if (u.items.length === 0 && !settingsChanged) return { status: "young", sha: null, changes: [], unresolved: [], young, tool, error: null };
 
+        // The cascade: each published package with a breaking range change gets its version bump in the same commit.
+        // The public types decide the release type. A repository with changesets gets a changeset, else a new version.
+        const added: string[] = newSettingsFile ? ["pnpm-workspace.yaml"] : [];
+        const releases: ReleaseDone[] = [];
+        const rels = (u.releases ?? [])
+          .map((r) => ({ ...r, changes: r.changes.filter((c) => u.items.some((i) => i.dep === c.dep)) }))
+          .filter((r) => r.changes.length > 0);
+        if (rels.length > 0) {
+          const viaChangeset = existsSync(join(dir, ".changeset", "config.json"));
+          for (const r of rels) {
+            const d = decideBump({ from: r.from, files: await publishedTypes(r.name, r.from), changes: r.changes });
+            releases.push({ name: r.name, from: r.from, to: d.to, type: d.type, why: d.why, via: viaChangeset ? "changeset" : "version" });
+            if (!viaChangeset) {
+              const file = join(dir, r.path, "package.json");
+              const text = setManifestVersion(readFileSync(file, "utf8"), d.to);
+              if (text === null) return fail(`${r.path || "."}/package.json has no version field.`);
+              writeFileSync(file, text);
+            }
+          }
+          if (viaChangeset) {
+            const deps = [...new Set(rels.flatMap((r) => r.changes.map((c) => c.dep)))];
+            const summary = `The release train: the ranges of ${deps.join(", ")} change to a new major version.`;
+            writeFileSync(join(dir, ".changeset", "release-train-cascade.md"), changesetText(releases, summary));
+            added.push(".changeset/release-train-cascade.md");
+          }
+        }
+
         // 1. The lockfile and the ranges. The package manager of the repository makes the lockfile.
         const lockFile = u.lockKind === "pnpm" ? "pnpm-lock.yaml" : u.lockKind === "npm" ? "package-lock.json" : null;
         const paths = [...new Set(u.items.map((i) => i.path))];
@@ -307,8 +358,8 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           : [];
         const changes = lockChanges(before, after, new Set(u.items.map((i) => `${i.path}|${i.dep}`)));
         const status = await sh("git", ["status", "--porcelain"], "git status");
-        if (status.stdout.trim() === "" && unresolved.length === 0) return { status: "no-change", sha: null, changes, unresolved, young, tool, error: null };
-        if (status.stdout.trim() === "" || (lockFile && names.length > 0 && unresolved.length === names.length)) return { status: "unresolved", sha: null, changes, unresolved, young, tool, error: null };
+        if (status.stdout.trim() === "" && unresolved.length === 0) return { status: "no-change", sha: null, changes, unresolved, young, tool, error: null, releases };
+        if (status.stdout.trim() === "" || (lockFile && names.length > 0 && unresolved.length === names.length)) return { status: "unresolved", sha: null, changes, unresolved, young, tool, error: null, releases };
 
         // 4. One commit on the newest default branch.
         const subject = names.length === 0
@@ -318,10 +369,11 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           subject,
           "",
           ...u.items.map((i) => `- ${i.dep} in ${i.path || "."}: ${i.newRange ? `${i.range} -> ${i.newRange}` : i.range}, lockfile -> ${after[i.path]?.[i.dep] ?? i.to}`),
+          ...releases.map((r) => `- release ${r.name}: ${r.from} -> ${r.to} (${r.type}, ${r.via === "changeset" ? "changeset" : "package.json"})`),
           ...(settingsChanged ? [`- pnpm-workspace.yaml: ${(u.ageScopes ?? []).join(", ")} in minimumReleaseAgeExclude`] : []),
         ].join("\n");
         await sh("git", ["add", "-u"], "git add");
-        if (newSettingsFile) await sh("git", ["add", "--", "pnpm-workspace.yaml"], "git add");
+        if (added.length > 0) await sh("git", ["add", "--", ...added], "git add");
         await sh("git", ["-c", `user.name=${o.author.name}`, "-c", `user.email=${o.author.email}`, "commit", "--quiet", "--no-verify", "-m", msg], "git commit");
         const head = (await sh("git", ["rev-parse", "HEAD"], "git rev-parse")).stdout.trim();
 
@@ -333,11 +385,11 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           const same = await run("git", ["diff", "--quiet", remoteRef, "HEAD", "--", ...files], { cwd: dir, env });
           if (same.code === 0) {
             const sha = (await sh("git", ["rev-parse", remoteRef], "git rev-parse")).stdout.trim();
-            return { status: "same", sha, changes, unresolved, young, tool, error: null };
+            return { status: "same", sha, changes, unresolved, young, tool, error: null, releases };
           }
         }
         await sh("git", ["push", "--quiet", "--force", "origin", `HEAD:refs/heads/${TRAIN_BRANCH}`], "git push");
-        return { status: "pushed", sha: head, changes, unresolved, young, tool, error: null };
+        return { status: "pushed", sha: head, changes, unresolved, young, tool, error: null, releases };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       } finally {

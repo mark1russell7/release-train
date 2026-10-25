@@ -45,9 +45,31 @@ export interface RepoUpdate {
   why: string;
   lockKind: LockKind;
   items: UpdateItem[];
+  /** The published packages of the repository that release with this update: the train adds their version bump. */
+  releases?: ReleaseItem[];
   /** The scopes that the update puts into `minimumReleaseAgeExclude` of pnpm, or null when the settings need no change. */
   ageScopes?: string[] | null;
   fingerprint: string;
+}
+
+/** A published package that must release because a dependency range changes in a breaking way. */
+export interface ReleaseItem {
+  name: string;
+  path: string;
+  /** The version on npm. */
+  from: string;
+  /** The changed dependencies of the package and the section of each range. */
+  changes: { dep: string; type: string }[];
+}
+
+/** A version bump that the updater added: a changeset, or a new version in `package.json`. */
+export interface ReleaseDone {
+  name: string;
+  from: string;
+  to: string;
+  type: "patch" | "minor" | "major";
+  why: string;
+  via: "changeset" | "version";
 }
 
 /** An adoption that waits for a release of a package that it needs. */
@@ -67,9 +89,13 @@ export interface Selection {
   needed: Set<string>;
 }
 
+/** The sections of the dependencies that the users of a published package install. */
+const RUNTIME = new Set(["dependencies", "peerDependencies", "optionalDependencies"]);
+
 /** This function gives a short fingerprint of the changes of an update. */
-export function fingerprint(items: readonly UpdateItem[], ageScopes: readonly string[] | null = null): string {
+export function fingerprint(items: readonly UpdateItem[], ageScopes: readonly string[] | null = null, releases: readonly ReleaseItem[] = []): string {
   const keys = items.map((i) => [i.path, i.type, i.dep, i.newRange ?? "", i.to].join("|")).sort();
+  for (const r of releases) keys.push(`release|${r.name}|${r.from}`);
   if (ageScopes && ageScopes.length > 0) keys.push(`settings|minimumReleaseAgeExclude|${ageScopes.join(",")}`);
   return createHash("sha256").update(keys.join("\n")).digest("hex").slice(0, 12);
 }
@@ -88,9 +114,9 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null): S
   const scopes = ownScopes(p.owner);
   const ageRule = new Set(p.repos.filter((r) => r.needsAgeRule).map((r) => r.name));
   const ageScopes = (repo: string): string[] | null => (ageRule.has(repo) ? scopes : null);
-  // A breaking adoption of a public repository with a cascade release must carry the version bump in the same pull request:
-  // after the merge, the plan no longer sees the need for the release. Until the train can add the bump, such an adoption waits.
-  const cascade = new Set(p.actions.filter((a) => a.kind === "release" && !a.repoPrivate && a.packages.some((x) => x.bump !== null)).map((a) => a.repo));
+  // A breaking adoption of a public repository with a cascade release carries the version bump in the same pull request:
+  // after the merge, the plan no longer sees the need for the release. A release that waits for something else holds the adoption.
+  const releaseOf = new Map(p.actions.filter((a) => a.kind === "release" && !a.repoPrivate && a.packages.some((x) => x.bump !== null)).map((a) => [a.repo, a]));
   const pick = (repo: string): boolean => !only || only.includes(repo);
   const ready: RepoUpdate[] = [];
   const waiting: WaitingUpdate[] = [];
@@ -103,11 +129,20 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null): S
       const l = latest.get(i.dep);
       return Boolean(l && semver.valid(l) && semver.valid(i.to) && semver.gte(l, i.to));
     });
-    const hold = a.kind === "adopt-breaking" && cascade.has(a.repo);
-    if (a.dependsOn.length > 0 || !onNpm || hold) {
-      waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: hold ? [...a.dependsOn, "cascade-release-support"] : a.dependsOn });
+    const rel = a.kind === "adopt-breaking" ? releaseOf.get(a.repo) : undefined;
+    const relWaits = rel ? (rel.blocked ? [`blocked:${rel.id}`] : rel.dependsOn.filter((d) => d !== a.id)) : [];
+    if (a.dependsOn.length > 0 || !onNpm || relWaits.length > 0) {
+      waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: [...a.dependsOn, ...relWaits] });
       continue;
     }
+    const releases: ReleaseItem[] = (rel?.packages ?? [])
+      .filter((x) => x.bump !== null && x.from !== null)
+      .map((x) => ({
+        name: x.name,
+        path: x.path,
+        from: x.from as string,
+        changes: a.items.filter((i) => i.dependent === x.name && i.newRange && RUNTIME.has(i.type)).map((i) => ({ dep: i.dep, type: i.type })),
+      }));
     const items: UpdateItem[] = a.items.map((i) => ({
       path: i.path,
       dependent: i.dependent,
@@ -129,7 +164,8 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null): S
       lockKind: lock.get(a.repo) ?? "none",
       items,
       ageScopes: ageScopes(a.repo),
-      fingerprint: fingerprint(items, ageScopes(a.repo)),
+      ...(releases.length > 0 ? { releases } : {}),
+      fingerprint: fingerprint(items, ageScopes(a.repo), releases),
     });
   }
   // A repository whose pnpm settings need the scopes of the owner gets them in its pull request. When it has no ready adoption,
@@ -187,6 +223,8 @@ export interface UpdateResult {
   young: YoungItem[];
   tool: string | null;
   error: string | null;
+  /** The version bumps of the cascade that the update added. */
+  releases?: ReleaseDone[];
 }
 
 /** The part of the train that changes the files: a clone, the range changes, the lockfile update and the push. */
@@ -233,6 +271,8 @@ export interface ApplyReport {
   at: string;
   dryRun: boolean;
   results: RepoResult[];
+  /** The public packages whose version on main is not on npm yet. The release workflow of each repository publishes them. */
+  inFlight?: { name: string; version: string }[];
 }
 
 /** The options of `apply`. */
@@ -248,6 +288,8 @@ export interface ApplyOptions {
   label?: (repo: string, isPrivate: boolean) => string;
   concurrency?: number;
   now?: Date;
+  /** Start the release workflow of a repository whose release starts only by hand, and merge its green version pull request. */
+  releaseDispatch?: boolean;
 }
 
 interface Pull {
@@ -288,7 +330,7 @@ export function prTitle(u: RepoUpdate): string {
 }
 
 /** This function gives the body of the pull request of an update. */
-export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[] }) | null): string {
+export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[] }) | null): string {
   const lockOf = new Map((r?.changes ?? []).map((c) => [`${c.path}|${c.dep}`, c]));
   const rows = u.items.map((i) => {
     const c = lockOf.get(`${i.path}|${i.dep}`);
@@ -318,8 +360,21 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
     `${u.why} (plan action \`${u.actionId}\`, kind \`${u.kind}\`, wave ${u.wave}).`,
     "",
   ];
-  if (u.kind === "adopt-breaking") {
-    lines.push("A range of a new major version changes. A published package with a changed runtime range needs a new release later.", "");
+  const done = r?.releases ?? [];
+  if (done.length > 0) {
+    const via = done[0]?.via === "changeset" ? "a changeset" : "the new version in `package.json`";
+    lines.push(
+      "## Releases",
+      "",
+      `A runtime range of a new major version changes, so these packages release. This pull request has ${via}. After the merge, the release workflow of the repository publishes them.`,
+      "",
+      "| Package | Version | Type | Reason |",
+      "|---|---|---|---|",
+      ...done.map((x) => `| \`${x.name}\` | ${x.from} -> ${x.to} | ${x.type} | ${x.why} |`),
+      "",
+    );
+  } else if (u.kind === "adopt-breaking") {
+    lines.push("A range of a new major version changes. No published package of this repository changes a runtime range, so no release is necessary.", "");
   }
   lines.push("## Other lockfile changes", "");
   if (other.length === 0) lines.push("None.");
@@ -469,7 +524,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const hasLabel = (pr: Pull, name: string): boolean => (pr.labels ?? []).some((l) => l.name === name);
 
   /** This function merges a green pull request, or labels a red one. It gives the new state. */
-  const settle = async (repo: string, pr: Pull, autoMerge: "native" | "train", meta: RepoMeta | null): Promise<{ state: RepoState; ci: CiState; detail: string }> => {
+  const settle = async (repo: string, pr: Pull, autoMerge: "native" | "train", meta: RepoMeta | null, branch: string = TRAIN_BRANCH): Promise<{ state: RepoState; ci: CiState; detail: string }> => {
     const ci = await ciOf(repo, pr.head.sha);
     if (ci === "failed") {
       if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
@@ -478,7 +533,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     if (ci === "green" && autoMerge === "train") {
       const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
-        await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${TRAIN_BRANCH}`);
+        await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);
         return { state: "merged", ci, detail: "CI was green. The train merged the pull request." };
       }
       return { state: "unchanged", ci, detail: `CI is green, but the merge failed (HTTP ${m.status}${m.message ? `: ${m.message}` : ""}).` };
@@ -607,5 +662,79 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     }
   }
 
-  return { owner, at: (o.now ?? new Date()).toISOString(), dryRun: o.dryRun, results };
+  // 4. The releases. A public package whose version on main is newer than npm is in flight: its release workflow publishes it.
+  // A repository whose release workflow starts only by hand (for example with changesets) needs a dispatch after green CI on main.
+  const inFlight: { name: string; version: string }[] = [];
+  const infoOf = new Map(o.plan.repos.map((r) => [r.name, r]));
+  const releaseRepos = new Set<string>();
+  for (const a of o.plan.actions) {
+    if (a.kind !== "release" || a.repoPrivate || a.blocked || (o.only && !o.only.includes(a.repo))) continue;
+    const pending = a.packages.filter((x) => x.bump === null && x.to !== null);
+    for (const x of pending) inFlight.push({ name: x.name, version: x.to as string });
+    if (pending.length > 0) releaseRepos.add(a.repo);
+  }
+  for (const r of o.plan.repos) if (!r.private && (r.pendingChangesets ?? 0) > 0 && (!o.only || o.only.includes(r.name))) releaseRepos.add(r.name);
+  if (o.releaseDispatch) {
+    for (const repo of releaseRepos) {
+      const info = infoOf.get(repo);
+      const changesets = info?.pendingChangesets ?? 0;
+      const base0 = { repo, private: false, actionId: `release:${repo}`, kind: "release", wave: null, items: 0, autoMerge: null };
+      try {
+        const wf = await gh.request<{ content?: string }>("GET", `${base}/${repo}/contents/.github/workflows/release.yml`);
+        const text = wf.data?.content ? Buffer.from(wf.data.content, "base64").toString("utf8") : "";
+        if (!dispatchOnly(text)) continue;
+        const metaRes = await gh.request<RepoMeta>("GET", `${base}/${repo}`);
+        const meta = metaRes.data;
+        if (!meta) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
+        // A version pull request of changesets merges on green. Its merge makes the version on main newer than npm.
+        const vpr = (await gh.request<Pull[]>("GET", `${base}/${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(VERSION_BRANCH)}&per_page=5`)).data?.[0];
+        if (vpr) {
+          if (o.dryRun) {
+            result({ ...base0, state: "planned", pr: { number: vpr.number, url: vpr.html_url }, ci: null, detail: "The run merges the version pull request when CI is green." });
+            continue;
+          }
+          const s = await settle(repo, vpr, "train", meta, VERSION_BRANCH);
+          result({ ...base0, state: s.state, pr: { number: vpr.number, url: vpr.html_url }, ci: s.ci, detail: `Version pull request: ${s.detail}` });
+          continue;
+        }
+        const runs = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(meta.default_branch)}&per_page=5`);
+        if ((runs.data?.workflow_runs ?? []).some((x) => x.status !== "completed")) {
+          result({ ...base0, state: "waiting", pr: null, ci: null, detail: "The release workflow runs." });
+          continue;
+        }
+        const head = (await gh.request<{ sha: string }>("GET", `${base}/${repo}/commits/${encodeURIComponent(meta.default_branch)}`)).data?.sha;
+        const ci = head ? await ciOf(repo, head) : "none";
+        if (ci !== "green") {
+          result({ ...base0, state: "waiting", pr: null, ci, detail: `The release waits for green CI on ${meta.default_branch}.` });
+          continue;
+        }
+        const what = changesets > 0 ? "the version pull request" : "the publish";
+        if (o.dryRun) {
+          result({ ...base0, state: "planned", pr: null, ci, detail: `The run starts the release workflow for ${what}.` });
+          continue;
+        }
+        const d = await gh.request("POST", `${base}/${repo}/actions/workflows/release.yml/dispatches`, { ref: meta.default_branch });
+        if (!d.ok) {
+          const need = d.status === 403 || d.status === 404 ? " The GitHub App needs the permission Actions: write." : "";
+          result({ ...base0, state: "error", pr: null, ci, detail: `The dispatch of the release workflow failed (HTTP ${d.status}).${need}` });
+          continue;
+        }
+        result({ ...base0, state: "opened", pr: null, ci, detail: `The train started the release workflow for ${what}.` });
+      } catch (e) {
+        result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
+      }
+    }
+  }
+
+  return { owner, at: (o.now ?? new Date()).toISOString(), dryRun: o.dryRun, results, inFlight };
+}
+
+/** The branch of the version pull request of changesets. */
+export const VERSION_BRANCH = "changeset-release/main";
+
+/** This function tells if a release workflow starts only by hand: it has `workflow_dispatch` and no `push` trigger. */
+export function dispatchOnly(workflow: string): boolean {
+  const lines = workflow.split("\n").map((l) => l.trim());
+  const push = lines.some((l) => l.startsWith("push:") || l === "push" || l === "- push" || l.startsWith("on: push") || (l.startsWith("on: [") && l.includes("push")));
+  return !push && lines.some((l) => l.startsWith("workflow_dispatch"));
 }

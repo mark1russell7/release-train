@@ -207,6 +207,22 @@ describe("writeDb", () => {
     expect(readdirSync(join(dir, "db", "history"))).toHaveLength(2);
   });
 
+  it("writes an alert for red CI, keeps its first date and removes it when CI is green", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "release-train-"));
+    dirs.push(dir);
+    const data = await collect({ owner: "example-owner", token: null, fetch: fakeFetch(REPOS, { "@ex/core": "1.4.0" }) });
+    const p = plan(publicView(buildGraph({ owner: "example-owner", repos: data.repos, npm: data.npm })));
+    const red = { "update:app-repo": { state: "ci-failed" as const, detail: "CI fails.", url: "https://github.com/example-owner/app-repo/pull/1" } };
+    const file = join(dir, "db", "alerts", `${docId("update:app-repo")}.json`);
+    writeDb(dir, p, red, new Date("2026-01-01T00:00:00Z"));
+    writeDb(dir, p, red, new Date("2026-01-02T00:00:00Z"));
+    const alert = JSON.parse(readFileSync(file, "utf8")) as { since: string; url: string; relay: string };
+    expect([alert.since, alert.url]).toEqual(["2026-01-01T00:00:00.000Z", red["update:app-repo"].url]);
+    expect(alert.relay).toContain("strategist");
+    writeDb(dir, p, {}, new Date("2026-01-03T00:00:00Z"));
+    expect(readdirSync(join(dir, "db", "alerts"))).toEqual([]);
+  });
+
   it("makes document ids that the tracker site permits", () => {
     for (const id of ["@ex/core", "update:app-repo", "app-repo:.", "new:@ex/a"]) {
       expect(docId(id)).toMatch(/^[A-Za-z0-9_\-.~@+]+$/);
