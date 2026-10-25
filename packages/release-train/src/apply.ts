@@ -15,6 +15,8 @@ export const BLOCKED_LABEL = "release-train:blocked";
 export const CLAUDE_LINE = "🤖 Generated with [Claude Code](https://claude.com/claude-code)";
 
 const MARK = "<!-- release-train:fingerprint=";
+/** The train adds this mark to the body of a pull request that it closes itself, so a closed train pull request is not "declined". */
+const CLOSED_MARK = "<!-- release-train:closed-by-train -->";
 
 /** One dependency change of an update. */
 export interface UpdateItem {
@@ -130,17 +132,27 @@ export interface LockChange {
   intended: boolean;
 }
 
+/** A target version that is younger than the minimumReleaseAge of pnpm in the repository. CI refuses it until readyAt. */
+export interface YoungItem {
+  dep: string;
+  version: string;
+  readyAt: string;
+}
+
 /** The result of the work in a clone of the repository. */
 export interface UpdateResult {
   /**
    * `pushed`: the branch has a new commit. `same`: the branch already has these changes.
-   * `no-change`: the update changes no file. `unresolved`: the lockfile holds no target version. `failed`: an error.
+   * `no-change`: the update changes no file. `unresolved`: the lockfile holds no target version.
+   * `young`: each target version is younger than the minimumReleaseAge of pnpm. `failed`: an error.
    */
-  status: "pushed" | "same" | "no-change" | "unresolved" | "failed";
+  status: "pushed" | "same" | "no-change" | "unresolved" | "young" | "failed";
   sha: string | null;
   changes: LockChange[];
   /** The packages that do not have their target version in the lockfile after the update. */
   unresolved: string[];
+  /** The packages that wait for the minimumReleaseAge of pnpm. The update leaves them out. */
+  young: YoungItem[];
   tool: string | null;
   error: string | null;
 }
@@ -243,7 +255,7 @@ export function prTitle(u: RepoUpdate): string {
 }
 
 /** This function gives the body of the pull request of an update. */
-export function prBody(u: RepoUpdate, r: Pick<UpdateResult, "changes" | "unresolved" | "tool"> | null): string {
+export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[] }) | null): string {
   const lockOf = new Map((r?.changes ?? []).map((c) => [`${c.path}|${c.dep}`, c]));
   const rows = u.items.map((i) => {
     const c = lockOf.get(`${i.path}|${i.dep}`);
@@ -274,6 +286,10 @@ export function prBody(u: RepoUpdate, r: Pick<UpdateResult, "changes" | "unresol
   else for (const c of other) lines.push(`- \`${c.dep}\` in \`${c.path || "."}\`: ${c.from ?? "none"} -> ${c.to ?? "removed"}`);
   if (r && r.unresolved.length > 0) {
     lines.push("", `The lockfile does not hold the target version of: ${r.unresolved.map((d) => `\`${d}\``).join(", ")}. A next run tries again.`);
+  }
+  if (r?.young && r.young.length > 0) {
+    const list = r.young.map((y) => `\`${y.dep}@${y.version}\` (ready at ${y.readyAt})`).join(", ");
+    lines.push("", `These versions are younger than the minimumReleaseAge of pnpm, so a later run adds them: ${list}.`);
   }
   lines.push(
     "",
@@ -431,6 +447,13 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     return { state: "unchanged", ci, detail: why };
   };
 
+  /** This function closes a pull request of the train with a comment, marks it as closed by the train and deletes the branch. */
+  const closeTrainPr = async (repo: string, pr: Pull, why: string): Promise<void> => {
+    await gh.request("POST", `${base}/${repo}/issues/${pr.number}/comments`, { body: `The release train closes this pull request: ${why}.\n\n${CLAUDE_LINE}` });
+    await gh.request("PATCH", `${base}/${repo}/pulls/${pr.number}`, { state: "closed", body: `${pr.body ?? ""}\n${CLOSED_MARK}` });
+    await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${TRAIN_BRANCH}`);
+  };
+
   // 1. Close each open pull request of the train that the plan no longer needs.
   for (const [repo, pr] of open) {
     if (sel.needed.has(repo)) continue;
@@ -438,9 +461,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       result({ repo, actionId: null, kind: null, wave: null, state: "closed", items: 0, pr: { number: pr.number, url: pr.html_url }, autoMerge: null, ci: null, detail: "The run closes this pull request: the plan has no update for the repository." });
       continue;
     }
-    await gh.request("POST", `${base}/${repo}/issues/${pr.number}/comments`, { body: `The release train closes this pull request: the plan has no update for this repository now.\n\n${CLAUDE_LINE}` });
-    await gh.request("PATCH", `${base}/${repo}/pulls/${pr.number}`, { state: "closed" });
-    await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${TRAIN_BRANCH}`);
+    await closeTrainPr(repo, pr, "the plan has no update for this repository now");
     result({ repo, actionId: null, kind: null, wave: null, state: "closed", items: 0, pr: { number: pr.number, url: pr.html_url }, autoMerge: null, ci: null, detail: "The plan has no update for the repository." });
   }
 
@@ -478,7 +499,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       if (!existing) {
         // A person closed a pull request with the same changes: the train does not open it again.
         const closed = await gh.request<Pull[]>("GET", `${base}/${u.repo}/pulls?state=closed&head=${owner}:${encodeURIComponent(TRAIN_BRANCH)}&per_page=20`);
-        const declined = (closed.data ?? []).find((p) => !p.merged_at && bodyFingerprint(p.body) === u.fingerprint);
+        const declined = (closed.data ?? []).find((p) => !p.merged_at && !(p.body ?? "").includes(CLOSED_MARK) && bodyFingerprint(p.body) === u.fingerprint);
         if (declined) {
           result({ ...common, state: "declined", pr: prRef(declined), autoMerge: null, ci: null, detail: "A closed pull request has the same changes. The train does not open it again." });
           continue;
@@ -494,13 +515,21 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: `The update failed: ${r.error ?? "unknown error"}` });
         continue;
       }
+      if (r.status === "young") {
+        // CI refuses a lockfile with a version younger than the minimumReleaseAge of pnpm. The update waits for its age.
+        const ready = r.young.map((y) => `${y.dep}@${y.version} at ${y.readyAt}`).join(", ");
+        if (existing) await closeTrainPr(u.repo, existing, `its versions are younger than the minimumReleaseAge of pnpm. A later run opens it again (ready: ${ready})`);
+        result({ ...common, state: "waiting", pr: prRef(existing), autoMerge: null, ci: null, detail: `It waits for the minimumReleaseAge of pnpm: ${ready}.${existing ? " The train closed the pull request." : ""}` });
+        continue;
+      }
       if ((r.status === "no-change" || r.status === "unresolved") && !existing) {
         const why = r.status === "no-change" ? "The update changes no file." : `The lockfile does not get the target versions (${r.unresolved.join(", ")}).`;
         result({ ...common, state: "skipped", pr: null, autoMerge: null, ci: null, detail: why });
         continue;
       }
-      const title = prTitle(u);
-      const body = prBody(u, r);
+      const shown: RepoUpdate = { ...u, items: u.items.filter((i) => !r.young.some((y) => y.dep === i.dep)) };
+      const title = prTitle(shown);
+      const body = prBody(shown, r);
       let pr: Pull;
       let state: RepoState;
       if (existing) {
