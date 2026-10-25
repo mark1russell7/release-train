@@ -1,12 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
+import { apply, applySummary, hashName, publicReport } from "./apply.ts";
 import { collect } from "./collect.ts";
 import { writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
 import { plan } from "./plan.ts";
 import type { Plan } from "./plan.ts";
+import { gitHub } from "./github.ts";
 import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
+import { gitUpdater } from "./workspace.ts";
 
 /** The options of the command line. */
 export interface CliOptions {
@@ -17,11 +20,34 @@ export interface CliOptions {
   writeDb: string | null;
   publicOnly: boolean;
   progress: boolean;
+  /** `apply`: this option shows the changes and changes nothing. */
+  dryRun: boolean;
+  /** `apply`: the run changes only these repositories. */
+  only: string[] | null;
+  /** `apply`: the file for the report without private names. */
+  report: string | null;
+  /** `apply`: the author of the commits, as "Name <email>". */
+  author: string | null;
+  /** `apply`: this option shows the names of the private repositories in the output. */
+  showPrivate: boolean;
 }
 
 /** This function reads the arguments of the command line. */
 export function parseArgs(argv: readonly string[]): CliOptions {
-  const o: CliOptions = { command: "plan", owner: "mark1russell7", json: false, out: null, writeDb: null, publicOnly: false, progress: true };
+  const o: CliOptions = {
+    command: "plan",
+    owner: "mark1russell7",
+    json: false,
+    out: null,
+    writeDb: null,
+    publicOnly: false,
+    progress: true,
+    dryRun: false,
+    only: null,
+    report: null,
+    author: null,
+    showPrivate: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const value = (): string => {
@@ -35,6 +61,11 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--owner") o.owner = value();
     else if (a === "--public-only") o.publicOnly = true;
     else if (a === "--no-progress") o.progress = false;
+    else if (a === "--dry-run") o.dryRun = true;
+    else if (a === "--only") o.only = [...(o.only ?? []), ...value().split(",").map((x) => x.trim()).filter(Boolean)];
+    else if (a === "--report") o.report = value();
+    else if (a === "--author") o.author = value();
+    else if (a === "--show-private") o.showPrivate = true;
     else if (a !== undefined && !a.startsWith("-")) o.command = a;
     else throw new Error(`Unknown option ${a}.`);
   }
@@ -78,13 +109,29 @@ function token(): string | null {
   }
 }
 
+/** This function reads an author of the form "Name <email>". */
+export function parseAuthor(text: string | null): { name: string; email: string } {
+  const m = text ? /^\s*(.+?)\s*<([^>]+)>\s*$/.exec(text) : null;
+  return m ? { name: m[1] as string, email: m[2] as string } : { name: "release-train", email: "release-train@users.noreply.github.com" };
+}
+
+/** This function replaces each whole occurrence of a name in a text. A longer word that holds the name does not change. */
+export function redactName(text: string, name: string, by: string): string {
+  const esc = name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+  return text.replace(new RegExp(`(?<![\\w-])${esc}(?![\\w-])`, "g"), by);
+}
+
 /** This function starts the command line. */
 export async function main(argv: readonly string[]): Promise<number> {
   const o = parseArgs(argv);
-  if (o.command !== "plan") {
-    process.stderr.write(`Unknown command ${o.command}. The command is "plan".\n`);
+  if (o.command !== "plan" && o.command !== "apply") {
+    process.stderr.write(`Unknown command ${o.command}. The commands are "plan" and "apply".\n`);
     return 2;
   }
+  return o.command === "apply" ? runApply(o) : runPlan(o);
+}
+
+async function runPlan(o: CliOptions): Promise<number> {
   const tok = token();
   const log = (l: string): void => void process.stderr.write(`${l}\n`);
   const data = await collect({ owner: o.owner, token: tok, publicOnly: o.publicOnly, log });
@@ -97,4 +144,64 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (o.writeDb) writeDb(o.writeDb, p, progress);
   process.stdout.write(o.json ? `${JSON.stringify(full, null, 2)}\n` : `${summary(p, progress)}\n`);
   return 0;
+}
+
+/**
+ * The apply command: it plans with all repositories of the token, then applies the adoptions of the current wave.
+ * Its output and its report give each private repository only as a hash. In GitHub Actions, it also masks the private names.
+ */
+async function runApply(o: CliOptions): Promise<number> {
+  const tok = token();
+  if (!tok) {
+    process.stderr.write("apply needs a token in GH_TOKEN.\n");
+    return 2;
+  }
+  const inActions = process.env["GITHUB_ACTIONS"] === "true";
+  const key = process.env["RELEASE_TRAIN_HASH_KEY"] ?? "";
+  const secrets = new Set<string>();
+  const hide = (names: Iterable<string>): void => {
+    for (const n of names) {
+      if (!n || secrets.has(n)) continue;
+      secrets.add(n);
+      if (inActions) process.stdout.write(`::add-mask::${n}\n`);
+    }
+  };
+  const redact = (text: string): string => {
+    if (o.showPrivate) return text;
+    let t = text;
+    for (const n of [...secrets].sort((a, b) => b.length - a.length)) t = redactName(t, n, hashName(n, key));
+    return t;
+  };
+  const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);
+  try {
+    const data = await collect({
+      owner: o.owner,
+      token: tok,
+      log,
+      onRepos: (repos) => hide(repos.filter((r) => r.private).map((r) => r.name)),
+    });
+    const graph = buildGraph({ owner: o.owner, repos: data.repos, npm: data.npm, warnings: data.warnings });
+    hide(graph.importers.filter((i) => i.repoPrivate).map((i) => i.name ?? ""));
+    const p = plan(graph);
+    const report = await apply({
+      owner: o.owner,
+      plan: p,
+      gh: gitHub({ token: tok }),
+      updater: gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author) }),
+      dryRun: o.dryRun,
+      only: o.only,
+      log,
+      label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
+    });
+    const out = o.showPrivate ? report : publicReport(report, key);
+    const text = redact(applySummary(out));
+    if (o.report) writeFileSync(o.report, `${redact(JSON.stringify(out, null, 2))}\n`);
+    const summaryFile = process.env["GITHUB_STEP_SUMMARY"];
+    if (summaryFile) appendFileSync(summaryFile, ["", "```", text, "```", ""].join("\n"));
+    process.stdout.write(`${text}\n`);
+    return 0;
+  } catch (e) {
+    process.stderr.write(`${redact(e instanceof Error ? e.message : String(e))}\n`);
+    return 1;
+  }
 }

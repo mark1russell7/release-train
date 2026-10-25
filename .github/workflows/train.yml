@@ -1,0 +1,86 @@
+# The release train apply step (stage 2). This workflow plans with the token of the GitHub App
+# mark1russell7-release-train, so it sees the private repositories too. Then it opens or updates one pull request
+# for each repository with an adoption of the current wave, and merges each green pull request.
+# Privacy: the log, the step summary and the artifact give each private repository only as a count or a hash.
+# The apply command also masks each private name in the log.
+name: Train
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Show the pull requests and change nothing.
+        type: boolean
+        default: true
+      only:
+        description: Change only these repositories (comma-separated). Empty means all.
+        type: string
+        default: ""
+  repository_dispatch:
+    types: [released]
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: train
+  cancel-in-progress: false
+
+env:
+  # The schedule and repository_dispatch change repositories only when LIVE is "true". Else they do a dry run.
+  LIVE: "false"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Make the token of the GitHub App
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RELEASE_TRAIN_APP_ID }}
+          private-key: ${{ secrets.RELEASE_TRAIN_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Find the commit author of the App
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          echo "author=${SLUG}[bot] <${id}+${SLUG}[bot]@users.noreply.github.com>" >> "$GITHUB_OUTPUT"
+      - name: Plan and apply
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_APP_KEY }}
+          EVENT: ${{ github.event_name }}
+          INPUT_DRY: ${{ inputs.dry-run }}
+          ONLY: ${{ inputs.only }}
+          OWNER: ${{ github.repository_owner }}
+          AUTHOR: ${{ steps.bot.outputs.author }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ]; then dry=false; else dry=true; fi
+          args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR")
+          if [ "$dry" != "false" ]; then args+=(--dry-run); fi
+          if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
+          node packages/release-train/src/bin.ts "${args[@]}"
+      # The report has no private name: apply writes each private repository as a hash.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: apply
+          path: apply.json
+          if-no-files-found: ignore
+          retention-days: 14

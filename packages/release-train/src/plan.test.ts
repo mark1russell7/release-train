@@ -150,10 +150,10 @@ describe("0.x rules", () => {
     expect(bumpVersion("0.4.2", "patch")).toBe("0.4.3");
   });
 
-  it("keeps the operator of the old range", () => {
-    expect(suggestRange("~1.2.0", "2.0.0")).toBe("~2.0.0");
-    expect(suggestRange("1.2.0", "2.0.0")).toBe("2.0.0");
-    expect(suggestRange(">=1 <2", "2.0.0")).toBe(">=2.0.0");
+  it("suggests a caret range of the new version", () => {
+    expect(suggestRange("~1.2.0", "2.0.0")).toBe("^2.0.0");
+    expect(suggestRange("1.2.0", "2.0.0")).toBe("^2.0.0");
+    expect(suggestRange(">=1 <2", "2.0.0")).toBe("^2.0.0");
   });
 });
 

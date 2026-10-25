@@ -146,10 +146,9 @@ export function bumpVersion(version: string, bump: Bump): string {
   return semver.inc(version, kind) ?? version;
 }
 
-/** This function suggests the new range for a breaking adoption, with the operator of the old range. */
-export function suggestRange(oldRange: string, to: string): string {
-  const op = /^\s*([~^]|>=)/.exec(oldRange)?.[1] ?? (semver.valid(oldRange.trim()) ? "" : "^");
-  return `${op}${to}`;
+/** This function gives the new range for a breaking adoption: a caret range of the new version, the standard of the owner. */
+export function suggestRange(_oldRange: string, to: string): string {
+  return `^${to}`;
 }
 
 function isRuntime(t: DepType): boolean {
