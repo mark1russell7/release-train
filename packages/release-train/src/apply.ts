@@ -88,6 +88,9 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null): S
   const scopes = ownScopes(p.owner);
   const ageRule = new Set(p.repos.filter((r) => r.needsAgeRule).map((r) => r.name));
   const ageScopes = (repo: string): string[] | null => (ageRule.has(repo) ? scopes : null);
+  // A breaking adoption of a public repository with a cascade release must carry the version bump in the same pull request:
+  // after the merge, the plan no longer sees the need for the release. Until the train can add the bump, such an adoption waits.
+  const cascade = new Set(p.actions.filter((a) => a.kind === "release" && !a.repoPrivate && a.packages.some((x) => x.bump !== null)).map((a) => a.repo));
   const pick = (repo: string): boolean => !only || only.includes(repo);
   const ready: RepoUpdate[] = [];
   const waiting: WaitingUpdate[] = [];
@@ -100,8 +103,9 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null): S
       const l = latest.get(i.dep);
       return Boolean(l && semver.valid(l) && semver.valid(i.to) && semver.gte(l, i.to));
     });
-    if (a.dependsOn.length > 0 || !onNpm) {
-      waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: a.dependsOn });
+    const hold = a.kind === "adopt-breaking" && cascade.has(a.repo);
+    if (a.dependsOn.length > 0 || !onNpm || hold) {
+      waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: hold ? [...a.dependsOn, "cascade-release-support"] : a.dependsOn });
       continue;
     }
     const items: UpdateItem[] = a.items.map((i) => ({
