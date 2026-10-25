@@ -16,6 +16,10 @@ on:
         description: Change only these repositories (comma-separated). Empty means all.
         type: string
         default: ""
+      cascade:
+        description: The value of --cascade for this run (public names, "all" or "none"). Empty means CASCADE of the workflow.
+        type: string
+        default: ""
   repository_dispatch:
     types: [released]
   schedule:
@@ -75,6 +79,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           INPUT_DRY: ${{ inputs.dry-run }}
           ONLY: ${{ inputs.only }}
+          INPUT_CASCADE: ${{ inputs.cascade }}
           OWNER: ${{ github.repository_owner }}
           AUTHOR: ${{ steps.bot.outputs.author }}
         run: |
@@ -83,7 +88,7 @@ jobs:
           if [ "$dry" != "false" ]; then args+=(--dry-run); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
           if [ "$RELEASE_DISPATCH" = "true" ]; then args+=(--release-dispatch); fi
-          args+=(--cascade "$CASCADE")
+          args+=(--cascade "${INPUT_CASCADE:-$CASCADE}")
           node packages/release-train/src/bin.ts "${args[@]}"
       # When npm has a version in flight, the next wave starts at once with the released event.
       - name: Wait for a release
