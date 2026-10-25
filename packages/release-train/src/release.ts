@@ -80,7 +80,7 @@ export function decideBump(i: BumpInput): BumpDecision {
   if (peer) return breaking(`The peer range of ${peer.dep} changes.`);
   if (i.files === null || i.files.size === 0) return breaking("The published types are not available, so the change counts as breaking.");
   const named = deps.filter((d) => [...i.files!.values()].some((t) => namesModule(t, d)));
-  if (named.length > 0) return breaking(`The public types name ${named.join(", ")}, so its new major version can change them.`);
+  if (named.length > 0) return breaking(`The public types name ${named.join(", ")}, so its new version outside the old range can change them.`);
   return { type: "patch", to: semver.inc(i.from, "patch") as string, why: `The public types do not name ${deps.join(", ")}.` };
 }
 
