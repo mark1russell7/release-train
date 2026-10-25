@@ -276,9 +276,12 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           const viaChangeset = existsSync(join(dir, ".changeset", "config.json"));
           for (const r of rels) {
             const d = decideBump({ from: r.from, files: await publishedTypes(r.name, r.from), changes: r.changes });
-            releases.push({ name: r.name, from: r.from, to: d.to, type: d.type, why: d.why, via: viaChangeset ? "changeset" : "version" });
-            if (!viaChangeset) {
-              const file = join(dir, r.path, "package.json");
+            const file = join(dir, r.path, "package.json");
+            // A version on main that is already as high as the new version stays: it holds the change already.
+            const current = viaChangeset ? null : ((JSON.parse(readFileSync(file, "utf8")) as { version?: unknown }).version ?? null);
+            const keep = typeof current === "string" && semver.valid(current) !== null && semver.gte(current, d.to);
+            releases.push({ name: r.name, from: r.from, to: keep ? (current as string) : d.to, type: d.type, why: d.why, via: viaChangeset ? "changeset" : "version" });
+            if (!viaChangeset && !keep) {
               const text = setManifestVersion(readFileSync(file, "utf8"), d.to);
               if (text === null) return fail(`${r.path || "."}/package.json has no version field.`);
               writeFileSync(file, text);
@@ -286,7 +289,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           }
           if (viaChangeset) {
             const deps = [...new Set(rels.flatMap((r) => r.changes.map((c) => c.dep)))];
-            const summary = `The release train: the ranges of ${deps.join(", ")} change to a new major version.`;
+            const summary = `The release train: the ranges of ${deps.join(", ")} change to a version outside the old range.`;
             writeFileSync(join(dir, ".changeset", "release-train-cascade.md"), changesetText(releases, summary));
             added.push(".changeset/release-train-cascade.md");
           }

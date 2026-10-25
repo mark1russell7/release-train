@@ -115,10 +115,10 @@ describe("gitUpdater with a cascade release", () => {
     if (url.endsWith(".tgz")) return new Response(types, { status: 200 });
     return new Response(JSON.stringify({ versions: { "0.3.0": { dist: { tarball: "https://registry.example/pub-0.3.0.tgz" } } } }), { status: 200 });
   };
-  const runWith = (changeset: boolean, cmds: string[], seen: { manifest?: string; changeset?: string }): RunFn => async (cmd, args, opts) => {
+  const runWith = (changeset: boolean, cmds: string[], seen: { manifest?: string; changeset?: string }, version = "0.3.0"): RunFn => async (cmd, args, opts) => {
     cmds.push(`${cmd} ${args.join(" ")}`);
     if (cmd === "git" && args[0] === "clone") {
-      writeFileSync(join(opts.cwd, "package.json"), '{\n  "name": "@ex/pub",\n  "version": "0.3.0",\n  "dependencies": { "@ex/core": "^1.0.0" }\n}\n');
+      writeFileSync(join(opts.cwd, "package.json"), `{\n  "name": "@ex/pub",\n  "version": "${version}",\n  "dependencies": { "@ex/core": "^1.0.0" }\n}\n`);
       if (changeset) {
         mkdirSync(join(opts.cwd, ".changeset"));
         writeFileSync(join(opts.cwd, ".changeset", "config.json"), "{}");
@@ -143,6 +143,15 @@ describe("gitUpdater with a cascade release", () => {
     expect(seen.manifest).toContain('"version": "0.4.0"');
     expect(seen.manifest).toContain('"@ex/core": "^2.0.0"');
     expect(prBody(u, r)).toContain("| `@ex/pub` | 0.3.0 -> 0.4.0 | minor |");
+  });
+
+  it("keeps a version on main that is already high enough", async () => {
+    const u = { ...(selectUpdates(cascadePlan()).ready.find((x) => x.repo === "pub-repo") as RepoUpdate), lockKind: "none" as const };
+    const seen: { manifest?: string } = {};
+    const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run: runWith(false, [], seen, "0.5.0"), fetch: fetchFn });
+    const r = await up.update(u, { defaultBranch: "main", rebuild: false });
+    expect(r.releases?.[0]?.to).toBe("0.5.0");
+    expect(seen.manifest).toContain('"version": "0.5.0"');
   });
 
   it("writes a changeset in a repository with changesets and keeps the version", async () => {
