@@ -34,5 +34,6 @@ Write all prose of this repository in the style of ASD-STE100 Simplified Technic
 
 - Some repositories of the owner are private. Do not write their names, their package names or their dependencies into this repository.
 - Use made-up names in test fixtures.
-- CI uses only the default token and `--public-only`. Keep it so.
+- `plan.yml` uses only the default token and `--public-only`. Keep it so.
+- `train.yml` uses the token of the GitHub App, so it sees the private repositories. Its log, summary and artifact give each private repository only as a count or a hash. Keep it so.
 - A local run with the token of the owner writes only to a private repository.

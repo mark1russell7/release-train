@@ -1,5 +1,6 @@
 import type { FetchFn } from "./collect.ts";
 import { pool } from "./collect.ts";
+import { BLOCKED_LABEL, TRAIN_BRANCH } from "./apply.ts";
 import type { Action, Plan } from "./plan.ts";
 
 /** The state of an action on GitHub. */
@@ -17,6 +18,7 @@ interface Pull {
   title: string;
   html_url: string;
   head: { sha: string; ref: string };
+  labels?: { name: string }[];
 }
 
 interface CheckRuns {
@@ -40,7 +42,12 @@ export function matchPull(a: Action, pulls: readonly Pull[]): Pull | null {
   const names =
     a.kind === "release" || a.kind === "new-package" ? a.packages.map((p) => p.name) : a.items.map((i) => i.dep);
   const releaseWords = /\b(release|version|bump)\b/i;
+  if (a.kind === "adopt-in-range" || a.kind === "adopt-breaking") {
+    const train = pulls.find((pr) => pr.head.ref === TRAIN_BRANCH);
+    if (train) return train;
+  }
   for (const pr of pulls) {
+    if (pr.head.ref === TRAIN_BRANCH) continue;
     const text = `${pr.title} ${pr.head.ref}`;
     const named = names.some((n) => text.includes(n) || text.includes(n.split("/").pop() ?? n));
     if (!named) continue;
@@ -71,8 +78,9 @@ export async function addProgress(
       const pr = matchPull(a, pulls);
       if (pr) {
         const checks = await get<CheckRuns>(`/repos/${opts.owner}/${repo}/commits/${pr.head.sha}/check-runs?per_page=100`);
-        const state = checkState(checks?.check_runs ?? []);
-        out[a.id] = { state, detail: `PR #${pr.number}: ${pr.title}`, url: pr.html_url };
+        const blocked = (pr.labels ?? []).some((l) => l.name === BLOCKED_LABEL);
+        const state = blocked ? "ci-failed" : checkState(checks?.check_runs ?? []);
+        out[a.id] = { state, detail: `PR #${pr.number}: ${pr.title}${blocked ? " (blocked: CI failed)" : ""}`, url: pr.html_url };
         continue;
       }
       if (a.kind === "release") {

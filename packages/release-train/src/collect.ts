@@ -19,6 +19,8 @@ export interface CollectOptions {
   apiBase?: string;
   registryBase?: string;
   log?: (line: string) => void;
+  /** The collector gives the list of repositories to this function before it reads them, for example to hide private names. */
+  onRepos?: (repos: readonly { name: string; private: boolean }[]) => void;
 }
 
 /** The data that `collect` gives to the graph builder. */
@@ -126,11 +128,28 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
       // A workflow token cannot read /user. The public list is correct for it.
     }
   }
-  const ghRepos = (await paginate<GhRepo>(listUrl))
+  let listed: GhRepo[] | null = null;
+  if (opts.token && !opts.publicOnly && listUrl.startsWith("/users/")) {
+    // The token of a GitHub App installation lists its repositories, also the private ones.
+    try {
+      const all: GhRepo[] = [];
+      let url: string | null = "/installation/repositories?per_page=100";
+      while (url) {
+        const page: { data: { repositories: GhRepo[] }; next: string | null } = await ghJson<{ repositories: GhRepo[] }>(url);
+        all.push(...page.data.repositories);
+        url = page.next;
+      }
+      listed = all;
+    } catch {
+      // A token that is not of an installation cannot read this list. The public list is correct for it.
+    }
+  }
+  const ghRepos = (listed ?? (await paginate<GhRepo>(listUrl)))
     .filter((r) => !r.archived && !r.fork)
     .filter((r) => !(opts.publicOnly && r.private))
     .filter((r) => !r.owner?.login || r.owner.login.toLowerCase() === opts.owner.toLowerCase())
     .sort((a, b) => a.name.localeCompare(b.name));
+  opts.onRepos?.(ghRepos.map((r) => ({ name: r.name, private: r.private })));
   log(`repositories: ${ghRepos.length}`);
 
   // Phase 1: the manifests of each repository.

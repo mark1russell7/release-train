@@ -5,4 +5,7 @@ export * from "./graph.ts";
 export * from "./plan.ts";
 export * from "./progress.ts";
 export * from "./db.ts";
+export * from "./apply.ts";
+export * from "./github.ts";
+export * from "./workspace.ts";
 export * from "./cli.ts";
