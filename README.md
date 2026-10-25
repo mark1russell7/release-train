@@ -72,5 +72,5 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 `train.yml` starts every 30 minutes, on a manual start and on the `released` event of `repository_dispatch`. It makes a token of the GitHub App `mark1russell7-release-train` with `actions/create-github-app-token`. Pull requests with that token start CI in the repositories.
 
 - A manual start has the inputs `dry-run` (default true) and `only`. Give only public names to `only`, because GitHub shows the inputs.
-- The schedule changes repositories only when `LIVE` in `train.yml` is `"true"`.
+- The schedule and `repository_dispatch` change repositories only when `LIVE` in `train.yml` is `"true"`. It is `"true"` since 2026-10-25. Set it to `"false"` to stop the train.
 - The log, the step summary and the artifact `apply` give each private repository only as a count or a hash. The run also masks each private name in the log.

@@ -30,7 +30,7 @@ concurrency:
 
 env:
   # The schedule and repository_dispatch change repositories only when LIVE is "true". Else they do a dry run.
-  LIVE: "false"
+  LIVE: "true"
 
 jobs:
   train:
