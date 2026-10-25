@@ -247,7 +247,7 @@ describe("apply", () => {
     const text = `${lines.join("\n")}\n${applySummary(pub)}\n${JSON.stringify(pub)}`;
     expect(text).not.toContain("secret");
     expect(text).toContain("lib-repo");
-    expect(applySummary(pub)).toContain("Wave 0: 2 pull requests. Public: lib-repo. Private: 1.");
+    expect(applySummary(pub)).toContain("Wave 0: 2 pull requests. Public: lib-repo. Count of private repositories: 1.");
   });
 });
 

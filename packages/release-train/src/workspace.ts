@@ -91,9 +91,9 @@ function tail(s: string, n = 800): string {
 }
 
 /**
- * This function makes the updater that works in a shallow clone of each repository. It changes the ranges, runs
- * `pnpm install --lockfile-only` and `pnpm update --lockfile-only --no-save` (or the npm equivalents), checks the
- * lockfile, and pushes one commit to the branch of the train. The token goes to git in the environment, not in a URL.
+ * This function makes the updater that works in a shallow clone of each repository. It changes the ranges and starts
+ * `pnpm update --lockfile-only --no-save <dep>@<version>`, `pnpm install --lockfile-only` and a frozen check (or the npm equivalents).
+ * Then it checks the lockfile and pushes one commit to the branch of the train. The token goes to git in the environment, not in a URL.
  */
 export function gitUpdater(o: GitUpdaterOptions): Updater {
   const run = o.run ?? runCommand;
@@ -155,8 +155,12 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           const v = await run("pnpm", ["--version"], { cwd: dir, env });
           tool = `pnpm ${v.stdout.trim() || "?"}`;
           const recursive = existsSync(join(dir, "pnpm-workspace.yaml")) ? ["-r"] : [];
-          if (byPath.size > 0) await sh("pnpm", ["install", "--lockfile-only"], "pnpm install --lockfile-only");
-          if (inRange.length > 0) await sh("pnpm", ["update", ...recursive, "--lockfile-only", "--no-save", ...inRange], "pnpm update --lockfile-only");
+          // An exact version gives the target of the plan, also when it is younger than the minimumReleaseAge of pnpm.
+          const exact = [...new Map(u.items.map((i) => [i.dep, `${i.dep}@${i.to}`])).values()];
+          await sh("pnpm", ["update", ...recursive, "--lockfile-only", "--no-save", ...exact], "pnpm update --lockfile-only");
+          // This install aligns each other part of the lockfile with the changed ranges. Then the frozen check must pass, as in CI.
+          await sh("pnpm", ["install", "--lockfile-only"], "pnpm install --lockfile-only");
+          await sh("pnpm", ["install", "--lockfile-only", "--frozen-lockfile"], "pnpm install --frozen-lockfile");
         } else if (u.lockKind === "npm") {
           const v = await run("npm", ["--version"], { cwd: dir, env });
           tool = `npm ${v.stdout.trim() || "?"}`;
@@ -175,8 +179,8 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           : [];
         const changes = lockChanges(before, after, new Set(u.items.map((i) => `${i.path}|${i.dep}`)));
         const status = await sh("git", ["status", "--porcelain"], "git status");
-        if (status.stdout.trim() === "") return { status: "no-change", sha: null, changes, unresolved, tool, error: null };
-        if (lockFile && unresolved.length === names.length) return { status: "unresolved", sha: null, changes, unresolved, tool, error: null };
+        if (status.stdout.trim() === "" && unresolved.length === 0) return { status: "no-change", sha: null, changes, unresolved, tool, error: null };
+        if (status.stdout.trim() === "" || (lockFile && unresolved.length === names.length)) return { status: "unresolved", sha: null, changes, unresolved, tool, error: null };
 
         // 4. One commit on the newest default branch.
         const msg = [
