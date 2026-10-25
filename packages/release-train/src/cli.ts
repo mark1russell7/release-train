@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
-import { apply, applySummary, hashName, publicReport } from "./apply.ts";
-import { collect } from "./collect.ts";
+import { apply, applySummary, hashName, pendingVersions, publicReport } from "./apply.ts";
+import { collect, pool } from "./collect.ts";
 import { writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
 import { plan } from "./plan.ts";
@@ -10,6 +10,8 @@ import { gitHub } from "./github.ts";
 import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
 import { awaitRelease } from "./release.ts";
+import { SYNC_RULES, apiFiles, syncFacts, syncRepo, syncSummary } from "./sync.ts";
+import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
 import { gitUpdater } from "./workspace.ts";
 
 /** The options of the command line. */
@@ -37,6 +39,10 @@ export interface CliOptions {
   cascade: string[] | "all";
   /** `await-release`: the maximum time of the wait, in minutes. */
   minutes: number;
+  /** `plan` and `apply`: this option is false with `--no-sync`. Then the run does not sync the template files. */
+  sync: boolean;
+  /** `plan` and `apply`: can the GitHub App change workflow files? `auto`: the first push that GitHub refuses tells. */
+  workflows: WorkflowsMode;
 }
 
 /** This function reads the arguments of the command line. */
@@ -57,6 +63,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     releaseDispatch: false,
     minutes: 20,
     cascade: "all",
+    sync: true,
+    workflows: "auto",
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -78,6 +86,12 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--show-private") o.showPrivate = true;
     else if (a === "--release-dispatch") o.releaseDispatch = true;
     else if (a === "--minutes") o.minutes = Number(value());
+    else if (a === "--no-sync") o.sync = false;
+    else if (a === "--workflows") {
+      const v = value().trim();
+      if (v !== "auto" && v !== "yes" && v !== "no") throw new Error(`--workflows needs auto, yes or no, not ${v}.`);
+      o.workflows = v;
+    }
     else if (a === "--cascade") {
       const v = value().trim();
       o.cascade = v === "all" ? "all" : v.split(",").map((x) => x.trim()).filter(Boolean);
@@ -159,11 +173,32 @@ async function runPlan(o: CliOptions): Promise<number> {
   if (o.publicOnly) graph = publicView(graph);
   const p = plan(graph);
   const progress = o.progress ? await addProgress(p, { owner: o.owner, token: tok }) : {};
-  const full = { ...p, progress };
+  const sync = o.sync ? await planSync(p, tok, o.workflows, log) : null;
+  const full = { ...p, progress, ...(sync ? { sync } : {}) };
   if (o.out) writeFileSync(o.out, `${JSON.stringify(full, null, 2)}\n`);
   if (o.writeDb) writeDb(o.writeDb, p, progress);
-  process.stdout.write(o.json ? `${JSON.stringify(full, null, 2)}\n` : `${summary(p, progress)}\n`);
+  const text = `${summary(p, progress)}${sync ? `\n${syncSummary(sync)}` : ""}`;
+  process.stdout.write(o.json ? `${JSON.stringify(full, null, 2)}\n` : `${text}\n`);
   return 0;
+}
+
+/** This function gives the template sync of each repository of a plan, with no change: the dry run of the sync. */
+async function planSync(p: Plan, tok: string | null, workflows: WorkflowsMode, log: (l: string) => void): Promise<SyncPlanItem[] | null> {
+  const gh = gitHub({ token: tok });
+  const facts = await syncFacts({ gh, owner: p.owner });
+  if (!facts) {
+    log("Template sync: the template is not readable.");
+    return null;
+  }
+  const pending = pendingVersions(p);
+  const items = await pool(p.repos, 6, async (r): Promise<SyncPlanItem | null> => {
+    const files = await apiFiles(gh, p.owner, r.name);
+    if (!files) return null;
+    const releaseInFlight = pending.has(r.name) || (r.pendingChangesets ?? 0) > 0;
+    const result = await syncRepo(files, { ...facts, repo: r.name, releaseInFlight }, SYNC_RULES, workflows !== "no");
+    return { repo: r.name, private: r.private, result };
+  });
+  return items.filter((i): i is SyncPlanItem => i !== null);
 }
 
 /**
@@ -203,11 +238,14 @@ async function runApply(o: CliOptions): Promise<number> {
     const graph = buildGraph({ owner: o.owner, repos: data.repos, npm: data.npm, warnings: data.warnings });
     hide(graph.importers.filter((i) => i.repoPrivate).map((i) => i.name ?? ""));
     const p = plan(graph);
+    const gh = gitHub({ token: tok });
+    const updater = gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author) });
     const report = await apply({
       owner: o.owner,
       plan: p,
-      gh: gitHub({ token: tok }),
-      updater: gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author) }),
+      gh,
+      updater,
+      sync: o.sync ? { updater, facts: await syncFacts({ gh, owner: o.owner }), workflows: o.workflows } : null,
       dryRun: o.dryRun,
       only: o.only,
       releaseDispatch: o.releaseDispatch,

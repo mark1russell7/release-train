@@ -1,4 +1,4 @@
-# The release train apply step (stage 2). This workflow plans with the token of the GitHub App
+# The release train apply step (stage 2) and the template sync (stage 3). This workflow plans with the token of the GitHub App
 # mark1russell7-release-train, so it sees the private repositories too. Then it opens or updates one pull request
 # for each repository with an adoption of the current wave, and merges each green pull request.
 # Privacy: the log, the step summary and the artifact give each private repository only as a count or a hash.
@@ -41,6 +41,9 @@ env:
   # The public repositories (comma-separated) whose breaking adoptions carry a cascade release, "all", or "none".
   # The adoptions of other repositories with a cascade release wait.
   CASCADE: "all"
+  # The run opens the template sync pull requests (branch release-train/template) when SYNC is "true".
+  # The changes to workflow files wait until the GitHub App has the permission Workflows: write.
+  SYNC: "true"
 
 jobs:
   train:
@@ -63,6 +66,16 @@ jobs:
           app-id: ${{ secrets.RELEASE_TRAIN_APP_ID }}
           private-key: ${{ secrets.RELEASE_TRAIN_APP_KEY }}
           owner: ${{ github.repository_owner }}
+      # This step fails when the App does not have the permission Workflows: write. The token of this step is not used.
+      - name: Check the Workflows permission of the App
+        id: wf
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RELEASE_TRAIN_APP_ID }}
+          private-key: ${{ secrets.RELEASE_TRAIN_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-workflows: write
       - name: Find the commit author of the App
         id: bot
         env:
@@ -82,6 +95,7 @@ jobs:
           INPUT_CASCADE: ${{ inputs.cascade }}
           OWNER: ${{ github.repository_owner }}
           AUTHOR: ${{ steps.bot.outputs.author }}
+          WORKFLOWS: ${{ steps.wf.outcome == 'success' && 'yes' || 'no' }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ]; then dry=false; else dry=true; fi
           args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR")
@@ -89,6 +103,7 @@ jobs:
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
           if [ "$RELEASE_DISPATCH" = "true" ]; then args+=(--release-dispatch); fi
           args+=(--cascade "${INPUT_CASCADE:-$CASCADE}")
+          if [ "$SYNC" = "true" ]; then args+=(--workflows "$WORKFLOWS"); else args+=(--no-sync); fi
           node packages/release-train/src/bin.ts "${args[@]}"
       # When npm has a version in flight, the next wave starts at once with the released event.
       - name: Wait for a release
