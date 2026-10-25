@@ -333,11 +333,11 @@ export function applySummary(r: ApplyReport): string {
   for (const w of waves) {
     const xs = r.results.filter((x) => prStates.has(x.state) && (x.wave ?? 0) === w);
     const pub = xs.filter((x) => !x.private).map((x) => x.repo);
-    lines.push(`Wave ${w}: ${xs.length} pull requests. Public: ${pub.join(", ") || "none"}. Private: ${xs.length - pub.length}.`);
+    lines.push(`Wave ${w}: ${xs.length} pull requests. Public: ${pub.join(", ") || "none"}. Count of private repositories: ${xs.length - pub.length}.`);
   }
   const wait = r.results.filter((x) => x.state === "waiting");
   if (wait.length > 0) {
-    lines.push(`Waiting for a release: ${wait.length}. Public: ${wait.filter((x) => !x.private).map((x) => x.repo).join(", ") || "none"}. Private: ${wait.filter((x) => x.private).length}.`);
+    lines.push(`Waiting for a release: ${wait.length}. Public: ${wait.filter((x) => !x.private).map((x) => x.repo).join(", ") || "none"}. Count of private repositories: ${wait.filter((x) => x.private).length}.`);
   }
   const counts = new Map<RepoState, number>();
   for (const x of r.results) counts.set(x.state, (counts.get(x.state) ?? 0) + 1);
