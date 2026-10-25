@@ -588,7 +588,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     }
     if (o.dryRun) {
       const what = existing ? `The run updates PR #${existing.number}` : "The run opens a pull request";
-      result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length === 0 ? "the pnpm settings" : `${u.items.length} ${u.items.length === 1 ? "change" : "changes"}`}${u.items.length > 0 && u.ageScopes ? " and the pnpm settings" : ""}.` });
+      result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length === 0 ? "the pnpm settings" : `${u.items.length} ${u.items.length === 1 ? "change" : "changes"}`}${u.items.length > 0 && u.ageScopes ? " and the pnpm settings" : ""}${u.releases?.length ? `, with the release of ${u.releases.map((x) => x.name).join(", ")}` : ""}.` });
       continue;
     }
     try {
