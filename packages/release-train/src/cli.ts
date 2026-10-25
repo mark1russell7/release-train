@@ -111,8 +111,11 @@ function token(): string | null {
 
 /** This function reads an author of the form "Name <email>". */
 export function parseAuthor(text: string | null): { name: string; email: string } {
-  const m = text ? /^\s*(.+?)\s*<([^>]+)>\s*$/.exec(text) : null;
-  return m ? { name: m[1] as string, email: m[2] as string } : { name: "release-train", email: "release-train@users.noreply.github.com" };
+  const lt = text?.indexOf("<") ?? -1;
+  const gt = text?.lastIndexOf(">") ?? -1;
+  const name = text && lt > 0 ? text.slice(0, lt).trim() : "";
+  const email = text && gt > lt + 1 ? text.slice(lt + 1, gt).trim() : "";
+  return name && email ? { name, email } : { name: "release-train", email: "release-train@users.noreply.github.com" };
 }
 
 /** This function replaces each whole occurrence of a name in a text. A longer word that holds the name does not change. */

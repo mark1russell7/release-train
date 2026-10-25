@@ -312,3 +312,12 @@ describe("merge method", () => {
     expect(mergeMethod({ allow_merge_commit: false, allow_squash_merge: false })).toBe("rebase");
   });
 });
+
+describe("author", () => {
+  it("reads Name <email>", async () => {
+    const { parseAuthor } = await import("./cli.ts");
+    expect(parseAuthor("bot[bot] <1+bot[bot]@users.noreply.github.com>")).toEqual({ name: "bot[bot]", email: "1+bot[bot]@users.noreply.github.com" });
+    expect(parseAuthor(null).name).toBe("release-train");
+    expect(parseAuthor("no email").name).toBe("release-train");
+  });
+});
