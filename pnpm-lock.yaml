@@ -174,7 +174,7 @@ importers:
         version: https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905
       '@mark1russell7/template-cli':
         specifier: ^0.1.0
-        version: 0.1.0
+        version: 0.1.2
       publint:
         specifier: ^0.3.25
         version: 0.3.25
@@ -398,8 +398,8 @@ packages:
     engines: {node: '>=22'}
     hasBin: true
 
-  '@mark1russell7/template-cli@0.1.0':
-    resolution: {integrity: sha512-Y+1YoNej3K78Y28fulIriUnKaOz0pP3r7floD001vgEws3ORi6zEPl8OR7yuYYk2mU+52VeAcSJi01EahE4H/A==}
+  '@mark1russell7/template-cli@0.1.2':
+    resolution: {integrity: sha512-PymBwlcDGyJiGZCQ6y9+dxWCpKPMSoqky5WkuNP+paoQp8z6vFkQJZTeIozxRHPtCipL2GmHg6RmpthaWAiM5g==}
     engines: {node: '>=22.12'}
     hasBin: true
 
@@ -1072,7 +1072,7 @@ snapshots:
     dependencies:
       typescript: 6.0.3
 
-  '@mark1russell7/template-cli@0.1.0':
+  '@mark1russell7/template-cli@0.1.2':
     dependencies:
       '@clack/prompts': 1.8.1
 
