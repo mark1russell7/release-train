@@ -5,6 +5,8 @@ import type { GitHub } from "./github.ts";
 import type { Action, Plan } from "./plan.ts";
 import type { DepType, LockKind } from "./types.ts";
 import { ownScopes } from "./settings.ts";
+import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, apiFiles, syncBody, syncNeeds, syncRepo } from "./sync.ts";
+import type { RunFacts, SyncFacts, SyncPush, SyncResult, SyncRule, SyncUpdater, WorkflowsMode } from "./sync.ts";
 
 /** The branch of each pull request of the release train. */
 export const TRAIN_BRANCH = "release-train/update";
@@ -265,6 +267,8 @@ export interface RepoResult {
   autoMerge: "native" | "train" | null;
   ci: CiState | null;
   detail: string;
+  /** The problems that a person must correct, and the changes that wait. Only the template sync gives them. */
+  needs?: string[];
 }
 
 /** The result of one run of the train. */
@@ -294,6 +298,18 @@ export interface ApplyOptions {
   releaseDispatch?: boolean;
   /** The repositories whose breaking adoptions carry a cascade release, or "all". The adoptions of other repositories with a release wait. Default: "all". */
   cascade?: readonly string[] | "all";
+  /** The template sync. Absent or null: the run does not sync the template files. */
+  sync?: SyncOptions | null;
+}
+
+/** The options of the template sync of `apply`. */
+export interface SyncOptions {
+  updater: SyncUpdater;
+  /** The facts of the run. Null: the template is not readable, so the sync waits. */
+  facts: RunFacts | null;
+  /** Can the App change workflow files? `auto`: the first push that GitHub refuses tells. */
+  workflows: WorkflowsMode;
+  rules?: readonly SyncRule[];
 }
 
 interface Pull {
@@ -390,14 +406,38 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
     const list = r.young.map((y) => `\`${y.dep}@${y.version}\` (ready at ${y.readyAt})`).join(", ");
     lines.push("", `These versions are younger than the minimumReleaseAge of pnpm, so a later run adds them: ${list}.`);
   }
-  lines.push(
-    "",
-    `The train made the lockfile with \`${r?.tool ?? "the package manager of the repository"}\`. It merges this pull request when CI is green. When CI fails, it adds the label \`${BLOCKED_LABEL}\` and keeps the pull request open.`,
-    "",
-    `${MARK}${u.fingerprint} -->`,
-    CLAUDE_LINE,
-  );
+  lines.push("", `The train made the lockfile with \`${r?.tool ?? "the package manager of the repository"}\`. ${prTrailer(u.fingerprint)}`);
   return lines.join("\n");
+}
+
+/** This function gives the last lines of each pull request body of the train: the merge rule, the fingerprint and the last line. */
+export function prTrailer(fingerprint: string, subject = "It"): string {
+  return [
+    `${subject} merges this pull request when CI is green. When CI fails, it adds the label \`${BLOCKED_LABEL}\` and keeps the pull request open.`,
+    "",
+    `${MARK}${fingerprint} -->`,
+    CLAUDE_LINE,
+  ].join("\n");
+}
+
+/** This function gives the body of a template sync pull request. */
+export function syncPrBody(r: SyncResult, tool: string | null, rules: readonly SyncRule[] = SYNC_RULES): string {
+  const tail = tool ? `The train made the lockfile with \`${tool}\`. ${prTrailer(r.fingerprint)}` : prTrailer(r.fingerprint, "The train");
+  return `${syncBody(r, rules)}\n\n${tail}`;
+}
+
+/**
+ * This function gives the published versions on `main` that npm does not have, for each public repository.
+ * A blocked release has none. A version in this list is in flight when its release workflow publishes it soon.
+ */
+export function pendingVersions(p: Plan, only: readonly string[] | null = null): Map<string, { name: string; version: string }[]> {
+  const out = new Map<string, { name: string; version: string }[]>();
+  for (const a of p.actions) {
+    if (a.kind !== "release" || a.repoPrivate || a.blocked || (only && !only.includes(a.repo))) continue;
+    const pending = a.packages.filter((x) => x.bump === null && x.to !== null).map((x) => ({ name: x.name, version: x.to as string }));
+    if (pending.length > 0) out.set(a.repo, pending);
+  }
+  return out;
 }
 
 /** This function gives the fingerprint in the body of a pull request of the train, if it has one. */
@@ -432,11 +472,12 @@ export function hashName(name: string, key = ""): string {
 export function publicReport(r: ApplyReport, key = ""): ApplyReport {
   return {
     ...r,
-    results: r.results.map((x) =>
-      x.private
-        ? { ...x, repo: hashName(x.repo, key), actionId: null, pr: null, detail: `A private repository: ${x.state}.` }
-        : x,
-    ),
+    results: r.results.map((x) => {
+      if (!x.private) return x;
+      const { needs, ...rest } = x;
+      const count = needs?.length ? ` Needs a hand or waits: ${needs.length}.` : "";
+      return { ...rest, repo: hashName(x.repo, key), actionId: null, pr: null, detail: `A private repository: ${x.state}.${count}` };
+    }),
   };
 }
 
@@ -444,11 +485,17 @@ export function publicReport(r: ApplyReport, key = ""): ApplyReport {
 export function applySummary(r: ApplyReport): string {
   const lines = [`Release train apply for ${r.owner} at ${r.at}${r.dryRun ? " (dry run)" : ""}`];
   const prStates = new Set<RepoState>(["planned", "opened", "updated", "unchanged", "merged", "blocked"]);
-  const waves = [...new Set(r.results.filter((x) => prStates.has(x.state)).map((x) => x.wave ?? 0))].sort((a, b) => a - b);
+  const isPr = (x: RepoResult): boolean => prStates.has(x.state) && x.kind !== SYNC_KIND;
+  const waves = [...new Set(r.results.filter(isPr).map((x) => x.wave ?? 0))].sort((a, b) => a - b);
   for (const w of waves) {
-    const xs = r.results.filter((x) => prStates.has(x.state) && (x.wave ?? 0) === w);
+    const xs = r.results.filter((x) => isPr(x) && (x.wave ?? 0) === w);
     const pub = xs.filter((x) => !x.private).map((x) => x.repo);
     lines.push(`Wave ${w}: ${xs.length} pull requests. Public: ${pub.join(", ") || "none"}. Count of private repositories: ${xs.length - pub.length}.`);
+  }
+  const sync = r.results.filter((x) => x.kind === SYNC_KIND && prStates.has(x.state));
+  if (sync.length > 0) {
+    const pub = sync.filter((x) => !x.private).map((x) => x.repo);
+    lines.push(`Template sync: ${sync.length} pull requests. Public: ${pub.join(", ") || "none"}. Count of private repositories: ${sync.length - pub.length}.`);
   }
   const wait = r.results.filter((x) => x.state === "waiting");
   if (wait.length > 0) {
@@ -461,7 +508,22 @@ export function applySummary(r: ApplyReport): string {
     const pr = x.pr ? ` ${x.pr.url}` : "";
     const am = x.autoMerge ? ` merge=${x.autoMerge}` : "";
     const ci = x.ci ? ` ci=${x.ci}` : "";
-    lines.push(`- ${x.repo}: ${x.state}${x.wave === null ? "" : ` (wave ${x.wave})`}${pr}${am}${ci}. ${x.detail}`);
+    const kind = x.kind === SYNC_KIND ? " [template sync]" : "";
+    lines.push(`- ${x.repo}${kind}: ${x.state}${x.wave === null ? "" : ` (wave ${x.wave})`}${pr}${am}${ci}. ${x.detail}`);
+  }
+  // The problems of the template sync that a person must correct. A private repository gives only a count.
+  const hands = r.results.filter((x) => x.needs && x.needs.length > 0);
+  const privateHands = r.results.filter((x) => x.private && x.kind === SYNC_KIND && / Needs a hand or waits: \d+\./.test(x.detail)).length;
+  if (hands.length > 0 || privateHands > 0) {
+    lines.push("", "Needs a hand (template sync):");
+    for (const x of hands) {
+      if (x.private) {
+        lines.push(`- ${x.repo}: ${x.needs?.length ?? 0} items.`);
+        continue;
+      }
+      for (const n of x.needs ?? []) lines.push(`- ${x.repo}: ${n.replaceAll("`", "")}`);
+    }
+    if (privateHands > 0) lines.push(`- Count of private repositories: ${privateHands}.`);
   }
   return lines.join("\n");
 }
@@ -490,13 +552,17 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     return full;
   };
 
-  // The open pull requests of the train, in each repository of the plan.
-  const open = new Map<string, Pull>();
-  await pool(scan, o.concurrency ?? 6, async (repo) => {
-    const res = await gh.request<Pull[]>("GET", `${base}/${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(TRAIN_BRANCH)}&per_page=10`);
-    const pr = (res.data ?? []).find((p) => p.head.ref === TRAIN_BRANCH);
-    if (pr) open.set(repo, pr);
-  });
+  /** This function reads the open pull request of a branch of the train, in each repository of the plan. */
+  const openOf = async (branch: string): Promise<Map<string, Pull>> => {
+    const found = new Map<string, Pull>();
+    await pool(scan, o.concurrency ?? 6, async (repo) => {
+      const res = await gh.request<Pull[]>("GET", `${base}/${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(branch)}&per_page=10`);
+      const pr = (res.data ?? []).find((p) => p.head.ref === branch);
+      if (pr) found.set(repo, pr);
+    });
+    return found;
+  };
+  const open = await openOf(TRAIN_BRANCH);
 
   const ensureLabels = async (repo: string): Promise<void> => {
     for (const [name, color, description] of [
@@ -547,10 +613,76 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   };
 
   /** This function closes a pull request of the train with a comment, marks it as closed by the train and deletes the branch. */
-  const closeTrainPr = async (repo: string, pr: Pull, why: string): Promise<void> => {
+  const closeTrainPr = async (repo: string, pr: Pull, why: string, branch: string = TRAIN_BRANCH): Promise<void> => {
     await gh.request("POST", `${base}/${repo}/issues/${pr.number}/comments`, { body: `The release train closes this pull request: ${why}.\n\n${CLAUDE_LINE}` });
     await gh.request("PATCH", `${base}/${repo}/pulls/${pr.number}`, { state: "closed", body: `${pr.body ?? ""}\n${CLOSED_MARK}` });
-    await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${TRAIN_BRANCH}`);
+    await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);
+  };
+
+  /** This function finds a pull request of a branch that a person closed with the same changes. The train does not open it again. */
+  const declinedPr = async (repo: string, branch: string, fp: string): Promise<Pull | undefined> => {
+    const closed = await gh.request<Pull[]>("GET", `${base}/${repo}/pulls?state=closed&head=${owner}:${encodeURIComponent(branch)}&per_page=20`);
+    return (closed.data ?? []).find((p) => !p.merged_at && !(p.body ?? "").includes(CLOSED_MARK) && bodyFingerprint(p.body) === fp);
+  };
+
+  /** This function tells if the branch of an open pull request must start again from the default branch: GitHub cannot merge it. */
+  const needsRebuild = async (repo: string, existing: Pull | null): Promise<boolean> => {
+    if (!existing) return false;
+    const full = await gh.request<Pull>("GET", `${base}/${repo}/pulls/${existing.number}`);
+    return full.data?.mergeable === false;
+  };
+
+  const prRef = (p: Pull | null) => (p ? { number: p.number, url: p.html_url } : null);
+
+  /**
+   * This function opens or updates the pull request of a branch after the work in a clone. It adds the labels, turns on
+   * auto-merge, and merges or blocks the pull request from its CI state. The update pull requests and the template sync use it.
+   */
+  const publish = async (p: {
+    common: Pick<RepoResult, "repo" | "private" | "actionId" | "kind" | "wave" | "items" | "needs">;
+    branch: string;
+    existing: Pull | null;
+    meta: RepoMeta;
+    pushed: boolean;
+    sha: string | null;
+    title: string;
+    body: string;
+    note: string;
+  }): Promise<void> => {
+    const repo = p.common.repo;
+    let pr: Pull;
+    let state: RepoState;
+    if (p.existing) {
+      const existing = p.existing;
+      pr = existing;
+      state = p.pushed ? "updated" : "unchanged";
+      if (p.pushed || existing.body !== p.body || existing.title !== p.title) {
+        const upd = await gh.request<Pull>("PATCH", `${base}/${repo}/pulls/${existing.number}`, { title: p.title, body: p.body });
+        if (upd.data) pr = { ...upd.data, labels: existing.labels ?? [] };
+      }
+      if (p.pushed) {
+        pr = { ...pr, head: { ...pr.head, sha: p.sha ?? pr.head.sha } };
+        if (hasLabel(existing, BLOCKED_LABEL)) {
+          await gh.request("DELETE", `${base}/${repo}/issues/${existing.number}/labels/${encodeURIComponent(BLOCKED_LABEL)}`);
+          pr = { ...pr, labels: (pr.labels ?? []).filter((l) => l.name !== BLOCKED_LABEL) };
+        }
+      }
+    } else {
+      const made = await gh.request<Pull>("POST", `${base}/${repo}/pulls`, { title: p.title, body: p.body, head: p.branch, base: p.meta.default_branch });
+      if (!made.data) throw new Error(`GitHub did not open the pull request (HTTP ${made.status}${made.message ? `: ${made.message}` : ""}).`);
+      pr = made.data;
+      state = "opened";
+    }
+    await ensureLabels(repo);
+    if (!hasLabel(pr, TRAIN_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [TRAIN_LABEL] });
+    const autoMerge = await enableAutoMerge(repo, pr, p.meta);
+    const how = autoMerge === "native" ? "GitHub auto-merge is on." : "The train merges it on green in a later run.";
+    if (state === "opened" || state === "updated") {
+      result({ ...p.common, state, pr: prRef(pr), autoMerge, ci: "none", detail: `${how}${p.note}` });
+      return;
+    }
+    const s = await settle(repo, pr, autoMerge, p.meta, p.branch);
+    result({ ...p.common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: s.state === "merged" ? s.detail : `${s.detail} ${how}` });
   };
 
   // 1. Close each open pull request of the train that the plan no longer needs.
@@ -581,7 +713,6 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   for (const u of sel.ready) {
     const existing = open.get(u.repo) ?? null;
     const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length };
-    const prRef = (p: Pull | null) => (p ? { number: p.number, url: p.html_url } : null);
     if (u.lockKind === "yarn") {
       result({ ...common, state: "skipped", pr: prRef(existing), autoMerge: null, ci: null, detail: "The train cannot update a Yarn lockfile." });
       continue;
@@ -597,18 +728,13 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       const meta = metaRes.data;
       if (!existing) {
         // A person closed a pull request with the same changes: the train does not open it again.
-        const closed = await gh.request<Pull[]>("GET", `${base}/${u.repo}/pulls?state=closed&head=${owner}:${encodeURIComponent(TRAIN_BRANCH)}&per_page=20`);
-        const declined = (closed.data ?? []).find((p) => !p.merged_at && !(p.body ?? "").includes(CLOSED_MARK) && bodyFingerprint(p.body) === u.fingerprint);
+        const declined = await declinedPr(u.repo, TRAIN_BRANCH, u.fingerprint);
         if (declined) {
           result({ ...common, state: "declined", pr: prRef(declined), autoMerge: null, ci: null, detail: "A closed pull request has the same changes. The train does not open it again." });
           continue;
         }
       }
-      let rebuild = false;
-      if (existing) {
-        const full = await gh.request<Pull>("GET", `${base}/${u.repo}/pulls/${existing.number}`);
-        rebuild = full.data?.mergeable === false;
-      }
+      const rebuild = await needsRebuild(u.repo, existing);
       const r = await o.updater.update(u, { defaultBranch: meta.default_branch, rebuild });
       if (r.status === "failed") {
         result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: `The update failed: ${r.error ?? "unknown error"}` });
@@ -627,57 +753,137 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         continue;
       }
       const shown: RepoUpdate = { ...u, items: u.items.filter((i) => !r.young.some((y) => y.dep === i.dep)) };
-      const title = prTitle(shown);
-      const body = prBody(shown, r);
-      let pr: Pull;
-      let state: RepoState;
-      if (existing) {
-        pr = existing;
-        state = r.status === "pushed" ? "updated" : "unchanged";
-        if (r.status === "pushed" || existing.body !== body || existing.title !== title) {
-          const upd = await gh.request<Pull>("PATCH", `${base}/${u.repo}/pulls/${existing.number}`, { title, body });
-          if (upd.data) pr = { ...upd.data, labels: existing.labels ?? [] };
-        }
-        if (r.status === "pushed") {
-          pr = { ...pr, head: { ...pr.head, sha: r.sha ?? pr.head.sha } };
-          if (hasLabel(existing, BLOCKED_LABEL)) {
-            await gh.request("DELETE", `${base}/${u.repo}/issues/${existing.number}/labels/${encodeURIComponent(BLOCKED_LABEL)}`);
-            pr = { ...pr, labels: (pr.labels ?? []).filter((l) => l.name !== BLOCKED_LABEL) };
-          }
-        }
-      } else {
-        const made = await gh.request<Pull>("POST", `${base}/${u.repo}/pulls`, { title, body, head: TRAIN_BRANCH, base: meta.default_branch });
-        if (!made.data) throw new Error(`GitHub did not open the pull request (HTTP ${made.status}${made.message ? `: ${made.message}` : ""}).`);
-        pr = made.data;
-        state = "opened";
-      }
-      await ensureLabels(u.repo);
-      if (!hasLabel(pr, TRAIN_LABEL)) await gh.request("POST", `${base}/${u.repo}/issues/${pr.number}/labels`, { labels: [TRAIN_LABEL] });
-      const autoMerge = await enableAutoMerge(u.repo, pr, meta);
-      const how = autoMerge === "native" ? "GitHub auto-merge is on." : "The train merges it on green in a later run.";
-      if (state === "opened" || state === "updated") {
-        result({ ...common, state, pr: prRef(pr), autoMerge, ci: "none", detail: `${how}${r.unresolved.length > 0 ? ` Unresolved: ${r.unresolved.join(", ")}.` : ""}` });
-        continue;
-      }
-      const s = await settle(u.repo, pr, autoMerge, meta);
-      result({ ...common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: s.state === "merged" ? s.detail : `${s.detail} ${how}` });
+      await publish({
+        common,
+        branch: TRAIN_BRANCH,
+        existing,
+        meta,
+        pushed: r.status === "pushed",
+        sha: r.sha,
+        title: prTitle(shown),
+        body: prBody(shown, r),
+        note: r.unresolved.length > 0 ? ` Unresolved: ${r.unresolved.join(", ")}.` : "",
+      });
     } catch (e) {
       result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
     }
   }
 
-  // 4. The releases. A public package whose version on main is newer than npm is in flight: its release workflow publishes it.
+  // 4. The template sync: one branch and one pull request for each repository whose template files are not in sync.
+  if (o.sync) await syncAll(o.sync);
+
+  /**
+   * This function syncs the template files of each repository. A rule that changes workflow files waits when the App
+   * cannot change them. In mode `auto`, the first push that GitHub refuses turns these rules off for the rest of the run.
+   */
+  async function syncAll(s: SyncOptions): Promise<void> {
+    if (!s.facts) {
+      log("Template sync: the template is not readable, so the sync waits.");
+      return;
+    }
+    const facts0 = s.facts;
+    const rules = s.rules ?? SYNC_RULES;
+    const syncOpen = await openOf(SYNC_BRANCH);
+    const pending = pendingVersions(o.plan, o.only ?? null);
+    const changesets = new Set(o.plan.repos.filter((r) => (r.pendingChangesets ?? 0) > 0).map((r) => r.name));
+    let workflows = s.workflows !== "no";
+    for (const repo of scan) {
+      const isPrivate = privateOf.get(repo) ?? true;
+      const existing = syncOpen.get(repo) ?? null;
+      const facts: SyncFacts = { ...facts0, repo, releaseInFlight: pending.has(repo) || changesets.has(repo) };
+      const commonOf = (r: SyncResult) => ({
+        repo,
+        private: isPrivate,
+        actionId: `sync:${repo}`,
+        kind: SYNC_KIND,
+        wave: null,
+        items: r.outcomes.filter((x) => x.state === "applied").reduce((n, x) => n + x.changes.length, 0),
+        needs: syncNeeds(r),
+      });
+      const fail = (detail: string) => result({ repo, private: isPrivate, actionId: `sync:${repo}`, kind: SYNC_KIND, wave: null, items: 0, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail });
+      try {
+        const files = await apiFiles(gh, owner, repo);
+        if (!files) continue;
+        let planned = await syncRepo(files, facts, rules, workflows);
+        const applied = (r: SyncResult): string[] => r.outcomes.filter((x) => x.state === "applied").map((x) => x.rule);
+        /** This function closes the open sync pull request, or reports the problems of a repository with no change. */
+        const nothing = async (r: SyncResult): Promise<void> => {
+          const common = commonOf(r);
+          if (existing) {
+            if (!o.dryRun) await closeTrainPr(repo, existing, "the template files of this repository are in sync now", SYNC_BRANCH);
+            result({ ...common, state: "closed", pr: prRef(existing), autoMerge: null, ci: null, detail: `${o.dryRun ? "The run closes this pull request: " : ""}The template files are in sync.` });
+          } else if (common.needs.length > 0) {
+            result({ ...common, state: "skipped", pr: null, autoMerge: null, ci: null, detail: "No template file changes now." });
+          }
+        };
+        if (applied(planned).length === 0) {
+          await nothing(planned);
+          continue;
+        }
+        if (o.dryRun) {
+          const what = existing ? `The run updates PR #${existing.number}` : "The run opens a pull request";
+          result({ ...commonOf(planned), state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for the template sync: ${applied(planned).join(", ")}.` });
+          continue;
+        }
+        const metaRes = await gh.request<RepoMeta>("GET", `${base}/${repo}`);
+        if (!metaRes.data) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
+        const meta = metaRes.data;
+        if (!existing) {
+          const declined = await declinedPr(repo, SYNC_BRANCH, planned.fingerprint);
+          if (declined) {
+            result({ ...commonOf(planned), state: "declined", pr: prRef(declined), autoMerge: null, ci: null, detail: "A closed pull request has the same changes. The train does not open it again." });
+            continue;
+          }
+        }
+        const rebuild = await needsRebuild(repo, existing);
+        let r: SyncPush;
+        if (existing && !rebuild && bodyFingerprint(existing.body) === planned.fingerprint) {
+          // The branch has these changes already: no clone and no push.
+          r = { status: "same", sha: existing.head.sha, result: planned, tool: null, error: null };
+        } else {
+          const ctx = { defaultBranch: meta.default_branch, rebuild };
+          r = await s.updater.sync({ repo, facts, workflows, rules }, ctx);
+          if (r.status === "workflows-denied" && workflows) {
+            workflows = false;
+            log("Template sync: GitHub refused a workflow change, because the App has no Workflows permission. The rules that change workflow files wait.");
+            planned = await syncRepo(files, facts, rules, false);
+            r = applied(planned).length > 0 ? await s.updater.sync({ repo, facts, workflows, rules }, ctx) : { status: "no-change", sha: null, result: planned, tool: null, error: null };
+          }
+        }
+        if (r.status === "failed" || r.status === "workflows-denied") {
+          fail(`The template sync failed: ${r.error ?? "unknown error"}`);
+          continue;
+        }
+        const done = r.result ?? planned;
+        if (r.status === "no-change" || applied(done).length === 0) {
+          await nothing(done);
+          continue;
+        }
+        await publish({
+          common: commonOf(done),
+          branch: SYNC_BRANCH,
+          existing,
+          meta,
+          pushed: r.status === "pushed",
+          sha: r.sha,
+          title: SYNC_TITLE,
+          // Without a new clone, the body keeps the name of the tool that made the lockfile.
+          body: existing && r.status === "same" && r.tool === null && existing.body ? existing.body : syncPrBody(done, r.tool, rules),
+          note: "",
+        });
+      } catch (e) {
+        fail(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
+
+  // 5. The releases. A public package whose version on main is newer than npm is in flight: its release workflow publishes it.
   // A repository whose release workflow starts only by hand (for example with changesets) needs a dispatch after green CI on main.
   // Only a version that a release workflow publishes soon is in flight: a workflow that starts on a push, a workflow that runs,
   // or a workflow that this run started. A version of a workflow that waits for a start by hand is not in flight.
   const inFlight: { name: string; version: string }[] = [];
   const infoOf = new Map(o.plan.repos.map((r) => [r.name, r]));
-  const pendingOf = new Map<string, { name: string; version: string }[]>();
-  for (const a of o.plan.actions) {
-    if (a.kind !== "release" || a.repoPrivate || a.blocked || (o.only && !o.only.includes(a.repo))) continue;
-    const pending = a.packages.filter((x) => x.bump === null && x.to !== null).map((x) => ({ name: x.name, version: x.to as string }));
-    if (pending.length > 0) pendingOf.set(a.repo, pending);
-  }
+  const pendingOf = pendingVersions(o.plan, o.only ?? null);
   const releaseRepos = new Set(pendingOf.keys());
   for (const r of o.plan.repos) if (!r.private && (r.pendingChangesets ?? 0) > 0 && (!o.only || o.only.includes(r.name))) releaseRepos.add(r.name);
   const fly = (repo: string): void => void inFlight.push(...(pendingOf.get(repo) ?? []));

@@ -2,7 +2,7 @@
 
 The release train reads the npm packages of the GitHub account `mark1russell7`. It makes the dependency graph of these packages and a plan of the next releases and updates.
 
-Stage 1 only reads. Stage 2 (`apply`) opens a pull request for each update of the current wave. The train does not publish to npm itself: the release workflow of each repository publishes.
+Stage 1 only reads. Stage 2 (`apply`) opens a pull request for each update of the current wave. Stage 3 (the template sync, also in `apply`) keeps the files from the template repository current in each repository. The train does not publish to npm itself: the release workflow of each repository publishes.
 
 ## What it reads
 
@@ -89,6 +89,23 @@ The report of `apply` lists the versions in flight. Such a version is on `main` 
 
 When CI of a train pull request fails, the pull request gets the label `release-train:blocked`. `plan --write-db` then writes an alert into the collection `alerts` of the tracker. The strategist tells the role that owns the repository.
 
+## Stage 3: template sync
+
+The template sync keeps the files from the repository `template` current in each other repository. Each rule is data in `SYNC_RULES` (`src/sync.ts`): an id, a reason and a check that gives the edits. To add a rule, add an object to this list.
+
+- `pins`: each `uses: <owner>/template/<path>@<sha>` line in `.github/workflows/` moves to the current commit of `main` of the template, with the comment `# main`. While a version is in flight (or changesets wait), `release.yml` keeps its pins. A path that the template does not have stays and goes under "Needs a hand".
+- `release-scripts`: when `release.yml` uses `reusable-release-build.yml` at a template commit that contains template#50, the rule deletes `scripts/release/`. When a workflow or a script of `package.json` still refers to `scripts/release`, the folder stays and the rule asks for a hand.
+- `template-cli`: when the script `package` starts the copy `packages/cli/`, the rule deletes the copy. It sets the scripts `package` and `template` to the published CLI, and adds the dev dependency `@<owner>/template-cli`. The package manager updates the lockfile, as for an update. The copy stays when its package is not private, or when another file still uses it.
+- `callers`: a `release.yml` that does not use `reusable-release-build.yml`, or a `ci.yml` that does not use `reusable-ci.yml`, goes under "Needs a hand". This rule changes nothing.
+
+The rules do not change the repository `template`. Each repository gets one branch `release-train/template` and one pull request with the label `release-train`, apart from the update pull request. The body tells each change and its reason, the changes that wait, and the problems that need a hand. The fingerprint in the body stops a push when the changes are the same. CI, the label `release-train:blocked`, the merge on green and the close follow the rules of the update pull request.
+
+GitHub refuses a change to a workflow file from an App without the permission Workflows: write. Until the App has this permission, the rules `pins` and `release-scripts` wait, and the pull request and the summary tell "The change waits for the Workflows permission of the App." The other rules work. The run does not fail.
+
+- `--no-sync` turns off the template sync.
+- `--workflows auto|yes|no` tells if the App can change workflow files. With `auto` (the default), the train tries, and when GitHub refuses the push, it pushes again without the workflow changes.
+- `plan` lists the sync actions of each repository and the count for each rule.
+
 ## The train workflow
 
 `train.yml` starts every 30 minutes, on a manual start and on the `released` event of `repository_dispatch`. It makes a token of the GitHub App `mark1russell7-release-train` with `actions/create-github-app-token`. Pull requests with that token start CI in the repositories.
@@ -99,3 +116,4 @@ When CI of a train pull request fails, the pull request gets the label `release-
 - After `apply`, the step "Wait for a release" waits up to 15 minutes for a version in flight.
 - `CASCADE` in `train.yml` gives the value of `--cascade`.
 - The run starts release workflows only when `RELEASE_DISPATCH` in `train.yml` is `"true"`.
+- The run does the template sync only when `SYNC` in `train.yml` is `"true"` (the default). The step "Check the Workflows permission of the App" asks for a token with the permission Workflows: write, and gives `--workflows yes` or `--workflows no` to `apply`.

@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import semver from "semver";
 import { changesetText, decideBump, setManifestVersion, typedFiles } from "./release.ts";
 import { ageRuleEdit, globMatch } from "./settings.ts";
@@ -9,6 +9,8 @@ import type { LockChange, ReleaseDone, RepoUpdate, UpdateResult, Updater, YoungI
 import type { FetchFn } from "./collect.ts";
 import { TRAIN_BRANCH } from "./apply.ts";
 import { parseNpmLock, parsePnpmLock } from "./parse.ts";
+import { SYNC_BRANCH, syncCommitMessage, syncRepo, workflowsRefused } from "./sync.ts";
+import type { RepoFiles, SyncJob, SyncPush, SyncResult, SyncUpdater } from "./sync.ts";
 import type { Resolved } from "./types.ts";
 
 /** The result of one command. */
@@ -163,7 +165,7 @@ function tail(s: string, n = 800): string {
  * again and a frozen check. For npm, it uses the npm equivalents. Then it checks the lockfile and pushes one commit to the branch
  * of the train. The token goes to git in the environment, not in a URL.
  */
-export function gitUpdater(o: GitUpdaterOptions): Updater {
+export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
   const run = o.run ?? runCommand;
   const f: FetchFn = o.fetch ?? ((u, i) => fetch(u, i));
   const registry = o.registry ?? "https://registry.npmjs.org";
@@ -214,20 +216,42 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
     GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
   });
 
+  type Sh = (cmd: string, args: string[], what: string) => Promise<RunResult>;
+  /** This function gives the command helper of one clone folder. It throws on an exit code that is not 0. */
+  const shell = (dir: string): Sh => async (cmd, args, what) => {
+    const r = await run(cmd, args, { cwd: dir, env });
+    if (r.code !== 0) throw new Error(`${what} failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}`);
+    return r;
+  };
+  /** This function clones the default branch and fetches a branch of the train. It gives the remote ref and if the branch exists. */
+  const checkout = async (dir: string, sh: Sh, repo: string, branch: string, defaultBranch: string): Promise<{ remoteRef: string; hasRemote: boolean }> => {
+    await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", defaultBranch, `https://github.com/${o.owner}/${repo}.git`, "."], "git clone");
+    const remoteRef = `refs/remotes/origin/${branch}`;
+    const fetched = await run("git", ["fetch", "--quiet", "--depth", "2", "origin", `+refs/heads/${branch}:${remoteRef}`], { cwd: dir, env });
+    return { remoteRef, hasRemote: fetched.code === 0 };
+  };
+  /** This function pushes the commit to a branch. When the branch already has the same content in the changed files, it does not push. */
+  const pushHead = async (dir: string, sh: Sh, branch: string, remote: { remoteRef: string; hasRemote: boolean }, rebuild: boolean): Promise<{ status: "same" | "pushed"; sha: string }> => {
+    const { remoteRef, hasRemote } = remote;
+    const head = (await sh("git", ["rev-parse", "HEAD"], "git rev-parse")).stdout.trim();
+    if (hasRemote && !rebuild) {
+      const ours = (await sh("git", ["diff", "--name-only", "HEAD~1", "HEAD"], "git diff")).stdout.split("\n");
+      const theirs = (await run("git", ["diff", "--name-only", `${remoteRef}~1`, remoteRef], { cwd: dir, env })).stdout.split("\n");
+      const files = [...new Set([...ours, ...theirs].map((f) => f.trim()).filter(Boolean))];
+      const same = await run("git", ["diff", "--quiet", remoteRef, "HEAD", "--", ...files], { cwd: dir, env });
+      if (same.code === 0) return { status: "same", sha: (await sh("git", ["rev-parse", remoteRef], "git rev-parse")).stdout.trim() };
+    }
+    await sh("git", ["push", "--quiet", "--force", "origin", `HEAD:refs/heads/${branch}`], "git push");
+    return { status: "pushed", sha: head };
+  };
+
   return {
     async update(u0: RepoUpdate, ctx: { defaultBranch: string; rebuild: boolean }): Promise<UpdateResult> {
       const dir = mkdtempSync(join(o.tmpRoot ?? tmpdir(), "rt-"));
       const fail = (error: string): UpdateResult => ({ status: "failed", sha: null, changes: [], unresolved: [], young: [], tool: null, error });
-      const sh = async (cmd: string, args: string[], what: string): Promise<RunResult> => {
-        const r = await run(cmd, args, { cwd: dir, env });
-        if (r.code !== 0) throw new Error(`${what} failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}`);
-        return r;
-      };
+      const sh = shell(dir);
       try {
-        await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", ctx.defaultBranch, `https://github.com/${o.owner}/${u0.repo}.git`, "."], "git clone");
-        const remoteRef = `refs/remotes/origin/${TRAIN_BRANCH}`;
-        const fetched = await run("git", ["fetch", "--quiet", "--depth", "2", "origin", `+refs/heads/${TRAIN_BRANCH}:${remoteRef}`], { cwd: dir, env });
-        const hasRemote = fetched.code === 0;
+        const remote = await checkout(dir, sh, u0.repo, TRAIN_BRANCH, ctx.defaultBranch);
 
         // 0. The minimumReleaseAge of pnpm: CI refuses a lockfile with a younger version. Such an item waits.
         let tool: string | null = null;
@@ -378,23 +402,53 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
         await sh("git", ["add", "-u"], "git add");
         if (added.length > 0) await sh("git", ["add", "--", ...added], "git add");
         await sh("git", ["-c", `user.name=${o.author.name}`, "-c", `user.email=${o.author.email}`, "commit", "--quiet", "--no-verify", "-m", msg], "git commit");
-        const head = (await sh("git", ["rev-parse", "HEAD"], "git rev-parse")).stdout.trim();
 
         // 5. No push when the branch already has the same content in the files of the train.
-        if (hasRemote && !ctx.rebuild) {
-          const ours = (await sh("git", ["diff", "--name-only", "HEAD~1", "HEAD"], "git diff")).stdout.split("\n");
-          const theirs = (await run("git", ["diff", "--name-only", `${remoteRef}~1`, remoteRef], { cwd: dir, env })).stdout.split("\n");
-          const files = [...new Set([...ours, ...theirs].map((f) => f.trim()).filter(Boolean))];
-          const same = await run("git", ["diff", "--quiet", remoteRef, "HEAD", "--", ...files], { cwd: dir, env });
-          if (same.code === 0) {
-            const sha = (await sh("git", ["rev-parse", remoteRef], "git rev-parse")).stdout.trim();
-            return { status: "same", sha, changes, unresolved, young, tool, error: null, releases };
-          }
-        }
-        await sh("git", ["push", "--quiet", "--force", "origin", `HEAD:refs/heads/${TRAIN_BRANCH}`], "git push");
-        return { status: "pushed", sha: head, changes, unresolved, young, tool, error: null, releases };
+        const pushed = await pushHead(dir, sh, TRAIN_BRANCH, remote, ctx.rebuild);
+        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+
+    /**
+     * The template sync: this function applies the sync rules to the files of a clone. When a rule asks for it, the package
+     * manager of the repository updates the lockfile. Then the function pushes one commit to the sync branch.
+     */
+    async sync(job: SyncJob, ctx: { defaultBranch: string; rebuild: boolean }): Promise<SyncPush> {
+      const dir = mkdtempSync(join(o.tmpRoot ?? tmpdir(), "rt-"));
+      const sh = shell(dir);
+      let result: SyncResult | null = null;
+      let tool: string | null = null;
+      try {
+        const remote = await checkout(dir, sh, job.repo, SYNC_BRANCH, ctx.defaultBranch);
+        const paths = (await sh("git", ["ls-files", "-z"], "git ls-files")).stdout.split("\0").filter(Boolean);
+        const files: RepoFiles = { paths, read: async (p) => (existsSync(join(dir, p)) ? readFileSync(join(dir, p), "utf8") : null) };
+        result = await syncRepo(files, job.facts, job.rules, job.workflows);
+        for (const r of result.removes) rmSync(join(dir, r), { recursive: true, force: true });
+        for (const [p, text] of Object.entries(result.writes)) {
+          mkdirSync(dirname(join(dir, p)), { recursive: true });
+          writeFileSync(join(dir, p), text);
+        }
+        if (result.install && existsSync(join(dir, "pnpm-lock.yaml"))) {
+          tool = `pnpm ${(await run("pnpm", ["--version"], { cwd: dir, env })).stdout.trim() || "?"}`;
+          await sh("pnpm", ["install", "--lockfile-only"], "pnpm install --lockfile-only");
+          await sh("pnpm", ["install", "--lockfile-only", "--frozen-lockfile"], "pnpm install --frozen-lockfile");
+        } else if (result.install && existsSync(join(dir, "package-lock.json"))) {
+          tool = `npm ${(await run("npm", ["--version"], { cwd: dir, env })).stdout.trim() || "?"}`;
+          await sh("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], "npm install --package-lock-only");
+        }
+        const status = await sh("git", ["status", "--porcelain"], "git status");
+        if (status.stdout.trim() === "") return { status: "no-change", sha: null, result, tool, error: null };
+        await sh("git", ["add", "-A"], "git add");
+        await sh("git", ["-c", `user.name=${o.author.name}`, "-c", `user.email=${o.author.email}`, "commit", "--quiet", "--no-verify", "-m", syncCommitMessage(result)], "git commit");
+        const pushed = await pushHead(dir, sh, SYNC_BRANCH, remote, ctx.rebuild);
+        return { status: pushed.status, sha: pushed.sha, result, tool, error: null };
+      } catch (e) {
+        const error = e instanceof Error ? e.message : String(e);
+        return { status: workflowsRefused(error) ? "workflows-denied" : "failed", sha: null, result, tool, error };
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }

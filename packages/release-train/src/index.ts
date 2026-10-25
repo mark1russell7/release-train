@@ -9,3 +9,4 @@ export * from "./apply.ts";
 export * from "./github.ts";
 export * from "./workspace.ts";
 export * from "./cli.ts";
+export * from "./sync.ts";
