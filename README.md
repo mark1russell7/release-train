@@ -48,7 +48,7 @@ node packages/release-train/src/bin.ts plan --write-db <folder>
 - Each repository gets one branch `release-train/update` and one combined pull request. A next run updates that branch and does not open a second pull request.
 - A breaking adoption changes the range to a caret range of the new version (`^x.y.z`).
 - The lockfile comes from the package manager of the repository: `pnpm update --lockfile-only --no-save <dep>@<version>`, then `pnpm install --lockfile-only` and a check with `--frozen-lockfile` (or the npm equivalents). The train does not write a lockfile itself.
-- The exact version gives the target of the plan, also when it is younger than the `minimumReleaseAge` of pnpm (1 day by default since pnpm 11).
+- pnpm 11 and later refuse a version that is younger than `minimumReleaseAge` (1 day by default, from `pnpm-workspace.yaml` or `.npmrc`). The train leaves out such a version and adds it in a later run. When each version of a repository is too young, the repository waits, and the train closes its open pull request with a mark. The train opens again a pull request that it closed itself, but not one that a person closed.
 - The body of the pull request tells each change, the reason, and each other lockfile change. It has the label `release-train`.
 - The train turns on GitHub auto-merge. When GitHub cannot merge on green (for example, the branch has no protection), the train merges a green pull request in a later run.
 - When CI fails, the pull request stays open with the label `release-train:blocked`.

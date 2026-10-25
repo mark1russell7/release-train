@@ -19,7 +19,8 @@ import { gitHub } from "./github.ts";
 import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import type { Manifest, NpmInfo, RepoSnapshot, Resolved } from "./types.ts";
-import { editManifest, lockChanges, replaceRange } from "./workspace.ts";
+import { ageExcluded, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
+import type { RunFn } from "./workspace.ts";
 
 const OWNER = "example-owner";
 
@@ -98,7 +99,7 @@ function updater(result: Partial<UpdateResult> = {}): Updater & { seen: RepoUpda
     seen,
     async update(u) {
       seen.push(u);
-      return { status: "pushed", sha: "newsha", changes: [], unresolved: [], tool: "pnpm 12.0.0", error: null, ...result };
+      return { status: "pushed", sha: "newsha", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null, ...result };
     },
   };
 }
@@ -239,6 +240,42 @@ describe("apply", () => {
     expect(calls.some((c) => c.method === "POST")).toBe(false);
   });
 
+  it("closes the pull request with a mark when its versions are younger than the minimumReleaseAge", async () => {
+    const { gh, calls } = server({
+      [`GET ${base}/lib-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(4, "lib-repo")] : []],
+      [`GET ${base}/lib-repo/pulls/4`]: () => [200, pull(4, "lib-repo")],
+      [`GET ${base}/lib-repo`]: meta,
+      [`POST ${base}/lib-repo/issues/4/comments`]: () => [201, {}],
+      [`PATCH ${base}/lib-repo/pulls/4`]: (b) => [200, { ...pull(4, "lib-repo"), ...b }],
+      [`DELETE ${base}/lib-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+    });
+    const young = [{ dep: "@ex/core", version: "2.0.0", readyAt: "2026-01-02T00:00:00.000Z" }];
+    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater({ status: "young", sha: null, young }), dryRun: false, only: ["lib-repo"] });
+    expect(r.results[0]).toMatchObject({ state: "waiting" });
+    expect(r.results[0]?.detail).toContain("@ex/core@2.0.0 at 2026-01-02T00:00:00.000Z");
+    const patch = calls.find((c) => c.method === "PATCH" && c.path === `${base}/lib-repo/pulls/4`);
+    expect(patch?.body?.["state"]).toBe("closed");
+    expect(String(patch?.body?.["body"])).toContain("release-train:closed-by-train");
+  });
+
+  it("opens a pull request again that the train closed itself", async () => {
+    const fp = selectUpdates(fixture(), ["lib-repo"]).ready[0]?.fingerprint;
+    const body = `x <!-- release-train:fingerprint=${fp} -->\n<!-- release-train:closed-by-train -->`;
+    const { gh } = server({
+      [`GET ${base}/lib-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [] : [pull(4, "lib-repo", { state: "closed", merged_at: null, body })]],
+      [`GET ${base}/lib-repo`]: meta,
+    });
+    const up = updater({ status: "unresolved", unresolved: ["@ex/core"] });
+    await apply({ owner: OWNER, plan: fixture(), gh, updater: up, dryRun: false, only: ["lib-repo"] });
+    expect(up.seen.length).toBe(1);
+  });
+
+  it("shows only the items that are old enough in a partial update", async () => {
+    const u = selectUpdates(fixture(), ["lib-repo"]).ready[0] as RepoUpdate;
+    const text = prBody(u, { changes: [], unresolved: [], tool: "pnpm 12.0.0", young: [{ dep: "@ex/core", version: "2.0.0", readyAt: "2026-01-02T00:00:00.000Z" }] });
+    expect(text).toContain("younger than the minimumReleaseAge of pnpm, so a later run adds them: `@ex/core@2.0.0` (ready at 2026-01-02T00:00:00.000Z)");
+  });
+
   it("keeps each private name out of the log, the public report and the summary", async () => {
     const { gh } = server({ [`GET ${base}/secret-repo/pulls`]: () => [200, [pull(7, "secret-repo")]] });
     const lines: string[] = [];
@@ -319,5 +356,40 @@ describe("author", () => {
     expect(parseAuthor("bot[bot] <1+bot[bot]@users.noreply.github.com>")).toEqual({ name: "bot[bot]", email: "1+bot[bot]@users.noreply.github.com" });
     expect(parseAuthor(null).name).toBe("release-train");
     expect(parseAuthor("no email").name).toBe("release-train");
+  });
+});
+
+describe("minimumReleaseAge", () => {
+  it("reads the policy from pnpm-workspace.yaml and .npmrc, with the default of pnpm 11 and later", () => {
+    expect(releaseAgePolicy("", "", "12.10.1")).toEqual({ minutes: 1440, exclude: [] });
+    expect(releaseAgePolicy("", "", "10.4.0")).toEqual({ minutes: 0, exclude: [] });
+    expect(releaseAgePolicy("packages:\n  - a\nminimumReleaseAge: 0\n", "", "12.0.0").minutes).toBe(0);
+    expect(releaseAgePolicy("", "minimum-release-age=60\n", "12.0.0").minutes).toBe(60);
+    const yaml = "minimumReleaseAge: 30\nminimumReleaseAgeExclude:\n  - '@ex/*'\n  - other@1.0.0\nonlyBuiltDependencies: []\n";
+    expect(releaseAgePolicy(yaml, "", "12.0.0")).toEqual({ minutes: 30, exclude: ["@ex/*", "other@1.0.0"] });
+    expect(releaseAgePolicy("minimumReleaseAgeExclude: [a, \"@b/c\"]\n", "", "12.0.0").exclude).toEqual(["a", "@b/c"]);
+  });
+
+  it("matches the exclude patterns by name and version", () => {
+    expect(ageExcluded(["@ex/*"], "@ex/core", "2.0.0")).toBe(true);
+    expect(ageExcluded(["@ex/*"], "@other/core", "2.0.0")).toBe(false);
+    expect(ageExcluded(["@ex/core@1.0.0 || 2.0.0"], "@ex/core", "2.0.0")).toBe(true);
+    expect(ageExcluded(["@ex/core@1.0.0"], "@ex/core", "2.0.0")).toBe(false);
+  });
+
+  it("gives young when each target version is too young, before it changes a file", async () => {
+    const cmds: string[] = [];
+    const run: RunFn = async (cmd, args) => {
+      cmds.push(`${cmd} ${args[0] ?? ""}`);
+      return { code: 0, stdout: cmd === "pnpm" ? "12.10.1\n" : "", stderr: "" };
+    };
+    const f: FetchFn = async () => new Response(JSON.stringify({ time: { "2.0.0": "2026-01-01T12:00:00.000Z" } }), { status: 200 });
+    const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: f, now: () => Date.parse("2026-01-02T00:00:00.000Z") });
+    const u = selectUpdates(fixture(), ["lib-repo"]).ready[0] as RepoUpdate;
+    const one = { ...u, lockKind: "pnpm" as const, items: u.items.filter((i) => i.dep === "@ex/core") };
+    const r = await up.update(one, { defaultBranch: "main", rebuild: false });
+    expect(r.status).toBe("young");
+    expect(r.young).toEqual([{ dep: "@ex/core", version: "2.0.0", readyAt: "2026-01-02T12:00:00.000Z" }]);
+    expect(cmds.some((c) => c.startsWith("pnpm update"))).toBe(false);
   });
 });

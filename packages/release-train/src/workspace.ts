@@ -3,7 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import semver from "semver";
-import type { LockChange, RepoUpdate, UpdateResult, Updater } from "./apply.ts";
+import type { LockChange, RepoUpdate, UpdateResult, Updater, YoungItem } from "./apply.ts";
+import type { FetchFn } from "./collect.ts";
 import { TRAIN_BRANCH } from "./apply.ts";
 import { parseNpmLock, parsePnpmLock } from "./parse.ts";
 import type { Resolved } from "./types.ts";
@@ -76,6 +77,77 @@ export function lockChanges(before: Resolved, after: Resolved, intended: Readonl
   return out;
 }
 
+/** The minimumReleaseAge policy of pnpm in one repository. */
+export interface ReleaseAgePolicy {
+  /** The minimum age of a version in minutes. 0 means no policy. */
+  minutes: number;
+  /** The patterns of `minimumReleaseAgeExclude`, for example `@scope/*` or `name@1.2.3`. */
+  exclude: string[];
+}
+
+/**
+ * This function reads the minimumReleaseAge policy from `pnpm-workspace.yaml` and `.npmrc`.
+ * When the files do not set it, pnpm 11 and later use 1440 minutes (1 day), and older versions use 0.
+ */
+export function releaseAgePolicy(workspaceYaml: string, npmrc: string, pnpmVersion: string): ReleaseAgePolicy {
+  const lines = workspaceYaml.split(/\r?\n/);
+  const fromYaml = settingOf(lines, "minimumReleaseAge", ":");
+  const fromRc = settingOf(npmrc.split(/\r?\n/), "minimum-release-age", "=");
+  const major = semver.coerce(pnpmVersion)?.major ?? 0;
+  const number = (v: string | null): number | null => (v !== null && /^\d+$/.test(v) ? Number(v) : null);
+  const minutes = number(fromYaml) ?? number(fromRc) ?? (major >= 11 ? 1440 : 0);
+  const exclude: string[] = [];
+  const list = settingOf(lines, "minimumReleaseAgeExclude", ":");
+  if (list !== null && list.startsWith("[") && list.endsWith("]")) exclude.push(...list.slice(1, -1).split(","));
+  else if (list === "") {
+    const start = lines.findIndex((l) => l.trim().startsWith("minimumReleaseAgeExclude"));
+    for (const l of lines.slice(start + 1)) {
+      const t = l.trim();
+      if (l === l.trimStart() || !t.startsWith("-")) break;
+      exclude.push(t.slice(1));
+    }
+  }
+  return { minutes, exclude: exclude.map((x) => x.trim().replace(/^["']|["']$/g, "")).filter(Boolean) };
+}
+
+/** This function gives the value of a "key: value" or "key=value" line, or null. */
+function settingOf(lines: readonly string[], key: string, sep: string): string | null {
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line.startsWith(key)) continue;
+    const rest = line.slice(key.length).trimStart();
+    if (rest.startsWith(sep)) return rest.slice(sep.length).trim();
+  }
+  return null;
+}
+
+/** This function tells if a pattern of `minimumReleaseAgeExclude` matches a version of a package. */
+export function ageExcluded(patterns: readonly string[], name: string, version: string): boolean {
+  return patterns.some((p) => {
+    const at = p.indexOf("@", 1);
+    const namePart = at > 0 ? p.slice(0, at) : p;
+    const versions = at > 0 ? p.slice(at + 1).split("||").map((s) => s.trim()) : null;
+    return globMatch(namePart, name) && (versions === null || versions.includes(version));
+  });
+}
+
+/** This function matches a text against a pattern in which `*` stands for any text. It uses no regular expression. */
+function globMatch(pattern: string, text: string): boolean {
+  const parts = pattern.split("*");
+  if (parts.length === 1) return pattern === text;
+  const first = parts[0] ?? "";
+  const last = parts[parts.length - 1] ?? "";
+  if (text.length < first.length + last.length || !text.startsWith(first) || !text.endsWith(last)) return false;
+  let pos = first.length;
+  const end = text.length - last.length;
+  for (const p of parts.slice(1, -1)) {
+    const i = text.indexOf(p, pos);
+    if (i < 0 || i + p.length > end) return false;
+    pos = i + p.length;
+  }
+  return true;
+}
+
 /** The options of the updater that uses git and the package manager of the repository. */
 export interface GitUpdaterOptions {
   owner: string;
@@ -83,6 +155,14 @@ export interface GitUpdaterOptions {
   author: { name: string; email: string };
   run?: RunFn;
   tmpRoot?: string;
+  /** The function that reads the publish times from the npm registry. Tests give a mock. */
+  fetch?: FetchFn;
+  registry?: string;
+  now?: () => number;
+}
+
+function readText(file: string): string {
+  return existsSync(file) ? readFileSync(file, "utf8") : "";
 }
 
 function tail(s: string, n = 800): string {
@@ -97,6 +177,18 @@ function tail(s: string, n = 800): string {
  */
 export function gitUpdater(o: GitUpdaterOptions): Updater {
   const run = o.run ?? runCommand;
+  const f: FetchFn = o.fetch ?? ((u, i) => fetch(u, i));
+  const registry = o.registry ?? "https://registry.npmjs.org";
+  const now = o.now ?? Date.now;
+  const publishTimes = async (dep: string): Promise<Record<string, string>> => {
+    try {
+      const res = await f(`${registry}/${dep.replaceAll("/", "%2f")}`, { headers: { accept: "application/json" } });
+      if (!res.ok) return {};
+      return ((await res.json()) as { time?: Record<string, string> }).time ?? {};
+    } catch {
+      return {};
+    }
+  };
   const basic = Buffer.from(`x-access-token:${o.token}`).toString("base64");
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) {
@@ -112,19 +204,42 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
   });
 
   return {
-    async update(u: RepoUpdate, ctx: { defaultBranch: string; rebuild: boolean }): Promise<UpdateResult> {
+    async update(u0: RepoUpdate, ctx: { defaultBranch: string; rebuild: boolean }): Promise<UpdateResult> {
       const dir = mkdtempSync(join(o.tmpRoot ?? tmpdir(), "rt-"));
-      const fail = (error: string): UpdateResult => ({ status: "failed", sha: null, changes: [], unresolved: [], tool: null, error });
+      const fail = (error: string): UpdateResult => ({ status: "failed", sha: null, changes: [], unresolved: [], young: [], tool: null, error });
       const sh = async (cmd: string, args: string[], what: string): Promise<RunResult> => {
         const r = await run(cmd, args, { cwd: dir, env });
         if (r.code !== 0) throw new Error(`${what} failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}`);
         return r;
       };
       try {
-        await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", ctx.defaultBranch, `https://github.com/${o.owner}/${u.repo}.git`, "."], "git clone");
+        await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", ctx.defaultBranch, `https://github.com/${o.owner}/${u0.repo}.git`, "."], "git clone");
         const remoteRef = `refs/remotes/origin/${TRAIN_BRANCH}`;
         const fetched = await run("git", ["fetch", "--quiet", "--depth", "2", "origin", `+refs/heads/${TRAIN_BRANCH}:${remoteRef}`], { cwd: dir, env });
         const hasRemote = fetched.code === 0;
+
+        // 0. The minimumReleaseAge of pnpm: CI refuses a lockfile with a younger version. Such an item waits.
+        let tool: string | null = null;
+        const youngBy = new Map<string, YoungItem>();
+        if (u0.lockKind === "pnpm") {
+          const v = (await run("pnpm", ["--version"], { cwd: dir, env })).stdout.trim();
+          tool = `pnpm ${v || "?"}`;
+          const policy = releaseAgePolicy(readText(join(dir, "pnpm-workspace.yaml")), readText(join(dir, ".npmrc")), v);
+          if (policy.minutes > 0) {
+            for (const dep of [...new Set(u0.items.map((i) => i.dep))]) {
+              const times = await publishTimes(dep);
+              for (const i of u0.items.filter((x) => x.dep === dep)) {
+                const t = Date.parse(times[i.to] ?? "");
+                if (Number.isNaN(t) || ageExcluded(policy.exclude, dep, i.to)) continue;
+                const readyAt = t + policy.minutes * 60_000;
+                if (readyAt > now()) youngBy.set(dep, { dep, version: i.to, readyAt: new Date(readyAt).toISOString() });
+              }
+            }
+          }
+        }
+        const young = [...youngBy.values()];
+        const u: RepoUpdate = { ...u0, items: u0.items.filter((i) => !youngBy.has(i.dep)) };
+        if (u.items.length === 0) return { status: "young", sha: null, changes: [], unresolved: [], young, tool, error: null };
 
         // 1. The ranges of the breaking items.
         const byPath = new Map<string, { type: string; dep: string; range: string; newRange: string }[]>();
@@ -150,12 +265,9 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
         };
         const before = read();
         const inRange = [...new Set(u.items.filter((i) => !i.newRange).map((i) => i.dep))];
-        let tool: string | null = null;
         if (u.lockKind === "pnpm") {
-          const v = await run("pnpm", ["--version"], { cwd: dir, env });
-          tool = `pnpm ${v.stdout.trim() || "?"}`;
           const recursive = existsSync(join(dir, "pnpm-workspace.yaml")) ? ["-r"] : [];
-          // An exact version gives the target of the plan, also when it is younger than the minimumReleaseAge of pnpm.
+          // An exact version gives the target of the plan. Step 0 left out each version younger than the minimumReleaseAge.
           const exact = [...new Map(u.items.map((i) => [i.dep, `${i.dep}@${i.to}`])).values()];
           await sh("pnpm", ["update", ...recursive, "--lockfile-only", "--no-save", ...exact], "pnpm update --lockfile-only");
           // This install aligns each other part of the lockfile with the changed ranges. Then the frozen check must pass, as in CI.
@@ -179,8 +291,8 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           : [];
         const changes = lockChanges(before, after, new Set(u.items.map((i) => `${i.path}|${i.dep}`)));
         const status = await sh("git", ["status", "--porcelain"], "git status");
-        if (status.stdout.trim() === "" && unresolved.length === 0) return { status: "no-change", sha: null, changes, unresolved, tool, error: null };
-        if (status.stdout.trim() === "" || (lockFile && unresolved.length === names.length)) return { status: "unresolved", sha: null, changes, unresolved, tool, error: null };
+        if (status.stdout.trim() === "" && unresolved.length === 0) return { status: "no-change", sha: null, changes, unresolved, young, tool, error: null };
+        if (status.stdout.trim() === "" || (lockFile && unresolved.length === names.length)) return { status: "unresolved", sha: null, changes, unresolved, young, tool, error: null };
 
         // 4. One commit on the newest default branch.
         const msg = [
@@ -200,11 +312,11 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
           const same = await run("git", ["diff", "--quiet", remoteRef, "HEAD", "--", ...files], { cwd: dir, env });
           if (same.code === 0) {
             const sha = (await sh("git", ["rev-parse", remoteRef], "git rev-parse")).stdout.trim();
-            return { status: "same", sha, changes, unresolved, tool, error: null };
+            return { status: "same", sha, changes, unresolved, young, tool, error: null };
           }
         }
         await sh("git", ["push", "--quiet", "--force", "origin", `HEAD:refs/heads/${TRAIN_BRANCH}`], "git push");
-        return { status: "pushed", sha: head, changes, unresolved, tool, error: null };
+        return { status: "pushed", sha: head, changes, unresolved, young, tool, error: null };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       } finally {
