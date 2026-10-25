@@ -218,11 +218,11 @@ describe("release dispatch", () => {
     plan(buildGraph({ owner: OWNER, repos: [snap("rel-repo", { "": { name: "@ex/rel", version: "1.1.0" } })], npm: { "@ex/rel": npm("1.0.0") }, now: new Date("2026-01-01T00:00:00Z") }));
   const b = `/repos/${OWNER}/rel-repo`;
   const wf = (text: string): Handler => () => [200, { content: Buffer.from(text).toString("base64") }];
-  const routes = (dispatch: [number, unknown], workflow = "on:\n  workflow_dispatch:\n"): Record<string, Handler> => ({
+  const routes = (dispatch: [number, unknown], workflow = "on:\n  workflow_dispatch:\n", last = "success"): Record<string, Handler> => ({
     [`GET ${b}/contents/.github/workflows/release.yml`]: wf(workflow),
     [`GET ${b}`]: () => [200, { default_branch: "main", allow_auto_merge: false }],
     [`GET ${b}/pulls`]: () => [200, []],
-    [`GET ${b}/actions/workflows/release.yml/runs`]: () => [200, { workflow_runs: [{ status: "completed" }] }],
+    [`GET ${b}/actions/workflows/release.yml/runs`]: () => [200, { workflow_runs: [{ status: "completed", conclusion: last }] }],
     [`GET ${b}/commits/main`]: () => [200, { sha: "m1" }],
     [`GET ${b}/commits/m1/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }],
     [`GET ${b}/commits/m1/status`]: () => [200, { state: "pending", total_count: 0 }],
@@ -251,8 +251,15 @@ describe("release dispatch", () => {
     expect(one.calls.some((c) => c.startsWith("POST"))).toBe(false);
     expect(r.inFlight).toHaveLength(1);
     const two = server(routes([204, null]));
-    await apply({ owner: OWNER, plan: relPlan(), gh: two.gh, updater: noUpdate, dryRun: false });
-    expect(two.calls.some((c) => c.includes("release.yml"))).toBe(false);
+    const r2 = await apply({ owner: OWNER, plan: relPlan(), gh: two.gh, updater: noUpdate, dryRun: false });
+    expect(two.calls.some((c) => c.includes("dispatches"))).toBe(false);
+    expect(r2.inFlight).toEqual([]);
+  });
+
+  it("does not wait for a version whose last release run failed", async () => {
+    const { gh } = server(routes([204, null], "on:\n  push:\n", "failure"));
+    const r = await apply({ owner: OWNER, plan: relPlan(), gh, updater: noUpdate, dryRun: false });
+    expect(r.inFlight).toEqual([]);
   });
 });
 
