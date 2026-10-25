@@ -25,6 +25,7 @@ export interface Manifest {
   optionalDependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
   workspaces?: string[] | { packages?: string[] };
+  packageManager?: string;
 }
 
 /** A `package.json` file and its folder in the repository. The root folder is the empty string. */
@@ -48,6 +49,10 @@ export interface RepoSnapshot {
   lockKind: LockKind;
   resolved: Resolved;
   warnings: string[];
+  /** The text of `pnpm-workspace.yaml`, or null when the repository has no such file. */
+  pnpmWorkspace?: string | null;
+  /** The `packageManager` field of the root `package.json`, for example `pnpm@12.0.0`. */
+  packageManager?: string | null;
 }
 
 /** The state of one package on the npm registry. */
@@ -101,6 +106,8 @@ export interface RepoInfo {
   packages: string[];
   importers: number;
   warnings: string[];
+  /** True when the release train must put the scopes of the owner into `minimumReleaseAgeExclude` of pnpm. */
+  needsAgeRule?: boolean;
 }
 
 /** The dependency graph of the packages of one owner. */

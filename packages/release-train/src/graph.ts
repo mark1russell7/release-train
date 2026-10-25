@@ -1,6 +1,7 @@
 import { BLOCKING_KINDS, DEP_TYPES } from "./types.ts";
 import type { Edge, Graph, Importer, NpmInfo, PackageNode, RepoInfo, RepoSnapshot } from "./types.ts";
 import { parseSpec } from "./parse.ts";
+import { needsAgeRule, ownScopes } from "./settings.ts";
 
 /** The input of `buildGraph`. */
 export interface GraphInput {
@@ -31,6 +32,7 @@ export function buildGraph(input: GraphInput): Graph {
       packages: [],
       importers: repo.manifests.length,
       warnings: [...repo.warnings],
+      needsAgeRule: needsAgeRule({ lockKind: repo.lockKind, pnpmWorkspace: repo.pnpmWorkspace ?? null, packageManager: repo.packageManager ?? null }, ownScopes(input.owner)),
     };
     for (const { path, manifest: m } of repo.manifests) {
       const published = Boolean(m.name) && m.private !== true;

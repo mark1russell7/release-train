@@ -4,6 +4,7 @@ import { pool } from "./collect.ts";
 import type { GitHub } from "./github.ts";
 import type { Action, Plan } from "./plan.ts";
 import type { DepType, LockKind } from "./types.ts";
+import { ownScopes } from "./settings.ts";
 
 /** The branch of each pull request of the release train. */
 export const TRAIN_BRANCH = "release-train/update";
@@ -38,11 +39,14 @@ export interface RepoUpdate {
   repo: string;
   private: boolean;
   actionId: string;
-  kind: "adopt-in-range" | "adopt-breaking";
+  /** "settings" is an update of the pnpm settings only, with no items. */
+  kind: "adopt-in-range" | "adopt-breaking" | "settings";
   wave: number;
   why: string;
   lockKind: LockKind;
   items: UpdateItem[];
+  /** The scopes that the update puts into `minimumReleaseAgeExclude` of pnpm, or null when the settings need no change. */
+  ageScopes?: string[] | null;
   fingerprint: string;
 }
 
@@ -64,8 +68,9 @@ export interface Selection {
 }
 
 /** This function gives a short fingerprint of the changes of an update. */
-export function fingerprint(items: readonly UpdateItem[]): string {
+export function fingerprint(items: readonly UpdateItem[], ageScopes: readonly string[] | null = null): string {
   const keys = items.map((i) => [i.path, i.type, i.dep, i.newRange ?? "", i.to].join("|")).sort();
+  if (ageScopes && ageScopes.length > 0) keys.push(`settings|minimumReleaseAgeExclude|${ageScopes.join(",")}`);
   return createHash("sha256").update(keys.join("\n")).digest("hex").slice(0, 12);
 }
 
@@ -80,6 +85,9 @@ function isAdopt(a: Action): a is Action & { kind: "adopt-in-range" | "adopt-bre
 export function selectUpdates(p: Plan, only: readonly string[] | null = null): Selection {
   const latest = new Map(p.nodes.filter((n) => n.kind === "package").map((n) => [n.name, n.npmLatest]));
   const lock = new Map(p.repos.map((r) => [r.name, r.lockKind]));
+  const scopes = ownScopes(p.owner);
+  const ageRule = new Set(p.repos.filter((r) => r.needsAgeRule).map((r) => r.name));
+  const ageScopes = (repo: string): string[] | null => (ageRule.has(repo) ? scopes : null);
   const pick = (repo: string): boolean => !only || only.includes(repo);
   const ready: RepoUpdate[] = [];
   const waiting: WaitingUpdate[] = [];
@@ -116,7 +124,27 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null): S
       why: a.why,
       lockKind: lock.get(a.repo) ?? "none",
       items,
-      fingerprint: fingerprint(items),
+      ageScopes: ageScopes(a.repo),
+      fingerprint: fingerprint(items, ageScopes(a.repo)),
+    });
+  }
+  // A repository whose pnpm settings need the scopes of the owner gets them in its pull request. When it has no ready adoption,
+  // the train sends the settings alone. Its waiting adoption comes in a later run, with no wait for the release age of pnpm.
+  for (const r of p.repos) {
+    if (!r.needsAgeRule || !pick(r.name) || ready.some((u) => u.repo === r.name)) continue;
+    needed.add(r.name);
+    for (let i = waiting.length - 1; i >= 0; i--) if (waiting[i]?.repo === r.name) waiting.splice(i, 1);
+    ready.push({
+      repo: r.name,
+      private: r.private,
+      actionId: `settings:${r.name}`,
+      kind: "settings",
+      wave: 0,
+      why: "The release train updates the packages of the owner, so the release age check of pnpm must not make them wait",
+      lockKind: r.lockKind,
+      items: [],
+      ageScopes: scopes,
+      fingerprint: fingerprint([], scopes),
     });
   }
   return { ready, waiting, needed };
@@ -249,6 +277,7 @@ export function mergeMethod(meta: { allow_merge_commit?: boolean; allow_squash_m
 
 /** This function gives the title of the pull request of an update. */
 export function prTitle(u: RepoUpdate): string {
+  if (u.items.length === 0) return "chore(pnpm): no release age wait for the packages of the owner";
   const deps = [...new Set(u.items.map((i) => i.dep))];
   const what = deps.length === 1 ? (deps[0] as string) : `${deps.length} packages`;
   return `chore(deps): release train update of ${what}`;
@@ -264,15 +293,22 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
     return `| \`${i.dep}\` | \`${i.path || "."}\` | ${i.type} | ${range} | ${lock} |`;
   });
   const other = (r?.changes ?? []).filter((c) => !c.intended);
+  const scopes = u.ageScopes ?? [];
+  const settings = scopes.length > 0
+    ? [
+        "## pnpm settings",
+        "",
+        `\`pnpm-workspace.yaml\` gets ${scopes.map((s) => `\`${s}\``).join(" and ")} in \`minimumReleaseAgeExclude\`. The release train updates these packages, so pnpm installs their new versions at once. The minimumReleaseAge of pnpm stays for all other packages. The change removes each entry that these patterns cover.`,
+        "",
+      ]
+    : [];
   const lines = [
-    "The release train updates the dependencies of this repository on packages of the owner.",
+    rows.length > 0
+      ? "The release train updates the dependencies of this repository on packages of the owner."
+      : "The release train changes the pnpm settings of this repository.",
     "",
-    "## What changes",
-    "",
-    "| Package | Folder | Section | Range | Lockfile |",
-    "|---|---|---|---|---|",
-    ...rows,
-    "",
+    ...(rows.length > 0 ? ["## What changes", "", "| Package | Folder | Section | Range | Lockfile |", "|---|---|---|---|---|", ...rows, ""] : []),
+    ...settings,
     "## Why",
     "",
     `${u.why} (plan action \`${u.actionId}\`, kind \`${u.kind}\`, wave ${u.wave}).`,
@@ -489,7 +525,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     }
     if (o.dryRun) {
       const what = existing ? `The run updates PR #${existing.number}` : "The run opens a pull request";
-      result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length} ${u.items.length === 1 ? "change" : "changes"}.` });
+      result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length === 0 ? "the pnpm settings" : `${u.items.length} ${u.items.length === 1 ? "change" : "changes"}`}${u.items.length > 0 && u.ageScopes ? " and the pnpm settings" : ""}.` });
       continue;
     }
     try {

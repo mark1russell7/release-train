@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import semver from "semver";
+import { ageRuleEdit, globMatch } from "./settings.ts";
 import type { LockChange, RepoUpdate, UpdateResult, Updater, YoungItem } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
 import { TRAIN_BRANCH } from "./apply.ts";
@@ -103,8 +104,10 @@ export function releaseAgePolicy(workspaceYaml: string, npmrc: string, pnpmVersi
     const start = lines.findIndex((l) => l.trim().startsWith("minimumReleaseAgeExclude"));
     for (const l of lines.slice(start + 1)) {
       const t = l.trim();
-      if (l === l.trimStart() || !t.startsWith("-")) break;
-      exclude.push(t.slice(1));
+      if (t === "" || t.startsWith("#")) continue;
+      if (!t.startsWith("-") || (l === l.trimStart() && !t.startsWith("-"))) break;
+      const hash = t.indexOf(" #");
+      exclude.push(hash >= 0 ? t.slice(1, hash) : t.slice(1));
     }
   }
   return { minutes, exclude: exclude.map((x) => x.trim().replace(/^["']|["']$/g, "")).filter(Boolean) };
@@ -129,23 +132,6 @@ export function ageExcluded(patterns: readonly string[], name: string, version: 
     const versions = at > 0 ? p.slice(at + 1).split("||").map((s) => s.trim()) : null;
     return globMatch(namePart, name) && (versions === null || versions.includes(version));
   });
-}
-
-/** This function matches a text against a pattern in which `*` stands for any text. It uses no regular expression. */
-function globMatch(pattern: string, text: string): boolean {
-  const parts = pattern.split("*");
-  if (parts.length === 1) return pattern === text;
-  const first = parts[0] ?? "";
-  const last = parts[parts.length - 1] ?? "";
-  if (text.length < first.length + last.length || !text.startsWith(first) || !text.endsWith(last)) return false;
-  let pos = first.length;
-  const end = text.length - last.length;
-  for (const p of parts.slice(1, -1)) {
-    const i = text.indexOf(p, pos);
-    if (i < 0 || i + p.length > end) return false;
-    pos = i + p.length;
-  }
-  return true;
 }
 
 /** The options of the updater that uses git and the package manager of the repository. */
@@ -222,6 +208,19 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
         // 0. The minimumReleaseAge of pnpm: CI refuses a lockfile with a younger version. Such an item waits.
         let tool: string | null = null;
         const youngBy = new Map<string, YoungItem>();
+        // The scopes of the owner go into minimumReleaseAgeExclude first, so the check below reads the new settings.
+        let settingsChanged = false;
+        let newSettingsFile = false;
+        const wsFile = join(dir, "pnpm-workspace.yaml");
+        if (u0.lockKind === "pnpm" && u0.ageScopes && u0.ageScopes.length > 0) {
+          const existed = existsSync(wsFile);
+          const e = ageRuleEdit(existed ? readFileSync(wsFile, "utf8") : null, u0.ageScopes);
+          if (e.changed) {
+            writeFileSync(wsFile, e.text);
+            settingsChanged = true;
+            newSettingsFile = !existed;
+          }
+        }
         if (u0.lockKind === "pnpm") {
           const v = (await run("pnpm", ["--version"], { cwd: dir, env })).stdout.trim();
           tool = `pnpm ${v || "?"}`;
@@ -240,7 +239,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
         }
         const young = [...youngBy.values()];
         const u: RepoUpdate = { ...u0, items: u0.items.filter((i) => !youngBy.has(i.dep)) };
-        if (u.items.length === 0) return { status: "young", sha: null, changes: [], unresolved: [], young, tool, error: null };
+        if (u.items.length === 0 && !settingsChanged) return { status: "young", sha: null, changes: [], unresolved: [], young, tool, error: null };
 
         // 1. The lockfile and the ranges. The package manager of the repository makes the lockfile.
         const lockFile = u.lockKind === "pnpm" ? "pnpm-lock.yaml" : u.lockKind === "npm" ? "package-lock.json" : null;
@@ -309,15 +308,20 @@ export function gitUpdater(o: GitUpdaterOptions): Updater {
         const changes = lockChanges(before, after, new Set(u.items.map((i) => `${i.path}|${i.dep}`)));
         const status = await sh("git", ["status", "--porcelain"], "git status");
         if (status.stdout.trim() === "" && unresolved.length === 0) return { status: "no-change", sha: null, changes, unresolved, young, tool, error: null };
-        if (status.stdout.trim() === "" || (lockFile && unresolved.length === names.length)) return { status: "unresolved", sha: null, changes, unresolved, young, tool, error: null };
+        if (status.stdout.trim() === "" || (lockFile && names.length > 0 && unresolved.length === names.length)) return { status: "unresolved", sha: null, changes, unresolved, young, tool, error: null };
 
         // 4. One commit on the newest default branch.
+        const subject = names.length === 0
+          ? "chore(pnpm): no release age wait for the packages of the owner"
+          : `chore(deps): release train update of ${names.length === 1 ? names[0] : `${names.length} packages`}`;
         const msg = [
-          `chore(deps): release train update of ${names.length === 1 ? names[0] : `${names.length} packages`}`,
+          subject,
           "",
           ...u.items.map((i) => `- ${i.dep} in ${i.path || "."}: ${i.newRange ? `${i.range} -> ${i.newRange}` : i.range}, lockfile -> ${after[i.path]?.[i.dep] ?? i.to}`),
+          ...(settingsChanged ? [`- pnpm-workspace.yaml: ${(u.ageScopes ?? []).join(", ")} in minimumReleaseAgeExclude`] : []),
         ].join("\n");
         await sh("git", ["add", "-u"], "git add");
+        if (newSettingsFile) await sh("git", ["add", "--", "pnpm-workspace.yaml"], "git add");
         await sh("git", ["-c", `user.name=${o.author.name}`, "-c", `user.email=${o.author.email}`, "commit", "--quiet", "--no-verify", "-m", msg], "git commit");
         const head = (await sh("git", ["rev-parse", "HEAD"], "git rev-parse")).stdout.trim();
 

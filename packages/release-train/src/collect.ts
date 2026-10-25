@@ -190,10 +190,13 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
       return { snap, lockPath: null };
     }
     snap.manifests.push({ path: "", manifest: root });
+    snap.packageManager = typeof root.packageManager === "string" ? root.packageManager : null;
+    snap.pnpmWorkspace = null;
 
     let globs: string[] = manifestWorkspaces(root);
     if (blobs.has("pnpm-workspace.yaml")) {
       const ws = await ghRaw(r.name, "pnpm-workspace.yaml", r.default_branch);
+      snap.pnpmWorkspace = ws;
       if (ws) globs = [...globs, ...parsePnpmWorkspace(ws)];
     }
     if (globs.length > 0) {
