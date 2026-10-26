@@ -37,7 +37,7 @@ env:
   LIVE: "true"
   # The run starts the release workflows that start only by hand (for example with changesets) when RELEASE_DISPATCH
   # is "true". This needs the permission Actions: write of the GitHub App.
-  RELEASE_DISPATCH: "false"
+  RELEASE_DISPATCH: "true"
   # The public repositories (comma-separated) whose breaking adoptions carry a cascade release, "all", or "none".
   # The adoptions of other repositories with a cascade release wait.
   CASCADE: "all"
