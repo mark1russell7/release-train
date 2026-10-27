@@ -21,6 +21,12 @@ const MARK = "<!-- release-train:fingerprint=";
 /** The train adds this mark to the body of a pull request that it closes itself, so a closed train pull request is not "declined". */
 const CLOSED_MARK = "<!-- release-train:closed-by-train -->";
 
+/**
+ * The longest time that a green pull request of the train waits for the workflow runs of other branches, in hours.
+ * After it, the train merges, so a repository whose CI never rests still gets its updates.
+ */
+export const YIELD_MAX_HOURS = 24;
+
 /** One dependency change of an update. */
 export interface UpdateItem {
   path: string;
@@ -319,6 +325,7 @@ interface Pull {
   title: string;
   body: string | null;
   state: string;
+  created_at?: string;
   merged_at?: string | null;
   mergeable?: boolean | null;
   auto_merge?: unknown;
@@ -591,6 +598,22 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     return ciState(runs.data?.check_runs ?? [], status.data);
   };
 
+  /**
+   * This function counts the workflow runs of a repository that are queued or in progress on a branch other than `branch`
+   * and the default branch: the gates of other changes. A merge into the default branch while such a gate runs makes
+   * its result old ("green on the rebased head"), so the gate runs again. Thus the train merges when they are done.
+   */
+  const otherRuns = async (repo: string, branch: string, meta: RepoMeta | null): Promise<number> => {
+    let count = 0;
+    for (const status of ["in_progress", "queued"]) {
+      const res = await gh.request<{ workflow_runs: { head_branch: string | null }[] }>("GET", `${base}/${repo}/actions/runs?status=${status}&per_page=100`);
+      for (const run of res.data?.workflow_runs ?? []) {
+        if (run.head_branch !== branch && run.head_branch !== (meta?.default_branch ?? "main")) count++;
+      }
+    }
+    return count;
+  };
+
   const hasLabel = (pr: Pull, name: string): boolean => (pr.labels ?? []).some((l) => l.name === name);
 
   /** This function merges a green pull request, or labels a red one. It gives the new state. */
@@ -601,6 +624,11 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       return { state: "blocked", ci, detail: "CI failed. The pull request stays open with the blocked label." };
     }
     if (ci === "green" && autoMerge === "train") {
+      const ageHours = pr.created_at ? ((o.now ?? new Date()).getTime() - Date.parse(pr.created_at)) / 3_600_000 : 0;
+      const others = ageHours < YIELD_MAX_HOURS ? await otherRuns(repo, branch, meta) : 0;
+      if (others > 0) {
+        return { state: "unchanged", ci, detail: `CI is green, but ${others} workflow run(s) of other branches are not done. The train merges in a later run, so their result stays valid.` };
+      }
       const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
         await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);

@@ -221,6 +221,34 @@ describe("apply", () => {
     expect(calls.find((c) => c.method === "PUT")?.body).toEqual({ merge_method: "merge", sha: "sha7" });
   });
 
+  it("waits with a green merge while a workflow run of another branch is not done, but not longer than YIELD_MAX_HOURS", async () => {
+    const routes = (created: string) => ({
+      ...green,
+      [`GET ${base}/secret-repo/pulls`]: (_b: unknown, u: URL) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo", { created_at: created })] : []],
+      [`GET ${base}/secret-repo/pulls/7`]: () => [200, pull(7, "secret-repo", { created_at: created })],
+      [`PATCH ${base}/secret-repo/pulls/7`]: (b: Record<string, unknown> | undefined) => [200, { ...pull(7, "secret-repo", { created_at: created }), ...b }],
+      [`GET ${base}/secret-repo`]: meta,
+      [`PATCH ${base}/secret-repo`]: () => [403, { message: "Resource not accessible by integration" }],
+      [`POST ${base}/secret-repo/labels`]: () => [201, {}],
+      [`POST /graphql`]: () => [200, { errors: [{ message: "Auto merge is not allowed for this repository" }] }],
+      [`GET ${base}/secret-repo/actions/runs`]: (_b: unknown, u: URL) =>
+        [200, { workflow_runs: u.searchParams.get("status") === "in_progress" ? [{ head_branch: "gate/x" }, { head_branch: "main" }, { head_branch: TRAIN_BRANCH }] : [] }],
+      [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
+      [`DELETE ${base}/secret-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+    }) as Record<string, Handler>;
+    const now = new Date("2026-01-02T00:00:00Z");
+    const run = (created: string) => {
+      const s = server(routes(created));
+      return apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"], now }).then((r) => ({ r, calls: s.calls }));
+    };
+    const young = await run("2026-01-01T12:00:00Z");
+    expect(young.r.results[0]).toMatchObject({ state: "unchanged", ci: "green", autoMerge: "train" });
+    expect(young.r.results[0]?.detail).toMatch(/1 workflow run\(s\) of other branches/);
+    expect(young.calls.some((c) => c.method === "PUT")).toBe(false);
+    const old = await run("2025-12-31T23:00:00Z");
+    expect(old.r.results[0]).toMatchObject({ state: "merged", ci: "green", autoMerge: "train" });
+  });
+
   it("does not open a pull request again that a person closed", async () => {
     const fp = selectUpdates(fixture(), ["lib-repo"]).ready[0]?.fingerprint;
     const { gh, calls } = server({
