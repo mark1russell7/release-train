@@ -23,7 +23,7 @@ const CLOSED_MARK = "<!-- release-train:closed-by-train -->";
 
 /**
  * The longest time that a green pull request of the train waits for the workflow runs of other branches, in hours.
- * After it, the train merges, so a repository whose CI never rests still gets its updates.
+ * After it, the train merges, so a repository whose CI is always busy still gets its updates.
  */
 export const YIELD_MAX_HOURS = 24;
 
@@ -599,9 +599,10 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   };
 
   /**
-   * This function counts the workflow runs of a repository that are queued or in progress on a branch other than `branch`
-   * and the default branch: the gates of other changes. A merge into the default branch while such a gate runs makes
-   * its result old ("green on the rebased head"), so the gate runs again. Thus the train merges when they are done.
+   * This function counts the workflow runs of a repository that are queued or in progress. It counts only the runs on a
+   * branch other than `branch` and the default branch: the gates of other changes. A merge into the default branch while
+   * such a gate runs makes its result old ("green on the rebased head"), so the gate runs again.
+   * Thus the train merges when they are done.
    */
   const otherRuns = async (repo: string, branch: string, meta: RepoMeta | null): Promise<number> => {
     let count = 0;
