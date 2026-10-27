@@ -19,7 +19,7 @@
   },
   "devDependencies": {
     "@mark1russell7/api-report": "^0.2.0",
-    "@mark1russell7/conventions": "^0.2.0",
+    "@mark1russell7/conventions": "^0.3.0",
     "@mark1russell7/cue": "github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8",
     "@mark1russell7/ste-lint": "github:mark1russell7/ste-lint#aa06c2c28b1c6b2b2e913443bfdf9fa170524905",
     "@mark1russell7/template-cli": "^0.1.0",
