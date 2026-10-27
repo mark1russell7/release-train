@@ -166,11 +166,17 @@ importers:
 
   .:
     devDependencies:
+      '@mark1russell7/api-report':
+        specifier: ^0.2.0
+        version: 0.2.0
+      '@mark1russell7/conventions':
+        specifier: ^0.2.0
+        version: 0.2.0
       '@mark1russell7/cue':
-        specifier: github:mark1russell7/cue
+        specifier: github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8
         version: https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8
       '@mark1russell7/ste-lint':
-        specifier: github:mark1russell7/ste-lint
+        specifier: github:mark1russell7/ste-lint#aa06c2c28b1c6b2b2e913443bfdf9fa170524905
         version: https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905
       '@mark1russell7/template-cli':
         specifier: ^0.1.0
@@ -195,7 +201,7 @@ importers:
         version: 2.9.1
     devDependencies:
       '@mark1russell7/cue':
-        specifier: github:mark1russell7/cue
+        specifier: github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8
         version: https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8
       '@types/node':
         specifier: ^26.6.4
@@ -385,6 +391,16 @@ packages:
 
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
+
+  '@mark1russell7/api-report@0.2.0':
+    resolution: {integrity: sha512-09QIGN/YGpbIgovGQ3uzPCWFwDazOBq8s7qhfi/FU2mo1c0M/iaF9EE+1psdZxN4o9Y1U4oU7zkGYLsfCvvMMg==}
+    engines: {node: '>=22'}
+    hasBin: true
+
+  '@mark1russell7/conventions@0.2.0':
+    resolution: {integrity: sha512-ETy6m+ilJtX62AzlL5bjkLpkUVvfaE1FMuB+6LzlNXP4Juz6xaNdVtdJlr6TMQLcSLlrN61X+U2MUVbPJOxpjw==}
+    engines: {node: '>=22'}
+    hasBin: true
 
   '@mark1russell7/cue@https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8':
     resolution: {gitHosted: true, integrity: sha512-T7pECDOwMETOvAIZGwsv8Cldx4NBjtZUP9MXFseAAmuGzxKKREE4y8n6JYsUtdDHyVRSizYxzO+ZPedPXwWwWA==, tarball: https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8}
@@ -1065,6 +1081,10 @@ snapshots:
     dependencies:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.6.0
+
+  '@mark1russell7/api-report@0.2.0': {}
+
+  '@mark1russell7/conventions@0.2.0': {}
 
   '@mark1russell7/cue@https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8': {}
 
