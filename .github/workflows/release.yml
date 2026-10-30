@@ -61,7 +61,7 @@ jobs:
   build:
     name: Build and pack
     needs: verify
-    uses: mark1russell7/template/.github/workflows/reusable-release-build.yml@787183c2d49e3bb10031457cb36fc4ae8975eeb2 # main
+    uses: mark1russell7/template/.github/workflows/reusable-release-build.yml@f5295fb927bbd6a9321468d63cbd07a67eeebb48 # main
     permissions:
       contents: read
 
@@ -86,14 +86,14 @@ jobs:
       # the pin. Renovate does not move it: the release session moves it at a quiet time, because a
       # workflow change between a version merge and its tag job makes GitHub refuse the tag (HTTP 403).
       - id: publish
-        uses: mark1russell7/template/.github/actions/npm-publish@787183c2d49e3bb10031457cb36fc4ae8975eeb2 # main
+        uses: mark1russell7/template/.github/actions/npm-publish@f5295fb927bbd6a9321468d63cbd07a67eeebb48 # main
 
   tag:
     name: Git tag and GitHub release
     needs: [build, publish]
     # Also after a failed publish: each version that it published before the failure gets its tag.
     if: ${{ !cancelled() && needs.build.result == 'success' }}
-    uses: mark1russell7/template/.github/workflows/reusable-release-tag.yml@787183c2d49e3bb10031457cb36fc4ae8975eeb2 # main
+    uses: mark1russell7/template/.github/workflows/reusable-release-tag.yml@f5295fb927bbd6a9321468d63cbd07a67eeebb48 # main
     permissions:
       contents: write
     with:
