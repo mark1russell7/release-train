@@ -166,22 +166,25 @@ export function pinsOf(text: string, owner: string): { path: string; sha: string
  * workflow is not known.
  */
 export function pinSurface(path: string, text: string | null): string[] | null {
-  if (path.startsWith(".github/actions/")) return [path.replace(/\/+$/, "")];
+  if (path.startsWith(".github/actions/")) return [trimSlashes(path)];
   if (text === null) return null;
   const lines = text.split(/\r?\n/).filter((l) => !isComment(l));
-  const checkouts = lines.filter((l) => /repository:\s*\$\{\{\s*job\.workflow_repository\s*\}\}/.test(l)).length;
+  const checkouts = lines.filter((l) => l.replace(/\s/g, "").includes("repository:${{job.workflow_repository}}")).length;
   const sparse: string[] = [];
   let sparseKeys = 0;
   for (let i = 0; i < lines.length; i++) {
-    const m = /^(\s*)sparse-checkout:\s*(.*)$/.exec(lines[i] ?? "");
-    if (!m) continue;
+    const line = lines[i] ?? "";
+    const key = line.trimStart();
+    if (!key.startsWith("sparse-checkout:")) continue;
     sparseKeys++;
-    const value = (m[2] ?? "").replace(/\s+#.*$/, "").trim();
+    const raw = key.slice("sparse-checkout:".length);
+    const hash = raw.indexOf(" #");
+    const value = (hash >= 0 ? raw.slice(0, hash) : raw).trim();
     if (value !== "|" && value !== ">" && value !== "") {
       sparse.push(value.replace(/^["']|["']$/g, ""));
       continue;
     }
-    const indent = (m[1] ?? "").length;
+    const indent = line.length - key.length;
     for (let j = i + 1; j < lines.length; j++) {
       const l = lines[j] ?? "";
       if (l.trim() === "") continue;
@@ -190,7 +193,16 @@ export function pinSurface(path: string, text: string | null): string[] | null {
     }
   }
   if (sparseKeys < checkouts) return null;
-  return [path, ...sparse.map((s) => s.replace(/^\/+|\/+$/g, ""))];
+  return [path, ...sparse.map(trimSlashes)];
+}
+
+/** This function removes the slashes at the start and at the end of a path. */
+function trimSlashes(path: string): string {
+  let a = 0;
+  let b = path.length;
+  while (a < b && path[a] === "/") a++;
+  while (b > a && path[b - 1] === "/") b--;
+  return path.slice(a, b);
 }
 
 /** This function tells if a changed path is in a surface: the path itself, or a file in a folder of the surface. */
@@ -558,10 +570,10 @@ export const SURFACE_WALK = 30;
  * This function reads the facts of a run: the template commit of the pins, its files and the npm version of the template
  * CLI. It gives null when the template is not readable.
  *
- * The commit of the pins is the oldest first-parent commit of `main` whose surface is the surface of the head: the shared
- * workflows (`.github/workflows/reusable-*.yml`), the `sparse-checkout` paths of their checkouts of the template, and
- * `.github/actions`. Thus a change of the docs of the template moves no target, and an open sync pull request gets no
- * new push and no new CI. When the surface is not known, the commit of the pins is the head.
+ * The commit of the pins is the oldest first-parent commit of `main` with the surface of the head. The surface is the
+ * shared workflows (`.github/workflows/reusable-*.yml`), their `sparse-checkout` paths and `.github/actions`. Thus a
+ * change of the docs of the template moves no target. An open sync pull request then gets no new push and no new CI.
+ * When the surface is not known, the commit of the pins is the head.
  */
 export async function syncFacts(o: { gh: GitHub; owner: string; fetch?: FetchFn; registry?: string }): Promise<RunFacts | null> {
   const f: FetchFn = o.fetch ?? ((u, i) => fetch(u, i));
