@@ -13,7 +13,11 @@ import {
   SYNC_BRANCH,
   SYNC_KIND,
   WORKFLOWS_WAIT,
+  inSurface,
   movePins,
+  pinSurface,
+  pinsOf,
+  pinsStale,
   syncFacts,
   syncRepo,
   workflowsRefused,
@@ -78,6 +82,73 @@ describe("pins", () => {
     const r = await syncRepo(files, facts());
     expect(outcome(r, "pins")).toMatchObject({ state: "report", changes: [] });
     expect(outcome(r, "pins")?.needs[0]).toContain("`.github/workflows/gone.yml`");
+  });
+
+  describe("the surface of a pin", () => {
+    const shared = [
+      "jobs:",
+      "  ci:",
+      "    steps:",
+      "      - uses: actions/checkout@v6",
+      "        with:",
+      "          repository: ${{ job.workflow_repository }}",
+      "          ref: ${{ job.workflow_sha }}",
+      "          sparse-checkout: .github/actions",
+      "      - uses: actions/checkout@v6",
+      "        with:",
+      "          repository: ${{ job.workflow_repository }}",
+      "          sparse-checkout: |",
+      "            scripts/release",
+      "            scripts/ai-review/",
+      "          path: x",
+      "",
+    ].join("\n");
+
+    it("is the file of a shared workflow and the sparse-checkout paths of its checkouts of the template", () => {
+      expect(pinSurface(".github/workflows/reusable-ci.yml", shared)).toEqual([
+        ".github/workflows/reusable-ci.yml",
+        ".github/actions",
+        "scripts/release",
+        "scripts/ai-review",
+      ]);
+      expect(pinSurface(".github/actions/npm-publish", null)).toEqual([".github/actions/npm-publish"]);
+    });
+
+    it("is the whole template when a checkout of the template has no sparse-checkout, or the text is not known", () => {
+      expect(pinSurface(".github/workflows/reusable-ci.yml", shared.replace("          sparse-checkout: .github/actions\n", ""))).toBeNull();
+      expect(pinSurface(".github/workflows/reusable-ci.yml", null)).toBeNull();
+    });
+
+    it("has a file of a folder, but not a file whose name only starts with the folder name", () => {
+      expect(inSurface(".github/actions/site-pages/action.yml", [".github/actions"])).toBe(true);
+      expect(inSurface(".github/actions-test.yml", [".github/actions"])).toBe(false);
+    });
+
+    const surfaceFacts = (changed: string[] | null) =>
+      facts({
+        changedSince: async (sha) => (sha === OLD ? changed : []),
+        readTemplate: async (p) => (p === ".github/workflows/reusable-ci.yml" ? shared : null),
+      });
+
+    it("moves no pin when only files outside the surface changed, such as the docs of the template", async () => {
+      const files = mem({ ".github/workflows/ci.yml": ci(OLD) });
+      const r = await syncRepo(files, surfaceFacts(["docs/ROADMAP.md", "README.md", ".github/workflows/actions-test.yml"]));
+      expect(r.writes).toEqual({});
+      expect(outcome(r, "pins")).toBeUndefined();
+      expect(await pinsStale(pinsOf(ci(OLD), OWNER), surfaceFacts(["docs/ROADMAP.md"]))).toBe(false);
+    });
+
+    it("moves all pins of the repository when a file of one surface changed", async () => {
+      const files = mem({ ".github/workflows/ci.yml": ci(OLD), ".github/workflows/release.yml": release(NEW).replace(`npm-publish@${NEW}`, `npm-publish@${OLD}`) });
+      const r = await syncRepo(files, surfaceFacts(["scripts/release/pack.ts"]));
+      expect(Object.keys(r.writes).sort()).toEqual([".github/workflows/ci.yml", ".github/workflows/release.yml"]);
+    });
+
+    it("moves the pins when the change is not known, as before", async () => {
+      const r = await syncRepo(mem({ ".github/workflows/ci.yml": ci(OLD) }), surfaceFacts(null));
+      expect(Object.keys(r.writes)).toEqual([".github/workflows/ci.yml"]);
+      expect(await pinsStale(pinsOf(ci(OLD), OWNER), facts())).toBe(true);
+    });
   });
 
   it("keeps the pins of release.yml while a version is in flight", async () => {
@@ -361,6 +432,41 @@ describe("syncFacts", () => {
     expect(await r?.contains(MID)).toBe(true);
     expect(await r?.contains(OLD)).toBe(false);
     expect(calls.filter((c) => c.path.includes("/compare/")).length).toBe(2);
+  });
+
+  it("pins the oldest first-parent commit of main with the surface of the head, so a docs commit moves no target", async () => {
+    const wf = ["jobs:", "  ci:", "    steps:", "      - with:", "          repository: ${{ job.workflow_repository }}", "          sparse-checkout: scripts/release", ""].join("\n");
+    const { gh, f } = server({
+      [`GET ${base}/template/commits/main`]: () => [200, { sha: NEW }],
+      [`GET ${base}/template/git/trees/${NEW}`]: () => [200, { tree: [{ path: ".github/workflows/reusable-ci.yml" }, { path: "docs/ROADMAP.md" }] }],
+      [`GET ${base}/template/git/trees/${MID}`]: () => [200, { tree: [{ path: ".github/workflows/reusable-ci.yml" }] }],
+      [`GET ${base}/template/contents/.github/workflows/reusable-ci.yml`]: () => [200, { content: b64(wf) }],
+      [`GET ${base}/template/commits/${NEW}`]: () => [200, { parents: [{ sha: MID }] }],
+      [`GET ${base}/template/commits/${MID}`]: () => [200, { parents: [{ sha: OLD }] }],
+      [`GET ${base}/template/compare/${MID}...${NEW}`]: () => [200, { status: "ahead", files: [{ filename: "docs/ROADMAP.md" }] }],
+      [`GET ${base}/template/compare/${OLD}...${NEW}`]: () => [200, { status: "ahead", files: [{ filename: "docs/ROADMAP.md" }, { filename: "scripts/release/pack.ts" }] }],
+    });
+    const r = await syncFacts({ gh, owner: OWNER, fetch: f, registry: "https://registry.example" });
+    expect(r?.templateSha).toBe(MID);
+    expect(r?.templatePaths?.has("docs/ROADMAP.md")).toBe(false);
+  });
+
+  it("gives the files that changed since a pin once, and null for a cut or a diverged compare", async () => {
+    const many = Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}` }));
+    const { gh, calls, f } = server({
+      [`GET ${base}/template/commits/main`]: () => [200, { sha: NEW }],
+      [`GET ${base}/template/git/trees/${NEW}`]: () => [200, { tree: [] }],
+      [`GET ${base}/template/compare/${OLD}...${NEW}`]: () => [200, { status: "ahead", files: [{ filename: "docs/a.md" }, { filename: "b.ts", previous_filename: "c.ts" }] }],
+      [`GET ${base}/template/compare/${MID}...${NEW}`]: () => [200, { status: "ahead", files: many }],
+      [`GET ${base}/template/contents/.github/workflows/reusable-ci.yml`]: (_b, u) => [200, { content: b64(`ref ${u.searchParams.get("ref")}`) }],
+    });
+    const r = await syncFacts({ gh, owner: OWNER, fetch: f, registry: "https://registry.example" });
+    expect(await r?.changedSince?.(OLD)).toEqual(["docs/a.md", "b.ts", "c.ts"]);
+    expect(await r?.changedSince?.(OLD)).toEqual(["docs/a.md", "b.ts", "c.ts"]);
+    expect(await r?.changedSince?.(MID)).toBeNull();
+    expect(await r?.changedSince?.("4".repeat(40))).toBeNull();
+    expect(await r?.readTemplate?.(".github/workflows/reusable-ci.yml")).toBe(`ref ${NEW}`);
+    expect(calls.filter((c) => c.path.includes(`/compare/${OLD}...`)).length).toBe(1);
   });
 });
 

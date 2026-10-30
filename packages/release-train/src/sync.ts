@@ -40,6 +40,13 @@ export interface RunFacts {
   cliVersion: string | null;
   /** This function tells if a template commit contains `RELEASE_SCRIPTS_COMMIT`. */
   contains(sha: string): Promise<boolean>;
+  /**
+   * This function gives the paths of the template that changed from `sha` to `templateSha`, or null when GitHub does not
+   * give them all. Without it, each old pin moves.
+   */
+  changedSince?(sha: string): Promise<string[] | null>;
+  /** This function reads a file of the template at `templateSha`, or gives null. Without it, each old pin moves. */
+  readTemplate?(path: string): Promise<string | null>;
 }
 
 /** The facts that the rules read for one repository. */
@@ -141,6 +148,87 @@ export function movePins(text: string, owner: string, sha: string, known: Readon
   return { text: out.join("\n"), moved, missing: [...missing] };
 }
 
+/** This function gives each pin of the template in a workflow text: the path and the commit. */
+export function pinsOf(text: string, owner: string): { path: string; sha: string }[] {
+  const re = pinPattern(owner);
+  const out: { path: string; sha: string }[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const m = re.exec(line);
+    if (m?.[3] && m[4]) out.push({ path: m[3], sha: m[4] });
+  }
+  return out;
+}
+
+/**
+ * This function gives the surface of a pin: the paths of the template that the pinned workflow or action reads. A shared
+ * workflow reads its own file and the `sparse-checkout` paths of each checkout of `job.workflow_repository`. An action
+ * reads its folder. It gives null (the whole template) when a checkout has no `sparse-checkout`, or when the text of a
+ * workflow is not known.
+ */
+export function pinSurface(path: string, text: string | null): string[] | null {
+  if (path.startsWith(".github/actions/")) return [trimSlashes(path)];
+  if (text === null) return null;
+  const lines = text.split(/\r?\n/).filter((l) => !isComment(l));
+  const checkouts = lines.filter((l) => l.replace(/\s/g, "").includes("repository:${{job.workflow_repository}}")).length;
+  const sparse: string[] = [];
+  let sparseKeys = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    const key = line.trimStart();
+    if (!key.startsWith("sparse-checkout:")) continue;
+    sparseKeys++;
+    const raw = key.slice("sparse-checkout:".length);
+    const hash = raw.indexOf(" #");
+    const value = (hash >= 0 ? raw.slice(0, hash) : raw).trim();
+    if (value !== "|" && value !== ">" && value !== "") {
+      sparse.push(value.replace(/^["']|["']$/g, ""));
+      continue;
+    }
+    const indent = line.length - key.length;
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j] ?? "";
+      if (l.trim() === "") continue;
+      if (l.length - l.trimStart().length <= indent) break;
+      sparse.push(l.trim());
+    }
+  }
+  if (sparseKeys < checkouts) return null;
+  return [path, ...sparse.map(trimSlashes)];
+}
+
+/** This function removes the slashes at the start and at the end of a path. */
+function trimSlashes(path: string): string {
+  let a = 0;
+  let b = path.length;
+  while (a < b && path[a] === "/") a++;
+  while (b > a && path[b - 1] === "/") b--;
+  return path.slice(a, b);
+}
+
+/** This function tells if a changed path is in a surface: the path itself, or a file in a folder of the surface. */
+export function inSurface(changed: string, surface: readonly string[]): boolean {
+  return surface.some((s) => changed === s || changed.startsWith(`${s}/`));
+}
+
+/**
+ * This function tells if the pins of a repository are old: a pin that is not `templateSha` and whose surface changed since
+ * its commit. A docs change of the template thus moves no pin, and starts no CI in each repository. When a fact is not
+ * known, the pins are old, as before.
+ */
+export async function pinsStale(pins: readonly { path: string; sha: string }[], f: RunFacts): Promise<boolean> {
+  const old = pins.filter((p) => p.sha !== f.templateSha);
+  if (old.length === 0) return false;
+  if (!f.changedSince || !f.readTemplate) return true;
+  for (const p of old) {
+    const changed = await f.changedSince(p.sha);
+    if (changed === null) return true;
+    if (changed.length === 0) continue;
+    const surface = pinSurface(p.path, p.path.startsWith(".github/actions/") ? null : await f.readTemplate(p.path));
+    if (surface === null || changed.some((c) => inSurface(c, surface))) return true;
+  }
+  return false;
+}
+
 /** This function gives the template commit of a pinned shared workflow in a workflow text, or null. */
 export function pinOf(text: string, owner: string, shared: string): string | null {
   const re = pinPattern(owner);
@@ -215,12 +303,17 @@ const pinsRule: SyncRule = {
     const write: Record<string, string> = {};
     const needs: string[] = [];
     const waits: string[] = [];
+    const texts = new Map<string, string>();
     for (const path of files.paths.filter((p) => WORKFLOW_FILE.test(p))) {
       const text = await files.read(path);
-      if (text === null) continue;
+      if (text !== null) texts.set(path, text);
+    }
+    // All pins move together or none moves, so that the pins of one repository stay one commit.
+    const stale = await pinsStale([...texts.values()].flatMap((t) => pinsOf(t, f.owner)), f);
+    for (const [path, text] of texts) {
       const r = movePins(text, f.owner, f.templateSha, f.templatePaths);
       for (const m of r.missing) needs.push(`\`${path}\` uses \`${m}\` of the template, but the template on \`main\` does not have it.`);
-      if (r.moved === 0) continue;
+      if (r.moved === 0 || !stale) continue;
       if (f.releaseInFlight && RELEASE_FILES.has(path)) {
         waits.push(`\`${path}\` keeps its pins while a version is in flight.`);
         continue;
@@ -470,15 +563,88 @@ export async function apiFiles(gh: GitHub, owner: string, repo: string): Promise
   };
 }
 
-/** This function reads the facts of a run: the template commit on `main`, its files and the npm version of the template CLI. It gives null when the template is not readable. */
+/** The most first-parent steps back from the head of `main` that `syncFacts` examines for the commit of the pins. */
+export const SURFACE_WALK = 30;
+
+/**
+ * This function reads the facts of a run: the template commit of the pins, its files and the npm version of the template
+ * CLI. It gives null when the template is not readable.
+ *
+ * The commit of the pins is the oldest first-parent commit of `main` with the surface of the head. The surface is the
+ * shared workflows (`.github/workflows/reusable-*.yml`), their `sparse-checkout` paths and `.github/actions`. Thus a
+ * change of the docs of the template moves no target. An open sync pull request then gets no new push and no new CI.
+ * When the surface is not known, the commit of the pins is the head.
+ */
 export async function syncFacts(o: { gh: GitHub; owner: string; fetch?: FetchFn; registry?: string }): Promise<RunFacts | null> {
   const f: FetchFn = o.fetch ?? ((u, i) => fetch(u, i));
   const base = `/repos/${o.owner}/${TEMPLATE_REPO}`;
   const head = await o.gh.request<{ sha: string }>("GET", `${base}/commits/main`);
-  const templateSha = head.data?.sha;
-  if (!templateSha || !/^[0-9a-f]{40}$/.test(templateSha)) return null;
-  const tree = await o.gh.request<{ tree: { path: string }[]; truncated?: boolean }>("GET", `${base}/git/trees/${templateSha}?recursive=1`);
-  const templatePaths = tree.data && !tree.data.truncated ? new Set(tree.data.tree.map((t) => t.path)) : null;
+  const headSha = head.data?.sha;
+  if (!headSha || !/^[0-9a-f]{40}$/.test(headSha)) return null;
+
+  const compares = new Map<string, Promise<string[] | null>>();
+  const changed = (from: string, to: string): Promise<string[] | null> => {
+    const key = `${from}...${to}`;
+    let p = compares.get(key);
+    if (!p) {
+      // GitHub gives at most 300 files in a compare. A longer list may be cut, so it is not known.
+      p = o.gh
+        .request<{ status: string; files?: { filename: string; previous_filename?: string }[] }>("GET", `${base}/compare/${key}`)
+        .then((res) => {
+          const d = res.data;
+          if (!d || (d.status !== "ahead" && d.status !== "identical") || !d.files || d.files.length >= 300) return null;
+          return d.files.flatMap((x) => (x.previous_filename ? [x.filename, x.previous_filename] : [x.filename]));
+        })
+        .catch(() => null);
+      compares.set(key, p);
+    }
+    return p;
+  };
+  const texts = new Map<string, Promise<string | null>>();
+  const readAt = (path: string, ref: string): Promise<string | null> => {
+    const key = `${ref}:${path}`;
+    let p = texts.get(key);
+    if (!p) {
+      p = o.gh
+        .request<{ content?: string }>("GET", `${base}/contents/${path}?ref=${ref}`)
+        .then((res) => (res.data?.content !== undefined ? Buffer.from(res.data.content, "base64").toString("utf8") : null))
+        .catch(() => null);
+      texts.set(key, p);
+    }
+    return p;
+  };
+  const treeOf = async (sha: string): Promise<string[] | null> => {
+    const tree = await o.gh.request<{ tree: { path: string }[]; truncated?: boolean }>("GET", `${base}/git/trees/${sha}?recursive=1`);
+    return tree.data && !tree.data.truncated ? tree.data.tree.map((x) => x.path) : null;
+  };
+
+  const headPaths = await treeOf(headSha);
+  let surface: string[] | null = null;
+  if (headPaths) {
+    surface = [".github/actions"];
+    for (const w of headPaths.filter((x) => /^\.github\/workflows\/reusable-[^/]+\.ya?ml$/.test(x))) {
+      const s = pinSurface(w, await readAt(w, headSha));
+      if (s === null) {
+        surface = null;
+        break;
+      }
+      surface.push(...s);
+    }
+  }
+  let templateSha = headSha;
+  if (surface) {
+    const s = surface;
+    for (let i = 0; i < SURFACE_WALK; i++) {
+      const c = await o.gh.request<{ parents?: { sha: string }[] }>("GET", `${base}/commits/${templateSha}`).catch(() => null);
+      const parent = c?.data?.parents?.[0]?.sha;
+      if (!parent) break;
+      const diff = await changed(parent, headSha);
+      if (diff === null || diff.some((x) => inSurface(x, s))) break;
+      templateSha = parent;
+    }
+  }
+  const paths = templateSha === headSha ? headPaths : await treeOf(templateSha);
+  const templatePaths = paths ? new Set(paths) : null;
   let cliVersion: string | null = null;
   try {
     const name = `@${o.owner}/template-cli`;
@@ -498,7 +664,9 @@ export async function syncFacts(o: { gh: GitHub; owner: string; fetch?: FetchFn;
     }
     return p;
   };
-  return { owner: o.owner, templateSha, templatePaths, cliVersion, contains };
+  const changedSince = (sha: string): Promise<string[] | null> => changed(sha, templateSha);
+  const readTemplate = (path: string): Promise<string | null> => readAt(path, templateSha);
+  return { owner: o.owner, templateSha, templatePaths, cliVersion, contains, changedSince, readTemplate };
 }
 
 /** The work of one template sync in a clone of a repository. */
