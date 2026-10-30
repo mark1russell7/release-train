@@ -551,15 +551,88 @@ export async function apiFiles(gh: GitHub, owner: string, repo: string): Promise
   };
 }
 
-/** This function reads the facts of a run: the template commit on `main`, its files and the npm version of the template CLI. It gives null when the template is not readable. */
+/** The most first-parent steps back from the head of `main` that `syncFacts` examines for the commit of the pins. */
+export const SURFACE_WALK = 30;
+
+/**
+ * This function reads the facts of a run: the template commit of the pins, its files and the npm version of the template
+ * CLI. It gives null when the template is not readable.
+ *
+ * The commit of the pins is the oldest first-parent commit of `main` whose surface is the surface of the head: the shared
+ * workflows (`.github/workflows/reusable-*.yml`), the `sparse-checkout` paths of their checkouts of the template, and
+ * `.github/actions`. Thus a change of the docs of the template moves no target, and an open sync pull request gets no
+ * new push and no new CI. When the surface is not known, the commit of the pins is the head.
+ */
 export async function syncFacts(o: { gh: GitHub; owner: string; fetch?: FetchFn; registry?: string }): Promise<RunFacts | null> {
   const f: FetchFn = o.fetch ?? ((u, i) => fetch(u, i));
   const base = `/repos/${o.owner}/${TEMPLATE_REPO}`;
   const head = await o.gh.request<{ sha: string }>("GET", `${base}/commits/main`);
-  const templateSha = head.data?.sha;
-  if (!templateSha || !/^[0-9a-f]{40}$/.test(templateSha)) return null;
-  const tree = await o.gh.request<{ tree: { path: string }[]; truncated?: boolean }>("GET", `${base}/git/trees/${templateSha}?recursive=1`);
-  const templatePaths = tree.data && !tree.data.truncated ? new Set(tree.data.tree.map((t) => t.path)) : null;
+  const headSha = head.data?.sha;
+  if (!headSha || !/^[0-9a-f]{40}$/.test(headSha)) return null;
+
+  const compares = new Map<string, Promise<string[] | null>>();
+  const changed = (from: string, to: string): Promise<string[] | null> => {
+    const key = `${from}...${to}`;
+    let p = compares.get(key);
+    if (!p) {
+      // GitHub gives at most 300 files in a compare. A longer list may be cut, so it is not known.
+      p = o.gh
+        .request<{ status: string; files?: { filename: string; previous_filename?: string }[] }>("GET", `${base}/compare/${key}`)
+        .then((res) => {
+          const d = res.data;
+          if (!d || (d.status !== "ahead" && d.status !== "identical") || !d.files || d.files.length >= 300) return null;
+          return d.files.flatMap((x) => (x.previous_filename ? [x.filename, x.previous_filename] : [x.filename]));
+        })
+        .catch(() => null);
+      compares.set(key, p);
+    }
+    return p;
+  };
+  const texts = new Map<string, Promise<string | null>>();
+  const readAt = (path: string, ref: string): Promise<string | null> => {
+    const key = `${ref}:${path}`;
+    let p = texts.get(key);
+    if (!p) {
+      p = o.gh
+        .request<{ content?: string }>("GET", `${base}/contents/${path}?ref=${ref}`)
+        .then((res) => (res.data?.content !== undefined ? Buffer.from(res.data.content, "base64").toString("utf8") : null))
+        .catch(() => null);
+      texts.set(key, p);
+    }
+    return p;
+  };
+  const treeOf = async (sha: string): Promise<string[] | null> => {
+    const tree = await o.gh.request<{ tree: { path: string }[]; truncated?: boolean }>("GET", `${base}/git/trees/${sha}?recursive=1`);
+    return tree.data && !tree.data.truncated ? tree.data.tree.map((x) => x.path) : null;
+  };
+
+  const headPaths = await treeOf(headSha);
+  let surface: string[] | null = null;
+  if (headPaths) {
+    surface = [".github/actions"];
+    for (const w of headPaths.filter((x) => /^\.github\/workflows\/reusable-[^/]+\.ya?ml$/.test(x))) {
+      const s = pinSurface(w, await readAt(w, headSha));
+      if (s === null) {
+        surface = null;
+        break;
+      }
+      surface.push(...s);
+    }
+  }
+  let templateSha = headSha;
+  if (surface) {
+    const s = surface;
+    for (let i = 0; i < SURFACE_WALK; i++) {
+      const c = await o.gh.request<{ parents?: { sha: string }[] }>("GET", `${base}/commits/${templateSha}`).catch(() => null);
+      const parent = c?.data?.parents?.[0]?.sha;
+      if (!parent) break;
+      const diff = await changed(parent, headSha);
+      if (diff === null || diff.some((x) => inSurface(x, s))) break;
+      templateSha = parent;
+    }
+  }
+  const paths = templateSha === headSha ? headPaths : await treeOf(templateSha);
+  const templatePaths = paths ? new Set(paths) : null;
   let cliVersion: string | null = null;
   try {
     const name = `@${o.owner}/template-cli`;
@@ -579,35 +652,8 @@ export async function syncFacts(o: { gh: GitHub; owner: string; fetch?: FetchFn;
     }
     return p;
   };
-  const changes = new Map<string, Promise<string[] | null>>();
-  const changedSince = (sha: string): Promise<string[] | null> => {
-    let p = changes.get(sha);
-    if (!p) {
-      // GitHub gives at most 300 files in a compare. A longer list may be cut, so it is not known.
-      p = o.gh
-        .request<{ status: string; files?: { filename: string; previous_filename?: string }[] }>("GET", `${base}/compare/${sha}...${templateSha}`)
-        .then((res) => {
-          const d = res.data;
-          if (!d || (d.status !== "ahead" && d.status !== "identical") || !d.files || d.files.length >= 300) return null;
-          return d.files.flatMap((x) => (x.previous_filename ? [x.filename, x.previous_filename] : [x.filename]));
-        })
-        .catch(() => null);
-      changes.set(sha, p);
-    }
-    return p;
-  };
-  const texts = new Map<string, Promise<string | null>>();
-  const readTemplate = (path: string): Promise<string | null> => {
-    let p = texts.get(path);
-    if (!p) {
-      p = o.gh
-        .request<{ content?: string }>("GET", `${base}/contents/${path}?ref=${templateSha}`)
-        .then((res) => (res.data?.content !== undefined ? Buffer.from(res.data.content, "base64").toString("utf8") : null))
-        .catch(() => null);
-      texts.set(path, p);
-    }
-    return p;
-  };
+  const changedSince = (sha: string): Promise<string[] | null> => changed(sha, templateSha);
+  const readTemplate = (path: string): Promise<string | null> => readAt(path, templateSha);
   return { owner: o.owner, templateSha, templatePaths, cliVersion, contains, changedSince, readTemplate };
 }
 

@@ -434,6 +434,23 @@ describe("syncFacts", () => {
     expect(calls.filter((c) => c.path.includes("/compare/")).length).toBe(2);
   });
 
+  it("pins the oldest first-parent commit of main with the surface of the head, so a docs commit moves no target", async () => {
+    const wf = ["jobs:", "  ci:", "    steps:", "      - with:", "          repository: ${{ job.workflow_repository }}", "          sparse-checkout: scripts/release", ""].join("\n");
+    const { gh, f } = server({
+      [`GET ${base}/template/commits/main`]: () => [200, { sha: NEW }],
+      [`GET ${base}/template/git/trees/${NEW}`]: () => [200, { tree: [{ path: ".github/workflows/reusable-ci.yml" }, { path: "docs/ROADMAP.md" }] }],
+      [`GET ${base}/template/git/trees/${MID}`]: () => [200, { tree: [{ path: ".github/workflows/reusable-ci.yml" }] }],
+      [`GET ${base}/template/contents/.github/workflows/reusable-ci.yml`]: () => [200, { content: b64(wf) }],
+      [`GET ${base}/template/commits/${NEW}`]: () => [200, { parents: [{ sha: MID }] }],
+      [`GET ${base}/template/commits/${MID}`]: () => [200, { parents: [{ sha: OLD }] }],
+      [`GET ${base}/template/compare/${MID}...${NEW}`]: () => [200, { status: "ahead", files: [{ filename: "docs/ROADMAP.md" }] }],
+      [`GET ${base}/template/compare/${OLD}...${NEW}`]: () => [200, { status: "ahead", files: [{ filename: "docs/ROADMAP.md" }, { filename: "scripts/release/pack.ts" }] }],
+    });
+    const r = await syncFacts({ gh, owner: OWNER, fetch: f, registry: "https://registry.example" });
+    expect(r?.templateSha).toBe(MID);
+    expect(r?.templatePaths?.has("docs/ROADMAP.md")).toBe(false);
+  });
+
   it("gives the files that changed since a pin once, and null for a cut or a diverged compare", async () => {
     const many = Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}` }));
     const { gh, calls, f } = server({
