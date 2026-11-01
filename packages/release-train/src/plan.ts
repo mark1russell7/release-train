@@ -353,7 +353,7 @@ export function plan(g: Graph): Plan {
     a.packages.push({ name: p.name, path: p.path, from: null, to: valid(p.version), bump: null, why: "The first release." });
     a.checklist.push(
       `Merge the version ${p.version ?? "?"} of ${p.name} to main of ${p.repo}.`,
-      `In ${p.repo}, run "node scripts/release/npm-bootstrap.mjs --dispatch" (Mark only, fewer than 25 new packages a day).`,
+      `In a checkout of the template, run "node scripts/release/npm-bootstrap.ts <folder of ${p.repo}> --dispatch" (Mark only, fewer than 25 new packages a day).`,
     );
   }
   for (const p of g.packages) {

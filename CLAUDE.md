@@ -26,7 +26,7 @@ Write all prose of this repository in the style of ASD-STE100 Simplified Technic
 ## npm releases
 
 - Do not publish to npm, and do not change npm settings. The owner and one named Claude session do all npm work.
-- Do not edit `.github/workflows/release.yml` or `scripts/release/`.
+- Do not edit `.github/workflows/release.yml`. The release scripts are the ones of the template commit that it pins.
 - Is a package that is not on npm a block? Use `workspace:*`, or a `github:` specifier pinned to a commit.
 - `RELEASING.md` tells how a release and a new package work.
 
