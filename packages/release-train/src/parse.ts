@@ -38,7 +38,11 @@ export function parseSpec(name: string, spec: string): ParsedSpec {
 
 /** This function changes a workspace glob into a regular expression for a folder path. */
 export function globToRegExp(glob: string): RegExp {
-  const g = glob.replace(/^\.\//, "").replace(/\/+$/, "");
+  // A loop removes the end slashes: the expression /\/+$/ backtracks in polynomial time on a long run of slashes.
+  const start = glob.startsWith("./") ? 2 : 0;
+  let end = glob.length;
+  while (end > start && glob.charAt(end - 1) === "/") end -= 1;
+  const g = glob.slice(start, end);
   let out = "";
   for (let i = 0; i < g.length; i++) {
     const c = g[i] as string;
