@@ -316,6 +316,47 @@ export interface SyncOptions {
   /** Can the App change workflow files? `auto`: the first push that GitHub refuses tells. */
   workflows: WorkflowsMode;
   rules?: readonly SyncRule[];
+  /**
+   * The most sync branches that one run pushes. Each push starts the CI of a repository, and all repositories of the
+   * account share the runners. The other repositories wait for the next run. Absent: no limit.
+   */
+  maxPushes?: number;
+  /** This function gives the number of jobs that run at this time on the runners of the account, or null when it is not known. */
+  runnersBusy?: () => Promise<number | null>;
+  /** A push waits while `runnersBusy` gives this number of jobs or more. The default is `BUSY_LIMIT`. */
+  busyLimit?: number;
+}
+
+/** The fleet rule of the runner slots (40 per account): no new heavy start while 30 or more jobs run. */
+export const BUSY_LIMIT = 30;
+
+/** The most sync branches of one run in the CLI. A sync push starts approximately 6 jobs (CI, the scans, the reviews). */
+export const MAX_PUSHES = 5;
+
+/**
+ * This function gives a counter of the jobs that run on the runners of the account. It counts the jobs `in_progress` of
+ * each run `in_progress` of the repositories. It keeps a count for `ttlMs`, and gives null for a list that it cannot read.
+ */
+export function busyRunners(gh: GitHub, owner: string, repos: readonly string[], ttlMs = 60_000, now: () => number = Date.now): () => Promise<number | null> {
+  let cached: { at: number; value: number | null } | null = null;
+  const count = async (): Promise<number | null> => {
+    let jobs = 0;
+    for (const repo of repos) {
+      const runs = await gh.request<{ workflow_runs: { id: number }[] }>("GET", `/repos/${owner}/${repo}/actions/runs?status=in_progress&per_page=100`);
+      if (!runs.data) return null;
+      for (const run of runs.data.workflow_runs) {
+        const list = await gh.request<{ jobs: { status: string }[] }>("GET", `/repos/${owner}/${repo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`);
+        if (!list.data) return null;
+        jobs += list.data.jobs.filter((j) => j.status === "in_progress").length;
+      }
+    }
+    return jobs;
+  };
+  return async () => {
+    if (cached && now() - cached.at < ttlMs) return cached.value;
+    cached = { at: now(), value: await count() };
+    return cached.value;
+  };
 }
 
 interface Pull {
@@ -816,6 +857,15 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const pending = pendingVersions(o.plan, o.only ?? null);
     const changesets = new Set(o.plan.repos.filter((r) => (r.pendingChangesets ?? 0) > 0).map((r) => r.name));
     let workflows = s.workflows !== "no";
+    let pushes = 0;
+    /** This function gives the reason why a push waits for the next run, or null when it can push. */
+    const paceWait = async (): Promise<string | null> => {
+      if (s.maxPushes !== undefined && pushes >= s.maxPushes) return `This run pushed ${pushes} sync branches, the most of one run, because the runners are shared. The next run pushes this one.`;
+      if (!s.runnersBusy) return null;
+      const busy = await s.runnersBusy();
+      const limit = s.busyLimit ?? BUSY_LIMIT;
+      return busy !== null && busy >= limit ? `${busy} jobs run on the runners of the account, and a sync push waits at ${limit} or more. The next run pushes this one.` : null;
+    };
     for (const repo of scan) {
       const isPrivate = privateOf.get(repo) ?? true;
       const existing = syncOpen.get(repo) ?? null;
@@ -870,6 +920,12 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           // The branch has these changes already: no clone and no push.
           r = { status: "same", sha: existing.head.sha, result: planned, tool: null, error: null };
         } else {
+          const wait = await paceWait();
+          if (wait !== null) {
+            result({ ...commonOf(planned), state: "waiting", pr: prRef(existing), autoMerge: null, ci: null, detail: wait });
+            continue;
+          }
+          pushes += 1;
           const ctx = { defaultBranch: meta.default_branch, rebuild };
           r = await s.updater.sync({ repo, facts, workflows, rules }, ctx);
           if (r.status === "workflows-denied" && workflows) {

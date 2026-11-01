@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
-import { apply, applySummary, hashName, pendingVersions, publicReport } from "./apply.ts";
+import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, pendingVersions, publicReport } from "./apply.ts";
 import { collect, pool } from "./collect.ts";
 import { writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
@@ -43,6 +43,8 @@ export interface CliOptions {
   sync: boolean;
   /** `plan` and `apply`: can the GitHub App change workflow files? `auto`: the first push that GitHub refuses tells. */
   workflows: WorkflowsMode;
+  /** `apply`: the most sync branches that one run pushes. */
+  maxPushes: number;
 }
 
 /** This function reads the arguments of the command line. */
@@ -65,6 +67,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     cascade: "all",
     sync: true,
     workflows: "auto",
+    maxPushes: MAX_PUSHES,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -87,6 +90,11 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--release-dispatch") o.releaseDispatch = true;
     else if (a === "--minutes") o.minutes = Number(value());
     else if (a === "--no-sync") o.sync = false;
+    else if (a === "--max-pushes") {
+      const v = Number(value());
+      if (!Number.isInteger(v) || v < 0) throw new Error(`--max-pushes needs a whole number of 0 or more.`);
+      o.maxPushes = v;
+    }
     else if (a === "--workflows") {
       const v = value().trim();
       if (v !== "auto" && v !== "yes" && v !== "no") throw new Error(`--workflows needs auto, yes or no, not ${v}.`);
@@ -245,7 +253,15 @@ async function runApply(o: CliOptions): Promise<number> {
       plan: p,
       gh,
       updater,
-      sync: o.sync ? { updater, facts: await syncFacts({ gh, owner: o.owner }), workflows: o.workflows } : null,
+      sync: o.sync
+        ? {
+            updater,
+            facts: await syncFacts({ gh, owner: o.owner }),
+            workflows: o.workflows,
+            maxPushes: o.maxPushes,
+            runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
+          }
+        : null,
       dryRun: o.dryRun,
       only: o.only,
       releaseDispatch: o.releaseDispatch,

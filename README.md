@@ -69,6 +69,7 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 - `--show-private` shows the private names in the output. Do not use it in CI.
 - `--cascade <repos>` sets the repositories (comma-separated) whose breaking adoptions carry a release, or `all` (the default). The adoptions of other repositories with a release wait.
 - `--release-dispatch` starts the release workflows that start only by hand. Refer to "Releases".
+- `--max-pushes <n>` is the most sync branches that one run pushes (default 5). Each push starts approximately 6 jobs in its repository, and all repositories of the account share 40 runners. A sync push also waits while 30 or more jobs run on the account. The other repositories get `waiting`, and the next run pushes them. When the list of runs is not readable, only the limit of pushes applies.
 
 ## Releases
 
