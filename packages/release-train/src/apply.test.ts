@@ -458,9 +458,13 @@ describe("gitUpdater and conventions fix", () => {
 
   it("starts the fix of the target version with the repository of the clone, and keeps its files in the commit", async () => {
     const { cmds, fixEnv, message, result } = await start(update("0.8.2"));
-    expect(cmds).toContain(`pnpm dlx ${CONVENTIONS}@0.8.2 fix --json`);
+    // typed-files needs the typescript of the repository: an install with no scripts, just before the fix
+    const fix = cmds.indexOf(`pnpm dlx ${CONVENTIONS}@0.8.2 fix --json`);
+    expect(fix).toBeGreaterThan(0);
+    expect(cmds[fix - 1]).toBe("pnpm install --frozen-lockfile --ignore-scripts");
     expect(fixEnv[0]?.["GITHUB_REPOSITORY"]).toBe(`${OWNER}/lib-repo`);
     expect(fixEnv[0]).not.toHaveProperty("GITHUB_STEP_SUMMARY");
+    expect(Object.keys(fixEnv[0] ?? {}).filter((key) => key.startsWith("GIT_CONFIG_"))).toEqual([]);
     expect(result).toMatchObject({ status: "pushed", fixed: [".github/workflows/ci.yml", "vitest.config.ts"] });
     expect(message).toContain("- conventions fix: .github/workflows/ci.yml, vitest.config.ts");
     expect(prBody(update("0.8.2"), result)).toContain("## Conventions fix");

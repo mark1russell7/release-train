@@ -253,12 +253,17 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    * This function starts `conventions fix` of the target version, when the update moves the repository to a version that
    * has the command. It gives the changed files. A break that stays does not stop the update: CI of the pull request shows it.
    * The rules read the repository from GITHUB_REPOSITORY, so it names the repository of the clone, not the train.
+   * The rule typed-files reads the tsconfig files with the typescript of the repository, so the packages are installed
+   * first, with no install scripts. The install and the fix get no git credentials: they need none.
    */
   const conventionsFix = async (dir: string, u: RepoUpdate): Promise<string[]> => {
     const to = u.items.find((i) => i.dep === CONVENTIONS)?.to;
     if (to === undefined || semver.valid(to) === null || semver.lt(to, FIX_SINCE)) return [];
     const fixEnv: NodeJS.ProcessEnv = { ...env, GITHUB_REPOSITORY: `${o.owner}/${u.repo}` };
+    for (const key of Object.keys(fixEnv)) if (key.startsWith("GIT_CONFIG_")) delete fixEnv[key];
     delete fixEnv["GITHUB_STEP_SUMMARY"];
+    if (u.lockKind === "npm") await run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: dir, env: fixEnv });
+    else await run("pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"], { cwd: dir, env: fixEnv });
     const args = [`${CONVENTIONS}@${to}`, "fix", "--json"];
     const r = u.lockKind === "npm" ? await run("npx", ["--yes", ...args], { cwd: dir, env: fixEnv }) : await run("pnpm", ["dlx", ...args], { cwd: dir, env: fixEnv });
     try {
