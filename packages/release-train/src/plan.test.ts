@@ -44,6 +44,34 @@ describe("range logic", () => {
     expect(p.nodes.find((n) => n.id === "@ex/app")?.status).toBe("adopt");
   });
 
+  it("moves a repository only to a version that release.yml of its own repository built", () => {
+    const repos = [
+      repo("core-repo", { "": { name: "@ex/core", version: "1.4.0" } }),
+      repo("app-repo", { "": { name: "app", private: true, dependencies: { "@ex/core": "^1.2.0" } } }, { resolved: { "": { "@ex/core": "1.3.0" } } }),
+      repo("next-repo", { "": { name: "next", private: true, dependencies: { "@ex/core": "^1.4.0" } } }, { resolved: { "": { "@ex/core": "1.4.0" } } }),
+    ];
+    const at = (provenance: NpmInfo["provenance"] | undefined) => run(repos, { "@ex/core": { ...npm("1.4.0"), ...(provenance === undefined ? {} : { provenance }) } });
+    const release = { repository: "https://github.com/example-owner/core-repo", workflow: ".github/workflows/release.yml" };
+    expect(at(release).actions.map((a) => a.id)).toEqual(["update:app-repo"]);
+    // A snapshot from before the field: no check
+    expect(at(undefined).actions.map((a) => a.id)).toEqual(["update:app-repo"]);
+    for (const [provenance, why] of [
+      [null, "@ex/core@1.4.0 has no provenance on npm"],
+      [{ ...release, repository: "https://github.com/someone/core-repo" }, "was built by .github/workflows/release.yml of https://github.com/someone/core-repo"],
+      [{ ...release, workflow: ".github/workflows/other.yml" }, "was built by .github/workflows/other.yml"],
+    ] as const) {
+      const p = at(provenance);
+      expect(p.actions).toEqual([]);
+      const edges = p.edges.map((e) => [e.from, e.status]);
+      // The edge that holds the version stays current: the hold only stops a move
+      expect(edges).toEqual([
+        ["app-repo:.", "waiting"],
+        ["next-repo:.", "current"],
+      ]);
+      expect(p.edges[0]?.why).toContain(why);
+    }
+  });
+
   it("marks an edge current when the lockfile has the newest version", () => {
     const p = run(
       [

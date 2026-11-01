@@ -131,6 +131,9 @@ const RANK: Record<Bump, number> = { patch: 0, minor: 1, major: 2 };
 const KIND_ORDER: Record<ActionKind, number> = { "new-package": 0, release: 1, "adopt-breaking": 2, "adopt-in-range": 3 };
 const STATUS_ORDER: readonly NodeStatus[] = ["blocked", "new-package", "release", "breaking", "adopt", "up-to-date"];
 
+/** The workflow file that releases a package of the owner. */
+export const RELEASE_WORKFLOW = ".github/workflows/release.yml";
+
 function valid(v: string | null | undefined): string | null {
   return v ? semver.valid(v) : null;
 }
@@ -218,6 +221,20 @@ export function plan(g: Graph): Plan {
   const pkgOfImporter = (imp: Importer | undefined): PackageNode | undefined =>
     imp?.published && imp.name ? (pkgs.get(imp.name)?.repo === imp.repo ? pkgs.get(imp.name) : undefined) : undefined;
 
+  // The train moves a repository only to a version that the release workflow of its own repository built. A version from
+  // another build can come from a stolen token, and pnpm does not check our scopes (trustPolicyExclude, minimumReleaseAgeExclude).
+  const untrusted = (p: PackageNode, t: string): string | null => {
+    if (t !== valid(p.npm.latest) || p.npm.provenance === undefined) return null;
+    const want = `https://github.com/${g.owner}/${p.repo}`;
+    const prov = p.npm.provenance;
+    const check = "A person checks the publish on npm, then releases a new version from release.yml.";
+    if (prov === null) return `${p.name}@${t} has no provenance on npm, so the release train does not move a repository to it. ${check}`;
+    if (prov.repository.toLowerCase() !== want.toLowerCase() || prov.workflow !== RELEASE_WORKFLOW) {
+      return `${p.name}@${t} was built by ${prov.workflow} of ${prov.repository}, not by ${RELEASE_WORKFLOW} of ${want}. ${check}`;
+    }
+    return null;
+  };
+
   // 1. The own state of each package.
   const target = new Map<string, string | null>();
   const publishBy = new Map<string, string>();
@@ -297,11 +314,13 @@ export function plan(g: Graph): Plan {
     if (!t) return st("waiting", `${e.to} has no version on npm or on main.`);
     const range = e.range ?? "*";
     if (!semver.validRange(range)) return st("flagged", `"${range}" is not a valid SemVer range.`);
+    const hold = untrusted(p, t);
     if (semver.satisfies(t, range)) {
       const lock = repoInfo.get(imp.repo)?.lockKind ?? "none";
       if (lock === "none" || lock === "yarn") {
         return st("unlocked", `The range ${range} allows ${t}. The repository has no lockfile that the release train reads, so a new install gets it.`);
       }
+      if (hold && (e.resolved === null || (valid(e.resolved) !== null && semver.lt(valid(e.resolved) as string, t)))) return st("waiting", hold);
       if (e.resolved === null) {
         return st("adopt", `The range ${range} allows ${t}, but the lockfile has no entry for it. A lockfile update fixes this.`);
       }
@@ -311,6 +330,7 @@ export function plan(g: Graph): Plan {
       }
       return st("current", `The lockfile holds ${e.resolved}, the newest version.`);
     }
+    if (hold && semver.gtr(t, range)) return st("waiting", hold);
     if (semver.gtr(t, range)) {
       const pub = imp.published && isRuntime(e.type);
       return st(

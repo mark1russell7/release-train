@@ -23,13 +23,23 @@ interface FakeRepo {
   files: Record<string, string>;
 }
 
-function fakeFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls: string[] = []): FetchFn {
+function fakeFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls: string[] = [], built: Record<string, { repository: string; path: string } | null> = {}): FetchFn {
   const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Response =>
     new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
   return async (url) => {
     calls.push(url);
     const u = new URL(url);
     if (u.origin === new URL(REG).origin) {
+      // The provenance of a version: release.yml of the repository that has the package, unless the test names it in `built`
+      const att = /^\/-\/npm\/v1\/attestations\/(.+)@[^@]+$/.exec(decodeURIComponent(u.pathname));
+      if (att) {
+        const name = att[1] ?? "";
+        const repo = repos.find((r) => Object.entries(r.files).some(([file, text]) => file.endsWith("package.json") && (() => { try { return (JSON.parse(text) as { name?: unknown }).name === name; } catch { return false; } })()));
+        const workflow = built[name] ?? (repo ? { repository: `https://github.com/example-owner/${repo.name}`, path: ".github/workflows/release.yml" } : null);
+        if (workflow === null) return new Response("", { status: 404 });
+        const statement = { predicate: { buildDefinition: { externalParameters: { workflow } } } };
+        return json({ attestations: [{ predicateType: "https://slsa.dev/provenance/v1", bundle: { dsseEnvelope: { payload: Buffer.from(JSON.stringify(statement)).toString("base64") } } }] });
+      }
       const ver = /^\/(.+)\/(\d[^/]*)$/.exec(decodeURIComponent(u.pathname));
       if (ver) {
         const foreign = ver[1] === "vendored-lib";
