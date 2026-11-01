@@ -2,8 +2,8 @@
 #
 #   verify    The gates of ci.yml.
 #   build     reusable-release-build.yml: stops when the commit is not on main, builds and packs
-#             each published package (scripts/release/pack.mjs), and writes the plan of the git tags
-#             and the GitHub releases (scripts/release/tags.mjs).
+#             each published package (scripts/release/pack.ts of the template), and writes the plan of the git tags
+#             and the GitHub releases (scripts/release/tags.ts of the template).
 #   publish   The npm-publish action of the template: publishes each tarball whose version npm does
 #             not have. Only this job holds "id-token: write", and it runs no code of the
 #             repository: no checkout, no install.
@@ -30,7 +30,7 @@
 # dist-tag "next". The others get "latest".
 #
 # npm trusts a workflow only for a package that exists. The owner bootstraps a new package once:
-# scripts/release/npm-bootstrap.mjs (RELEASING.md tells the procedure). Without it, this workflow
+# scripts/release/npm-bootstrap.ts of the template (RELEASING.md tells the procedure). Without it, this workflow
 # publishes the other packages and then fails with the names of the new ones.
 #
 # The git tag of a version is "v<version>" in a repository with one published package, else

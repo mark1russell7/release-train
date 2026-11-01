@@ -164,7 +164,7 @@ describe("release and new package", () => {
       { "@ex/a": npm("1.0.0"), "@ex/b": NONE },
     );
     expect(p.actions.map((a) => a.id)).toEqual(["new:@ex/b", "release:multi-repo"]);
-    expect(p.actions[0]?.checklist.join(" ")).toContain("npm-bootstrap.mjs");
+    expect(p.actions[0]?.checklist.join(" ")).toContain("npm-bootstrap.ts");
     expect(p.nodes.find((n) => n.id === "@ex/b")?.status).toBe("new-package");
     expect(p.nodes.find((n) => n.id === "@ex/a")?.status).toBe("release");
   });

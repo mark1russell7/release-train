@@ -9,7 +9,7 @@ on:
     branches: [main]
   # A weekly scan finds the new advisories for the dependencies that do not change
   schedule:
-    - cron: "23 5 * * 1"
+    - cron: "57 5 * * 1"
   workflow_dispatch:
 
 permissions: {}

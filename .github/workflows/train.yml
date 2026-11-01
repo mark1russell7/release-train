@@ -23,7 +23,7 @@ on:
   repository_dispatch:
     types: [released]
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "18,48 * * * *"
 
 permissions:
   contents: read
