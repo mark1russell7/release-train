@@ -21,7 +21,7 @@ import { gitHub } from "./github.ts";
 import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import type { Manifest, NpmInfo, RepoSnapshot, Resolved } from "./types.ts";
-import { ageExcluded, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
+import { CONVENTIONS, ageExcluded, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 const OWNER = "example-owner";
@@ -421,6 +421,56 @@ describe("minimumReleaseAge", () => {
     expect(r.status).toBe("young");
     expect(r.young).toEqual([{ dep: "@ex/core", version: "2.0.0", readyAt: "2026-01-02T12:00:00.000Z" }]);
     expect(cmds.some((c) => c.startsWith("pnpm update"))).toBe(false);
+  });
+});
+
+describe("gitUpdater and conventions fix", () => {
+  /** The update of lib-repo, with conventions at the version `to` in place of @ex/util. */
+  const update = (to: string): RepoUpdate => {
+    const u = selectUpdates(fixture(), ["lib-repo"]).ready[0] as RepoUpdate;
+    return { ...u, lockKind: "pnpm" as const, items: u.items.filter((i) => i.dep === "@ex/util").map((i) => ({ ...i, dep: CONVENTIONS, to })) };
+  };
+  const start = async (u: RepoUpdate) => {
+    const cmds: string[] = [];
+    const fixEnv: NodeJS.ProcessEnv[] = [];
+    let message = "";
+    const run: RunFn = async (cmd, args, opts) => {
+      cmds.push(`${cmd} ${args.join(" ")}`);
+      if (cmd === "git" && args[0] === "clone") writeFileSync(join(opts.cwd, "package.json"), `${JSON.stringify({ name: "x", devDependencies: { [CONVENTIONS]: "^0.8.0" } }, null, 2)}\n`);
+      if (cmd === "git" && args.includes("commit")) message = args[args.indexOf("-m") + 1] ?? "";
+      // The branch of the train does not exist yet
+      if (cmd === "git" && args[0] === "fetch") return { code: 128, stdout: "", stderr: "no such ref" };
+      if (cmd === "pnpm" && args[0] === "install") {
+        const to = u.items[0]?.to ?? "";
+        writeFileSync(join(opts.cwd, "pnpm-lock.yaml"), `lockfileVersion: '9.0'\nimporters:\n  .:\n    devDependencies:\n      '${CONVENTIONS}':\n        specifier: ^0.8.0\n        version: ${to}\n`);
+      }
+      if (cmd === "pnpm" && args[0] === "dlx") {
+        fixEnv.push(opts.env ?? {});
+        return { code: 1, stdout: JSON.stringify({ changed: [".github/workflows/ci.yml", "vitest.config.ts"], passes: 2, failed: true }), stderr: "" };
+      }
+      const stdout = cmd === "pnpm" && args[0] === "--version" ? "12.10.1\n" : cmd === "git" && args[0] === "status" ? " M package.json\n" : "";
+      return { code: 0, stdout, stderr: "" };
+    };
+    const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: async () => new Response("{}", { status: 200 }) });
+    const result = await up.update(u, { defaultBranch: "main", rebuild: false });
+    return { cmds, fixEnv, message, result };
+  };
+
+  it("starts the fix of the target version with the repository of the clone, and keeps its files in the commit", async () => {
+    const { cmds, fixEnv, message, result } = await start(update("0.8.2"));
+    expect(cmds).toContain(`pnpm dlx ${CONVENTIONS}@0.8.2 fix --json`);
+    expect(fixEnv[0]?.["GITHUB_REPOSITORY"]).toBe(`${OWNER}/lib-repo`);
+    expect(fixEnv[0]).not.toHaveProperty("GITHUB_STEP_SUMMARY");
+    expect(result).toMatchObject({ status: "pushed", fixed: [".github/workflows/ci.yml", "vitest.config.ts"] });
+    expect(message).toContain("- conventions fix: .github/workflows/ci.yml, vitest.config.ts");
+    expect(prBody(update("0.8.2"), result)).toContain("## Conventions fix");
+  });
+
+  it("does not start the fix for a version before the command", async () => {
+    const { cmds, result } = await start(update("0.8.1"));
+    expect(cmds.some((c) => c.startsWith("pnpm dlx"))).toBe(false);
+    expect(result).not.toHaveProperty("fixed");
+    expect(prBody(update("0.8.1"), result)).not.toContain("## Conventions fix");
   });
 });
 

@@ -154,6 +154,10 @@ function readText(file: string): string {
   return existsSync(file) ? readFileSync(file, "utf8") : "";
 }
 
+/** The package of the fleet conventions, and its first version with `conventions fix`. */
+export const CONVENTIONS = "@mark1russell7/conventions";
+export const FIX_SINCE = "0.8.2";
+
 function tail(s: string, n = 800): string {
   const t = s.trim();
   return t.length > n ? `...${t.slice(-n)}` : t;
@@ -243,6 +247,26 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     }
     await sh("git", ["push", "--quiet", "--force", "origin", `HEAD:refs/heads/${branch}`], "git push");
     return { status: "pushed", sha: head };
+  };
+
+  /**
+   * This function starts `conventions fix` of the target version, when the update moves the repository to a version that
+   * has the command. It gives the changed files. A break that stays does not stop the update: CI of the pull request shows it.
+   * The rules read the repository from GITHUB_REPOSITORY, so it names the repository of the clone, not the train.
+   */
+  const conventionsFix = async (dir: string, u: RepoUpdate): Promise<string[]> => {
+    const to = u.items.find((i) => i.dep === CONVENTIONS)?.to;
+    if (to === undefined || semver.valid(to) === null || semver.lt(to, FIX_SINCE)) return [];
+    const fixEnv: NodeJS.ProcessEnv = { ...env, GITHUB_REPOSITORY: `${o.owner}/${u.repo}` };
+    delete fixEnv["GITHUB_STEP_SUMMARY"];
+    const args = [`${CONVENTIONS}@${to}`, "fix", "--json"];
+    const r = u.lockKind === "npm" ? await run("npx", ["--yes", ...args], { cwd: dir, env: fixEnv }) : await run("pnpm", ["dlx", ...args], { cwd: dir, env: fixEnv });
+    try {
+      const changed = (JSON.parse(r.stdout) as { changed?: unknown }).changed;
+      return Array.isArray(changed) ? changed.filter((file): file is string => typeof file === "string") : [];
+    } catch {
+      return [];
+    }
   };
 
   return {
@@ -374,6 +398,9 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           const failed = editAll(breaking.map((i) => ({ path: i.path, type: i.type, dep: i.dep, range: i.range, newRange: i.newRange ?? i.range })));
           if (failed.size > 0) return fail(notPlanRange(failed));
         }
+        // 2. A new version of conventions brings the fixes of its rules. The train writes them in the same commit, so a new
+        // rule does not block the update for a break that a script can fix. CI of the pull request checks the result.
+        const fixed = await conventionsFix(dir, u);
         const after = read();
 
         // 3. The check: each item must have its target version in the lockfile.
@@ -398,6 +425,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           ...u.items.map((i) => `- ${i.dep} in ${i.path || "."}: ${i.newRange ? `${i.range} -> ${i.newRange}` : i.range}, lockfile -> ${after[i.path]?.[i.dep] ?? i.to}`),
           ...releases.map((r) => `- release ${r.name}: ${r.from} -> ${r.to} (${r.type}, ${r.via === "changeset" ? "changeset" : "package.json"})`),
           ...(settingsChanged ? [`- pnpm-workspace.yaml: ${(u.ageScopes ?? []).join(", ")} in minimumReleaseAgeExclude`] : []),
+          ...(fixed.length > 0 ? [`- conventions fix: ${fixed.join(", ")}`] : []),
         ].join("\n");
         await sh("git", ["add", "-u"], "git add");
         if (added.length > 0) await sh("git", ["add", "--", ...added], "git add");
@@ -405,7 +433,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
 
         // 5. No push when the branch already has the same content in the files of the train.
         const pushed = await pushHead(dir, sh, TRAIN_BRANCH, remote, ctx.rebuild);
-        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases };
+        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(fixed.length > 0 ? { fixed } : {}) };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       } finally {
