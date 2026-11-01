@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { TRAIN_LABEL, apply, applySummary, bodyFingerprint, publicReport, syncPrBody } from "./apply.ts";
+import { BUSY_LIMIT, TRAIN_LABEL, apply, applySummary, bodyFingerprint, busyRunners, publicReport, syncPrBody } from "./apply.ts";
 import type { Updater } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
@@ -403,6 +403,45 @@ describe("apply with the template sync", () => {
     expect(up.jobs).toEqual([]);
     expect(r.results[0]).toMatchObject({ state: "merged", ci: "green" });
     expect(calls.some((c) => c.method === "DELETE" && c.path.endsWith(`/refs/heads/${SYNC_BRANCH}`))).toBe(true);
+  });
+
+  it("waits for the next run after maxPushes pushes, and while the runners are busy", async () => {
+    const run = async (sync: { maxPushes?: number; runnersBusy?: () => Promise<number | null> }) => {
+      const { gh } = server(repoRoutes("demo-repo"));
+      const up = syncer([]);
+      const r = await apply({ owner: OWNER, plan: onePlan("demo-repo"), gh, updater: noUpdates, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no", ...sync } });
+      return { up, r };
+    };
+    const capped = await run({ maxPushes: 0 });
+    expect(capped.up.jobs).toEqual([]);
+    expect(capped.r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "waiting" });
+    expect(capped.r.results[0]?.detail).toContain("the most of one run");
+    const busy = await run({ runnersBusy: async () => BUSY_LIMIT });
+    expect(busy.up.jobs).toEqual([]);
+    expect(busy.r.results[0]?.detail).toContain(`${String(BUSY_LIMIT)} jobs run`);
+    for (const count of [BUSY_LIMIT - 1, null]) {
+      const free = await run({ maxPushes: 1, runnersBusy: async () => count });
+      expect(free.up.jobs).toHaveLength(1);
+      expect(free.r.results[0]).toMatchObject({ state: "opened" });
+    }
+  });
+
+  it("counts the jobs in progress of the runs in progress, and keeps the count for the time to live", async () => {
+    let now = 0;
+    const { gh, calls } = server({
+      [`GET ${base}/a/actions/runs`]: (_b, u) => [200, { workflow_runs: u.searchParams.get("status") === "in_progress" ? [{ id: 1 }, { id: 2 }] : [] }],
+      [`GET ${base}/a/actions/runs/1/jobs`]: () => [200, { jobs: [{ status: "in_progress" }, { status: "completed" }, { status: "queued" }] }],
+      [`GET ${base}/a/actions/runs/2/jobs`]: () => [200, { jobs: [{ status: "in_progress" }] }],
+      [`GET ${base}/b/actions/runs`]: () => [200, { workflow_runs: [] }],
+    });
+    const busy = busyRunners(gh, OWNER, ["a", "b"], 1000, () => now);
+    expect(await busy()).toBe(2);
+    const made = calls.length;
+    now = 999;
+    expect(await busy()).toBe(2);
+    expect(calls.length).toBe(made);
+    const { gh: broken } = server({});
+    expect(await busyRunners(broken, OWNER, ["a"])()).toBeNull();
   });
 
   it("keeps the name and the problems of a private repository out of the public report", async () => {
