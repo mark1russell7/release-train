@@ -63,6 +63,18 @@ export interface NpmInfo {
   latest: string | null;
   /** This value is true when another person publishes the npm package of this name, for example for a copied package. */
   foreign?: boolean;
+  /**
+   * The build of the latest version, from its SLSA provenance on npm. It has the GitHub repository and the workflow file.
+   * npm checks the signed provenance when it takes the publish. null: the version has no provenance.
+   * Not set: collect did not read it (a snapshot from before the field).
+   */
+  provenance?: Provenance | null;
+}
+
+/** The repository and the workflow file that built a version, from its provenance. */
+export interface Provenance {
+  repository: string;
+  workflow: string;
 }
 
 /** A package of the owner: a `package.json` with a name and without `"private": true`. */
