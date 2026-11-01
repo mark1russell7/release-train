@@ -235,6 +235,8 @@ export interface UpdateResult {
   error: string | null;
   /** The version bumps of the cascade that the update added. */
   releases?: ReleaseDone[];
+  /** The files that `conventions fix` of the new version of conventions changed in the same commit. */
+  fixed?: string[];
 }
 
 /** The part of the train that changes the files: a clone, the range changes, the lockfile update and the push. */
@@ -398,7 +400,7 @@ export function prTitle(u: RepoUpdate): string {
 }
 
 /** This function gives the body of the pull request of an update. */
-export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[] }) | null): string {
+export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[] }) | null): string {
   const lockOf = new Map((r?.changes ?? []).map((c) => [`${c.path}|${c.dep}`, c]));
   const rows = u.items.map((i) => {
     const c = lockOf.get(`${i.path}|${i.dep}`);
@@ -443,6 +445,17 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
     );
   } else if (u.kind === "adopt-breaking") {
     lines.push("A range of a new major version changes. No published package of this repository changes a runtime range, so no release is necessary.", "");
+  }
+  const fixed = r?.fixed ?? [];
+  if (fixed.length > 0) {
+    lines.push(
+      "## Conventions fix",
+      "",
+      "The new version of `@mark1russell7/conventions` has fixes for some of its rules. `conventions fix` wrote them in this commit, so these breaks do not block the update. CI checks the result. A break that stays needs a person.",
+      "",
+      ...fixed.map((file) => `- \`${file}\``),
+      "",
+    );
   }
   lines.push("## Other lockfile changes", "");
   if (other.length === 0) lines.push("None.");
