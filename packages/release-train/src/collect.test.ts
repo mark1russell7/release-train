@@ -29,7 +29,7 @@ function fakeFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls:
   return async (url) => {
     calls.push(url);
     const u = new URL(url);
-    if (url.startsWith(REG)) {
+    if (u.origin === new URL(REG).origin) {
       const ver = /^\/(.+)\/(\d[^/]*)$/.exec(decodeURIComponent(u.pathname));
       if (ver) {
         const foreign = ver[1] === "vendored-lib";

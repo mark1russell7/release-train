@@ -648,7 +648,7 @@ export async function syncFacts(o: { gh: GitHub; owner: string; fetch?: FetchFn;
   let cliVersion: string | null = null;
   try {
     const name = `@${o.owner}/template-cli`;
-    const res = await f(`${o.registry ?? "https://registry.npmjs.org"}/${name.replace("/", "%2f")}`, { headers: { accept: "application/vnd.npm.install-v1+json" } });
+    const res = await f(`${o.registry ?? "https://registry.npmjs.org"}/${name.replaceAll("/", "%2f")}`, { headers: { accept: "application/vnd.npm.install-v1+json" } });
     if (res.ok) cliVersion = ((await res.json()) as { "dist-tags"?: Record<string, string> })["dist-tags"]?.["latest"] ?? null;
   } catch {
     cliVersion = null;
