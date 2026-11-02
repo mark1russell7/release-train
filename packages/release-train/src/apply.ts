@@ -528,8 +528,8 @@ interface WorkflowRun {
 
 /**
  * This function keeps the check runs of the newest workflow run of each workflow. Each workflow run is its own check
- * suite, so the `latest` filter of GitHub keeps the checks of an older run of the same workflow: for example a run that
- * a new push cancelled, after a later run of the same commit passed. Check runs of other apps stay.
+ * suite, so the `latest` filter of GitHub keeps the checks of an older run of the same workflow. An example is a run
+ * that a new push cancelled, after a later run of the same commit passed. Check runs of other apps stay.
  */
 export function latestRuns(runs: readonly CheckRun[], workflowRuns: readonly WorkflowRun[]): CheckRun[] {
   const newest = new Map<number, WorkflowRun>();
