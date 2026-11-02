@@ -242,6 +242,10 @@ export interface UpdateResult {
   releases?: ReleaseDone[];
   /** The files that `conventions fix` of the new version of conventions changed in the same commit. */
   fixed?: string[];
+  /** The files of a fix that the train removed, because the typecheck failed with it and passed without it. */
+  reverted?: string[];
+  /** The first error lines of the typecheck with the removed fix. */
+  fixError?: string | null;
 }
 
 /** The part of the train that changes the files: a clone, the range changes, the lockfile update and the push. */
@@ -405,7 +409,7 @@ export function prTitle(u: RepoUpdate): string {
 }
 
 /** This function gives the body of the pull request of an update. */
-export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[] }) | null): string {
+export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; fixError?: string | null }) | null): string {
   const lockOf = new Map((r?.changes ?? []).map((c) => [`${c.path}|${c.dep}`, c]));
   const rows = u.items.map((i) => {
     const c = lockOf.get(`${i.path}|${i.dep}`);
@@ -460,6 +464,18 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
       "",
       ...fixed.map((file) => `- \`${file}\``),
       "",
+    );
+  }
+  const reverted = r?.reverted ?? [];
+  if (reverted.length > 0) {
+    lines.push(
+      "## Conventions fix removed",
+      "",
+      "`conventions fix` changed these files, but then `typecheck` failed. Without the fix it passed, so the train removed the fix. The rule stays broken here until the fix of conventions is correct: this is a bug of conventions, not of this repository.",
+      "",
+      ...reverted.map((file) => `- \`${file}\``),
+      "",
+      ...(r?.fixError ? ["```text", r.fixError, "```", ""] : []),
     );
   }
   lines.push("## Other lockfile changes", "");
