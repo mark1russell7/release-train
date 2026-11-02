@@ -11,3 +11,16 @@ allowBuilds:
 minimumReleaseAgeExclude:
   - "@mark1russell7/*"
   - "@procedures/*"
+
+# An install fails when a new version has less trust evidence than an earlier version of the same package: for
+# example, a version with no provenance after versions from a trusted publisher. Such a version can be a stolen token.
+trustPolicy: no-downgrade
+# The check examines the versions of the last 7 days. A stolen-token version is new, and the registry removes it in
+# hours. Older versions can have less evidence for other reasons: for example undici-types 6.21.0 under @types/node.
+trustPolicyIgnoreAfter: 10080
+
+# The release train updates our own scopes, and it checks the provenance of each version. pnpm cannot use them: it
+# ranks the first versions, which were staged by hand, above the versions from release.yml (pnpm/pnpm#16689).
+trustPolicyExclude:
+  - "@mark1russell7/*"
+  - "@procedures/*"
