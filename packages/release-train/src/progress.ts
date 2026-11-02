@@ -1,6 +1,6 @@
 import type { FetchFn } from "./collect.ts";
 import { pool } from "./collect.ts";
-import { BLOCKED_LABEL, TRAIN_BRANCH } from "./apply.ts";
+import { BLOCKED_LABEL, latestRuns, TRAIN_BRANCH } from "./apply.ts";
 import type { Action, Plan } from "./plan.ts";
 
 /** The state of an action on GitHub. */
@@ -22,7 +22,7 @@ interface Pull {
 }
 
 interface CheckRuns {
-  check_runs: { status: string; conclusion: string | null }[];
+  check_runs: { status: string; conclusion: string | null; check_suite?: { id: number } | null }[];
 }
 
 interface Runs {
@@ -79,7 +79,8 @@ export async function addProgress(
       if (pr) {
         const checks = await get<CheckRuns>(`/repos/${opts.owner}/${repo}/commits/${pr.head.sha}/check-runs?per_page=100`);
         const blocked = (pr.labels ?? []).some((l) => l.name === BLOCKED_LABEL);
-        const state = blocked ? "ci-failed" : checkState(checks?.check_runs ?? []);
+        const workflows = await get<{ workflow_runs: { workflow_id: number; check_suite_id: number; created_at: string }[] }>(`/repos/${opts.owner}/${repo}/actions/runs?head_sha=${pr.head.sha}&per_page=100`);
+        const state = blocked ? "ci-failed" : checkState(latestRuns(checks?.check_runs ?? [], workflows?.workflow_runs ?? []));
         out[a.id] = { state, detail: `PR #${pr.number}: ${pr.title}${blocked ? " (blocked: CI failed)" : ""}`, url: pr.html_url };
         continue;
       }

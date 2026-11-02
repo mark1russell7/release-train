@@ -11,6 +11,7 @@ import {
   applySummary,
   bodyFingerprint,
   ciState,
+  latestRuns,
   prBody,
   publicReport,
   selectUpdates,
@@ -339,6 +340,27 @@ describe("helpers", () => {
     expect(ciState([{ status: "completed", conclusion: "success" }, { status: "completed", conclusion: "skipped" }], null)).toBe("green");
     expect(ciState([{ status: "completed", conclusion: "success" }], { state: "failure", total_count: 1 })).toBe("failed");
     expect(ciState([{ status: "completed", conclusion: "cancelled" }], null)).toBe("failed");
+  });
+
+  it("counts only the newest run of each workflow, so a cancelled older run of the same commit does not fail it", () => {
+    const runs = [
+      { status: "completed", conclusion: "cancelled", check_suite: { id: 1 } },
+      { status: "completed", conclusion: "success", check_suite: { id: 2 } },
+      { status: "completed", conclusion: "success", check_suite: { id: 3 } },
+      { status: "completed", conclusion: "success", check_suite: null },
+    ];
+    const workflows = [
+      { workflow_id: 10, check_suite_id: 1, created_at: "2026-11-02T00:33:00Z" },
+      { workflow_id: 10, check_suite_id: 2, created_at: "2026-11-02T00:34:00Z" },
+      { workflow_id: 11, check_suite_id: 3, created_at: "2026-11-02T00:33:00Z" },
+    ];
+    expect(latestRuns(runs, workflows).map((r) => r.check_suite?.id ?? null)).toEqual([2, 3, null]);
+    expect(ciState(latestRuns(runs, workflows), null)).toBe("green");
+    // A newest run that failed still fails
+    const later = [...workflows, { workflow_id: 11, check_suite_id: 4, created_at: "2026-11-02T00:35:00Z" }];
+    expect(ciState(latestRuns([...runs, { status: "completed", conclusion: "failure", check_suite: { id: 4 } }], later), null)).toBe("failed");
+    // Without the workflow runs, each check counts
+    expect(ciState(latestRuns(runs, []), null)).toBe("failed");
   });
 
   it("writes the fingerprint and the lockfile changes into the body", () => {
