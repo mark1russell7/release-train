@@ -1,0 +1,16 @@
+# The roadmap of release-train
+
+This file gives the items of the release train and their status. The Status page of the site reads the table. `README.md` tells how each stage works.
+
+## The items
+
+| ID | Item | Status | Links |
+| --- | --- | --- | --- |
+| RT1 | Stage 1: a read-only graph of the packages and a plan of the next releases | Done | `f7c99d0` |
+| RT2 | Stage 2: `apply` opens one update pull request for each repository of the current wave | Done | #2 |
+| RT3 | The live train: `train.yml` starts on a schedule | Done | #4 |
+| RT4 | Cascade releases in the update pull request | Done | #10, #11 |
+| RT5 | Stage 3: the template sync keeps the files from the template current | Done | #13 |
+| RT6 | The sync pushes wait for the shared runners | Done | #44 |
+| RT7 | The train moves a repository only to a version that its own `release.yml` built | Done | #49 |
+| RT8 | The site: the README, the Releases page and the Status page on GitHub Pages | In progress | #74 |
