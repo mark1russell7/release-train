@@ -470,7 +470,7 @@ describe("gitUpdater and conventions fix", () => {
    * `typecheck` gives the exit code of the typecheck script from the text of tsconfig.test.json. Without it, the
    * repository has no typecheck script. The fix writes "fixed" into tsconfig.test.json, and the clone has "old".
    */
-  const start = async (u: RepoUpdate, typecheck?: (config: string) => number) => {
+  const start = async (u: RepoUpdate, typecheck?: (config: string) => number, prettier = false) => {
     const cmds: string[] = [];
     const trees: string[] = [];
     const fixEnv: NodeJS.ProcessEnv[] = [];
@@ -479,7 +479,8 @@ describe("gitUpdater and conventions fix", () => {
       cmds.push(`${cmd} ${args.join(" ")}`);
       if (cmd === "git" && args[0] === "clone") {
         const scripts = typecheck === undefined ? {} : { scripts: { typecheck: "tsc -p tsconfig.test.json" } };
-        writeFileSync(join(opts.cwd, "package.json"), `${JSON.stringify({ name: "x", ...scripts, devDependencies: { [CONVENTIONS]: "^0.8.0" } }, null, 2)}\n`);
+        const devDependencies = { [CONVENTIONS]: "^0.8.0", ...(prettier ? { prettier: "^3.0.0" } : {}) };
+        writeFileSync(join(opts.cwd, "package.json"), `${JSON.stringify({ name: "x", ...scripts, devDependencies }, null, 2)}\n`);
         writeFileSync(join(opts.cwd, "tsconfig.test.json"), "old");
       }
       if (cmd === "git" && args[0] === "write-tree") {
@@ -496,6 +497,8 @@ describe("gitUpdater and conventions fix", () => {
         const stdout = code === 0 ? "" : "vitest.config.ts(4,16): error TS9037: Default exports can't be inferred with --isolatedDeclarations.\n";
         return { code, stdout, stderr: "" };
       }
+      // gone.ts is a file that the fix removed
+      if (cmd === "git" && args[0] === "diff" && args[1] === "--name-only" && args.length === 2) return { code: 0, stdout: "package.json\npnpm-lock.yaml\nvitest.config.ts\ngone.ts\n", stderr: "" };
       if (cmd === "git" && args.includes("commit")) message = args[args.indexOf("-m") + 1] ?? "";
       // The branch of the train does not exist yet
       if (cmd === "git" && args[0] === "fetch") return { code: 128, stdout: "", stderr: "no such ref" };
@@ -556,6 +559,15 @@ describe("gitUpdater and conventions fix", () => {
     expect(fails.result).not.toHaveProperty("reverted");
     // The fix is back: the second snapshot restored it
     expect(fails.cmds.filter((c) => c.startsWith("git show tree2:"))).toHaveLength(2);
+  });
+
+  it("gives the changed files the format of a repository with Prettier, but not the lockfile", async () => {
+    const { cmds } = await start(update("0.8.2"), () => 0, true);
+    const format = cmds.filter((c) => c.startsWith("pnpm exec prettier"));
+    expect(format).toEqual(["pnpm exec prettier --write --ignore-unknown -- package.json vitest.config.ts"]);
+    expect(cmds.indexOf(format[0] ?? "")).toBeGreaterThan(cmds.indexOf(`pnpm dlx ${CONVENTIONS}@0.8.2 fix --json`));
+    const without = await start(update("0.8.2"), () => 0);
+    expect(without.cmds.some((c) => c.includes("prettier"))).toBe(false);
   });
 
   it("does not start the fix for a version before the command", async () => {
