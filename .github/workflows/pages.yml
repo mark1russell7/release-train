@@ -10,7 +10,7 @@ on:
     branches: [main]
   # One build each day, so the Status page shows the open pull requests and issues of the day
   schedule:
-    - cron: "47 6 * * *"
+    - cron: "35 6 * * *"
   workflow_dispatch:
 
 permissions: {}
