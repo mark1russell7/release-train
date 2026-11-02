@@ -21,6 +21,8 @@ interface FakeRepo {
   archived?: boolean;
   fork?: boolean;
   files: Record<string, string>;
+  /** The paths of the git submodules: entries of type "commit" in the tree. */
+  links?: string[];
 }
 
 function fakeFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls: string[] = [], built: Record<string, { repository: string; path: string } | null> = {}): FetchFn {
@@ -72,7 +74,7 @@ function fakeFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls:
       const r = repos.find((x) => x.name === tree[1]);
       if (!r) return json({}, 404);
       if (Object.keys(r.files).length === 0) return json({ message: "Git Repository is empty." }, 409);
-      return json({ tree: Object.keys(r.files).map((path) => ({ path, type: "blob" })), truncated: false });
+      return json({ tree: [...Object.keys(r.files).map((path) => ({ path, type: "blob" })), ...(r.links ?? []).map((path) => ({ path, type: "commit" }))], truncated: false });
     }
     const content = /^\/repos\/example-owner\/([^/]+)\/contents\/(.+)$/.exec(p);
     if (content) {
@@ -99,8 +101,10 @@ const REPOS: FakeRepo[] = [
       "packages/fresh/package.json": JSON.stringify({ name: "@ex/fresh", version: "0.1.0", dependencies: { "@ex/core": "workspace:*" } }),
       "packages/skip/package.json": JSON.stringify({ name: "@ex/skip", version: "1.0.0" }),
       "packages/core/node_modules/x/package.json": JSON.stringify({ name: "x" }),
+      ".gitmodules": '[submodule "packages/linked"]\n\tpath = packages/linked\n',
       "pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  packages/fresh:\n    dependencies:\n      '@ex/core':\n        specifier: workspace:*\n        version: link:../core\n",
     },
+    links: ["packages/linked", "tools/outside"],
   },
   {
     name: "app-repo",
@@ -160,6 +164,9 @@ describe("collect with a mocked fetch", () => {
     expect(calls.some((c) => c.includes("hidden-repo"))).toBe(false);
     const core = data.repos.find((r) => r.name === "core-repo");
     expect(core?.manifests.map((m) => m.path)).toEqual(["", "packages/core", "packages/fresh"]);
+    // Only a submodule in a folder of the workspace counts
+    expect(core?.submodules).toEqual(["packages/linked"]);
+    expect(data.repos.find((r) => r.name === "app-repo")?.submodules).toBeUndefined();
     expect(data.npm["@ex/fresh"]).toEqual({ exists: false, latest: null });
 
     const p = plan(buildGraph({ owner: "example-owner", repos: data.repos, npm: data.npm }));

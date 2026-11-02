@@ -55,6 +55,8 @@ export interface RepoSnapshot {
   packageManager?: string | null;
   /** The count of the changeset files on the default branch (`.changeset/*.md`, not the README). */
   pendingChangesets?: number;
+  /** The git submodules in the folders of the workspace. A clone of the train has no submodules, so their packages are missing. */
+  submodules?: string[];
 }
 
 /** The state of one package on the npm registry. */
@@ -124,6 +126,8 @@ export interface RepoInfo {
   needsAgeRule?: boolean;
   /** The count of the changeset files on the default branch. */
   pendingChangesets?: number;
+  /** The git submodules in the folders of the workspace. */
+  submodules?: string[];
 }
 
 /** The dependency graph of the packages of one owner. */
