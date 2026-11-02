@@ -516,6 +516,30 @@ export function bodyFingerprint(body: string | null | undefined): string | null 
 interface CheckRun {
   status: string;
   conclusion: string | null;
+  check_suite?: { id: number } | null;
+}
+
+/** A workflow run of a commit, as far as `latestRuns` reads it. */
+interface WorkflowRun {
+  workflow_id: number;
+  check_suite_id: number;
+  created_at: string;
+}
+
+/**
+ * This function keeps the check runs of the newest workflow run of each workflow. Each workflow run is its own check
+ * suite, so the `latest` filter of GitHub keeps the checks of an older run of the same workflow. An example is a run
+ * that a new push cancelled, after a later run of the same commit passed. Check runs of other apps stay.
+ */
+export function latestRuns(runs: readonly CheckRun[], workflowRuns: readonly WorkflowRun[]): CheckRun[] {
+  const newest = new Map<number, WorkflowRun>();
+  for (const w of workflowRuns) {
+    const seen = newest.get(w.workflow_id);
+    if (!seen || w.created_at > seen.created_at) newest.set(w.workflow_id, w);
+  }
+  const keep = new Set([...newest.values()].map((w) => w.check_suite_id));
+  const old = new Set(workflowRuns.map((w) => w.check_suite_id).filter((id) => !keep.has(id)));
+  return runs.filter((r) => !(r.check_suite && old.has(r.check_suite.id)));
 }
 
 /** This function changes the check runs and the commit status of a commit into one CI state. */
@@ -654,7 +678,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const ciOf = async (repo: string, sha: string): Promise<CiState> => {
     const runs = await gh.request<{ check_runs: CheckRun[] }>("GET", `${base}/${repo}/commits/${sha}/check-runs?per_page=100`);
     const status = await gh.request<{ state: string; total_count: number }>("GET", `${base}/${repo}/commits/${sha}/status`);
-    return ciState(runs.data?.check_runs ?? [], status.data);
+    const workflows = await gh.request<{ workflow_runs: WorkflowRun[] }>("GET", `${base}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
+    return ciState(latestRuns(runs.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []), status.data);
   };
 
   /**
