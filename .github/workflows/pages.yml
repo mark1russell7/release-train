@@ -94,9 +94,10 @@ jobs:
         EOF
       out: _site
       # The site-pages action adds releases/, status/, data/releases.json and data/status.json to the built site.
-      # The repository has no docs/ROADMAP.md, so the Status page shows the open pull requests and issues.
       site-pages: true
       site-name: release-train
+      # The Status page reads the items of this table.
+      roadmap: docs/ROADMAP.md
 
   # This job examines the deployed site: the home page and the pages of site-pages.
   # It starts no code of the repository and reads only the public site.
