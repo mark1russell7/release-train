@@ -79,7 +79,7 @@ When a dependency gets a new version outside the range of a dependent (a new maj
 - When these files name the changed dependency (for example `from "@scope/dep"`), the types of the dependency can reach the users, so the change breaks the API. A change of a peer range also breaks the API. When npm gives no typed files, the case is not clear, so the change counts as a break of the API.
 - When the files do not name the dependency, the release is a patch.
 - A break of the API gives MINOR before `1.0.0` and MAJOR after.
-- A repository with changesets (`.changeset/config.json`) gets the changeset file `.changeset/release-train-cascade.md`. Another repository gets the new version in `package.json`.
+- A repository with changesets (`.changeset/config.json`) gets a changeset file `.changeset/release-train-<fingerprint>.md`. The name is new on each update, so the Changesets check of the pull request sees it. This is also true when the default branch still has an unreleased changeset of an earlier run. Another repository gets the new version in `package.json`.
 - The body of the pull request has a table "Releases" with each package, its version, the release type and the reason.
 - A private repository gets the pull request, but its packages are not published.
 - When the release of the dependent is blocked, its range change waits too.

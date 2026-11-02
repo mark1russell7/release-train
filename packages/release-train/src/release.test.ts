@@ -1,5 +1,5 @@
 // All repository and package names in these tests are made up.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
@@ -11,7 +11,7 @@ import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import { awaitRelease, changesetText, decideBump, namesModule, setManifestVersion, typedFiles } from "./release.ts";
 import type { Manifest, NpmInfo, RepoSnapshot } from "./types.ts";
-import { gitUpdater } from "./workspace.ts";
+import { changesetName, gitUpdater } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 /** This function makes a gzip tar file with the given files. */
@@ -126,7 +126,8 @@ describe("gitUpdater with a cascade release", () => {
     }
     if (cmd === "git" && args.includes("commit")) {
       seen.manifest = readFileSync(join(opts.cwd, "package.json"), "utf8");
-      if (changeset) seen.changeset = readFileSync(join(opts.cwd, ".changeset", "release-train-cascade.md"), "utf8");
+      const file = changeset ? readdirSync(join(opts.cwd, ".changeset")).find((n) => /^release-train-[0-9a-f]{8}\.md$/.test(n)) : undefined;
+      if (file) seen.changeset = readFileSync(join(opts.cwd, ".changeset", file), "utf8");
     }
     const out = cmd === "pnpm" && args[0] === "--version" ? "10.0.0\n" : cmd === "git" && args[0] === "status" ? " M package.json\n" : "";
     return { code: cmd === "git" && args[0] === "fetch" ? 1 : 0, stdout: out, stderr: "" };
@@ -163,7 +164,7 @@ describe("gitUpdater with a cascade release", () => {
     expect(r.releases?.[0]?.via).toBe("changeset");
     expect(seen.manifest).toContain('"version": "0.3.0"');
     expect(seen.changeset).toContain('"@ex/pub": minor');
-    expect(cmds).toContain("git add -- .changeset/release-train-cascade.md");
+    expect(cmds.some((c) => /^git add -- \.changeset\/release-train-[0-9a-f]{8}\.md$/.test(c))).toBe(true);
   });
 });
 
@@ -269,5 +270,13 @@ describe("cascade switch", () => {
     expect(s.ready.some((x) => x.repo === "pub-repo")).toBe(false);
     expect(s.waiting.find((w) => w.repo === "pub-repo")?.dependsOn).toEqual(["cascade-off:release:pub-repo"]);
     expect(selectUpdates(cascadePlan(), null, ["pub-repo"]).ready.some((x) => x.repo === "pub-repo")).toBe(true);
+  });
+});
+
+describe("changesetName", () => {
+  it("names the changeset by the fingerprint, and numbers a name that the branch has already", () => {
+    expect(changesetName(() => false, "0123456789ab")).toBe("release-train-01234567.md");
+    const taken = new Set(["release-train-01234567.md", "release-train-01234567-2.md"]);
+    expect(changesetName((n) => taken.has(n), "0123456789ab")).toBe("release-train-01234567-3.md");
   });
 });
