@@ -155,6 +155,51 @@ describe("gitUpdater with a cascade release", () => {
     expect(seen.manifest).toContain('"version": "0.5.0"');
   });
 
+  it("starts the version script of the package after the new version, as npm version does", async () => {
+    const u = { ...(selectUpdates(cascadePlan()).ready.find((x) => x.repo === "pub-repo") as RepoUpdate), lockKind: "pnpm" as const };
+    const go = async (code: number) => {
+      const cmds: string[] = [];
+      const seen: { version?: string; env?: NodeJS.ProcessEnv; message?: string } = {};
+      const run: RunFn = async (cmd, args, opts) => {
+        cmds.push(`${cmd} ${args.join(" ")}`);
+        if (cmd === "git" && args[0] === "clone")
+          writeFileSync(join(opts.cwd, "package.json"), `{\n  "name": "@ex/pub",\n  "version": "0.3.0",\n  "scripts": { "version": "node scripts/sync.ts" },\n  "dependencies": { "@ex/core": "^1.0.0" }\n}\n`);
+        if (cmd === "pnpm" && args[0] === "run" && args[1] === "version") {
+          seen.version = (JSON.parse(readFileSync(join(opts.cwd, "package.json"), "utf8")) as { version: string }).version;
+          seen.env = opts.env;
+          return { code, stdout: "", stderr: code === 0 ? "" : "VERSION and package.json differ" };
+        }
+        if (cmd === "pnpm" && args[0] === "install")
+          writeFileSync(join(opts.cwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      '@ex/core':\n        specifier: ^2.0.0\n        version: 2.0.0\n");
+        if (cmd === "git" && args.includes("commit")) seen.message = args[args.indexOf("-m") + 1] ?? "";
+        const out = cmd === "pnpm" && args[0] === "--version" ? "10.0.0\n" : cmd === "git" && args[0] === "status" ? " M package.json\n" : "";
+        return { code: cmd === "git" && args[0] === "fetch" ? 1 : 0, stdout: out, stderr: "" };
+      };
+      const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: fetchFn });
+      return { cmds, seen, r: await up.update(u, { defaultBranch: "main", rebuild: false }) };
+    };
+    const { cmds, seen, r } = await go(0);
+    expect(r.status).toBe("pushed");
+    // The script sees the new version, after the lockfile, with the packages installed and no git credentials
+    expect(seen.version).toBe("0.4.0");
+    const script = cmds.indexOf("pnpm run version");
+    expect(cmds.slice(0, script)).toContain("pnpm install --lockfile-only --frozen-lockfile");
+    expect(cmds.slice(0, script).at(-1)).toBe("pnpm install --frozen-lockfile --ignore-scripts");
+    expect(cmds.slice(script + 1)).toContain("pnpm install --lockfile-only");
+    expect(Object.keys(seen.env ?? {}).filter((key) => key.startsWith("GIT_CONFIG_"))).toEqual([]);
+    expect(seen.message).toContain("- version script: ./package.json");
+    const failed = await go(1);
+    expect(failed.r).toMatchObject({ status: "failed", error: expect.stringContaining("The version script of ./package.json failed (exit 1): VERSION and package.json differ") });
+  });
+
+  it("starts no version script for a version that stays", async () => {
+    const u = { ...(selectUpdates(cascadePlan()).ready.find((x) => x.repo === "pub-repo") as RepoUpdate), lockKind: "none" as const };
+    const cmds: string[] = [];
+    const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run: runWith(false, cmds, {}, "0.5.0"), fetch: fetchFn });
+    await up.update(u, { defaultBranch: "main", rebuild: false });
+    expect(cmds.some((c) => c.includes("run version"))).toBe(false);
+  });
+
   it("writes a changeset in a repository with changesets and keeps the version", async () => {
     const u = { ...(selectUpdates(cascadePlan()).ready.find((x) => x.repo === "pub-repo") as RepoUpdate), lockKind: "none" as const };
     const cmds: string[] = [];

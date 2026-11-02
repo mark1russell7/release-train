@@ -80,6 +80,8 @@ When a dependency gets a new version outside the range of a dependent (a new maj
 - When the files do not name the dependency, the release is a patch.
 - A break of the API gives MINOR before `1.0.0` and MAJOR after.
 - A repository with changesets (`.changeset/config.json`) gets a changeset file `.changeset/release-train-<fingerprint>.md`. The name is new on each update, so the Changesets check of the pull request sees it. This is also true when the default branch still has an unreleased changeset of an earlier run. Another repository gets the new version in `package.json`.
+- After the new version, the train starts the `version` script of the package, as `npm version` does. The script gets the packages, but no git credentials. The script changes the other copies of the version, for example a `VERSION` constant or a registry entry. When the script fails, the update fails.
+- When the repository has Prettier, each file that the train changed gets the format of the repository. The lockfiles stay.
 - The body of the pull request has a table "Releases" with each package, its version, the release type and the reason.
 - A private repository gets the pull request, but its packages are not published.
 - When the release of the dependent is blocked, its range change waits too.

@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import semver from "semver";
 import { changesetText, decideBump, setManifestVersion, typedFiles } from "./release.ts";
 import { ageRuleEdit, globMatch } from "./settings.ts";
@@ -175,6 +175,18 @@ function tail(s: string, n = 800): string {
   return t.length > n ? `...${t.slice(-n)}` : t;
 }
 
+/** This function reads the scripts of a package.json. It gives undefined when the file has none or does not parse. */
+function readScripts(file: string): Record<string, unknown> | undefined {
+  try {
+    return (JSON.parse(readFileSync(file, "utf8")) as { scripts?: Record<string, unknown> }).scripts;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The lockfiles: the package manager writes them, so the formatter of the repository does not change them. */
+const LOCKFILES = new Set(["pnpm-lock.yaml", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock"]);
+
 /** The result of `conventions fix` in a clone: the files that it changed, and the fix that the train removed because it broke the typecheck. */
 interface FixOutcome {
   fixed: string[];
@@ -280,15 +292,11 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    * starts it again without the fix. When it then passes, the fix caused the failure: the function removes the fix and
    * gives the files in `reverted`, with the first error lines. Else the failure is not from the fix, and the fix stays.
    */
-  const conventionsFix = async (dir: string, u: RepoUpdate): Promise<FixOutcome> => {
+  const conventionsFix = async (dir: string, u: RepoUpdate, fixEnv: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<FixOutcome> => {
     const none: FixOutcome = { fixed: [], reverted: [], error: null };
     const to = u.items.find((i) => i.dep === CONVENTIONS)?.to;
     if (to === undefined || semver.valid(to) === null || semver.lt(to, FIX_SINCE)) return none;
-    const fixEnv: NodeJS.ProcessEnv = { ...env, GITHUB_REPOSITORY: `${o.owner}/${u.repo}` };
-    for (const key of Object.keys(fixEnv)) if (key.startsWith("GIT_CONFIG_")) delete fixEnv[key];
-    delete fixEnv["GITHUB_STEP_SUMMARY"];
-    if (u.lockKind === "npm") await run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: dir, env: fixEnv });
-    else await run("pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"], { cwd: dir, env: fixEnv });
+    await install();
     // The tree of the files before the fix, from a separate index, so the index of the clone does not change
     const snapshot = async (): Promise<string | null> => {
       const index = join(dir, ".git", "rt-fix-index");
@@ -316,12 +324,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     } catch {
       return none;
     }
-    let scripts: Record<string, unknown> | undefined;
-    try {
-      scripts = (JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { scripts?: Record<string, unknown> }).scripts;
-    } catch {
-      scripts = undefined;
-    }
+    const scripts = readScripts(join(dir, "package.json"));
     if (fixed.length === 0 || before === null || typeof scripts?.["typecheck"] !== "string") return { ...none, fixed };
     const typecheck = (): Promise<RunResult> => run(u.lockKind === "npm" ? "npm" : "pnpm", ["run", "typecheck"], { cwd: dir, env: fixEnv });
     const withFix = await typecheck();
@@ -335,6 +338,63 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     const output = `${withFix.stdout}\n${withFix.stderr}`;
     const error = output.split("\n").filter((line) => /error/i.test(line)).slice(0, 5).join("\n");
     return { fixed: [], reverted: fixed, error: error === "" ? tail(withFix.stdout || withFix.stderr, 500) : error };
+  };
+
+  /** The environment of a script of the repository: no git credentials, no step summary, and the repository of the clone in GITHUB_REPOSITORY. */
+  const scriptEnv = (repo: string): NodeJS.ProcessEnv => {
+    const e: NodeJS.ProcessEnv = { ...env, GITHUB_REPOSITORY: `${o.owner}/${repo}` };
+    for (const key of Object.keys(e)) if (key.startsWith("GIT_CONFIG_")) delete e[key];
+    delete e["GITHUB_STEP_SUMMARY"];
+    return e;
+  };
+
+  /** This function gives the install of one clone: the packages with no install scripts, at most one time. */
+  const installer = (dir: string, u: RepoUpdate, e: NodeJS.ProcessEnv): (() => Promise<void>) => {
+    let done: Promise<void> | null = null;
+    return () =>
+      (done ??= (async () => {
+        if (u.lockKind === "npm") await run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: dir, env: e });
+        else await run("pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"], { cwd: dir, env: e });
+      })());
+  };
+
+  /**
+   * This function starts the `version` script of each package that got a new version, as `npm version` does. There a
+   * repository keeps the other copies of its version in step. Examples are a `VERSION` constant, an API report, a registry
+   * entry and the version of a package that releases with it. In crawler (11-02), a test compared the constant with package.json, and the
+   * train changed only package.json. The function gives the folders of the scripts that ran, or the first error.
+   */
+  const versionScripts = async (dir: string, u: RepoUpdate, paths: readonly string[], e: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<{ ran: string[]; error: string | null }> => {
+    const ran: string[] = [];
+    for (const path of paths) {
+      if (typeof readScripts(join(dir, path, "package.json"))?.["version"] !== "string") continue;
+      await install();
+      const r = await run(u.lockKind === "npm" ? "npm" : "pnpm", ["run", "version"], { cwd: join(dir, path), env: e });
+      if (r.code !== 0) return { ran, error: `The version script of ${path || "."}/package.json failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}` };
+      ran.push(path || ".");
+    }
+    return { ran, error: null };
+  };
+
+  /**
+   * This function gives each file that the train changed the format of the repository, when the repository uses Prettier, so
+   * its format check passes (crawler, 11-02: a line that conventions fix wrote was longer than the print width). Prettier reads
+   * the configuration and the ignore file of the repository. The lockfiles do not change.
+   */
+  const formatChanged = async (dir: string, u: RepoUpdate, extra: readonly string[], e: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<void> => {
+    let manifest: { dependencies?: Record<string, unknown>; devDependencies?: Record<string, unknown> };
+    try {
+      manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as typeof manifest;
+    } catch {
+      return;
+    }
+    if (manifest.devDependencies?.["prettier"] === undefined && manifest.dependencies?.["prettier"] === undefined) return;
+    const changed = (await run("git", ["diff", "--name-only"], { cwd: dir, env: e })).stdout.split("\n");
+    const files = [...new Set([...changed, ...extra].map((f) => f.trim()))].filter((f) => f !== "" && !LOCKFILES.has(basename(f)) && existsSync(join(dir, f)));
+    if (files.length === 0) return;
+    await install();
+    const args = ["prettier", "--write", "--ignore-unknown", "--", ...files];
+    await run(u.lockKind === "npm" ? "npx" : "pnpm", u.lockKind === "npm" ? ["--no-install", ...args] : ["exec", ...args], { cwd: dir, env: e });
   };
 
   return {
@@ -385,6 +445,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
         // The public types decide the release type. A repository with changesets gets a changeset, else a new version.
         const added: string[] = newSettingsFile ? ["pnpm-workspace.yaml"] : [];
         const releases: ReleaseDone[] = [];
+        const bumped: string[] = [];
         const rels = (u.releases ?? [])
           .map((r) => ({ ...r, changes: r.changes.filter((c) => u.items.some((i) => i.dep === c.dep)) }))
           .filter((r) => r.changes.length > 0);
@@ -401,6 +462,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
               const text = setManifestVersion(readFileSync(file, "utf8"), d.to);
               if (text === null) return fail(`${r.path || "."}/package.json has no version field.`);
               writeFileSync(file, text);
+              bumped.push(r.path);
             }
           }
           if (viaChangeset) {
@@ -467,12 +529,23 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           const failed = editAll(breaking.map((i) => ({ path: i.path, type: i.type, dep: i.dep, range: i.range, newRange: i.newRange ?? i.range })));
           if (failed.size > 0) return fail(notPlanRange(failed));
         }
-        // 2. A new version of conventions brings the fixes of its rules. The train writes them in the same commit, so a new
+        // 2. The version script of each package with a new version. A script can change the version of another package of
+        // the workspace, so the lockfile gets the new versions.
+        const fixEnv = scriptEnv(u.repo);
+        const install = installer(dir, u, fixEnv);
+        const hooks = await versionScripts(dir, u, bumped, fixEnv, install);
+        if (hooks.error !== null) return fail(hooks.error);
+        if (hooks.ran.length > 0 && u.lockKind === "pnpm") await sh("pnpm", ["install", "--lockfile-only"], "pnpm install --lockfile-only");
+        if (hooks.ran.length > 0 && u.lockKind === "npm") await sh("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], "npm install --package-lock-only");
+
+        // 3. A new version of conventions brings the fixes of its rules. The train writes them in the same commit, so a new
         // rule does not block the update for a break that a script can fix. CI of the pull request checks the result.
-        const { fixed, reverted, error: fixError } = await conventionsFix(dir, u);
+        const { fixed, reverted, error: fixError } = await conventionsFix(dir, u, fixEnv, install);
+        // 4. The files that the train wrote get the format of the repository.
+        await formatChanged(dir, u, added, fixEnv, install);
         const after = read();
 
-        // 3. The check: each item must have its target version in the lockfile.
+        // 5. The check: each item must have its target version in the lockfile.
         const unresolved = lockFile
           ? [...new Set(u.items.filter((i) => {
               const v = after[i.path]?.[i.dep];
@@ -484,7 +557,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
         if (status.stdout.trim() === "" && unresolved.length === 0) return { status: "no-change", sha: null, changes, unresolved, young, tool, error: null, releases };
         if (status.stdout.trim() === "" || (lockFile && names.length > 0 && unresolved.length === names.length)) return { status: "unresolved", sha: null, changes, unresolved, young, tool, error: null, releases };
 
-        // 4. One commit on the newest default branch.
+        // 6. One commit on the newest default branch.
         const subject = names.length === 0
           ? "chore(pnpm): no release age wait for the packages of the owner"
           : `chore(deps): release train update of ${names.length === 1 ? names[0] : `${names.length} packages`}`;
@@ -493,6 +566,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           "",
           ...u.items.map((i) => `- ${i.dep} in ${i.path || "."}: ${i.newRange ? `${i.range} -> ${i.newRange}` : i.range}, lockfile -> ${after[i.path]?.[i.dep] ?? i.to}`),
           ...releases.map((r) => `- release ${r.name}: ${r.from} -> ${r.to} (${r.type}, ${r.via === "changeset" ? "changeset" : "package.json"})`),
+          ...(hooks.ran.length > 0 ? [`- version script: ${hooks.ran.map((p) => `${p}/package.json`).join(", ")}`] : []),
           ...(settingsChanged ? [`- pnpm-workspace.yaml: ${(u.ageScopes ?? []).join(", ")} in minimumReleaseAgeExclude`] : []),
           ...(fixed.length > 0 ? [`- conventions fix: ${fixed.join(", ")}`] : []),
           ...(reverted.length > 0 ? [`- conventions fix removed, it broke typecheck: ${reverted.join(", ")}`] : []),
@@ -501,7 +575,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
         if (added.length > 0) await sh("git", ["add", "--", ...added], "git add");
         await sh("git", ["-c", `user.name=${o.author.name}`, "-c", `user.email=${o.author.email}`, "commit", "--quiet", "--no-verify", "-m", msg], "git commit");
 
-        // 5. No push when the branch already has the same content in the files of the train.
+        // 7. No push when the branch already has the same content in the files of the train.
         const pushed = await pushHead(dir, sh, TRAIN_BRANCH, remote, ctx.rebuild);
         return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError } : {}) };
       } catch (e) {
