@@ -466,13 +466,36 @@ describe("gitUpdater and conventions fix", () => {
     const u = selectUpdates(fixture(), ["lib-repo"]).ready[0] as RepoUpdate;
     return { ...u, lockKind: "pnpm" as const, items: u.items.filter((i) => i.dep === "@ex/util").map((i) => ({ ...i, dep: CONVENTIONS, to })) };
   };
-  const start = async (u: RepoUpdate) => {
+  /**
+   * `typecheck` gives the exit code of the typecheck script from the text of tsconfig.test.json. Without it, the
+   * repository has no typecheck script. The fix writes "fixed" into tsconfig.test.json, and the clone has "old".
+   */
+  const start = async (u: RepoUpdate, typecheck?: (config: string) => number) => {
     const cmds: string[] = [];
+    const trees: string[] = [];
     const fixEnv: NodeJS.ProcessEnv[] = [];
     let message = "";
     const run: RunFn = async (cmd, args, opts) => {
       cmds.push(`${cmd} ${args.join(" ")}`);
-      if (cmd === "git" && args[0] === "clone") writeFileSync(join(opts.cwd, "package.json"), `${JSON.stringify({ name: "x", devDependencies: { [CONVENTIONS]: "^0.8.0" } }, null, 2)}\n`);
+      if (cmd === "git" && args[0] === "clone") {
+        const scripts = typecheck === undefined ? {} : { scripts: { typecheck: "tsc -p tsconfig.test.json" } };
+        writeFileSync(join(opts.cwd, "package.json"), `${JSON.stringify({ name: "x", ...scripts, devDependencies: { [CONVENTIONS]: "^0.8.0" } }, null, 2)}\n`);
+        writeFileSync(join(opts.cwd, "tsconfig.test.json"), "old");
+      }
+      if (cmd === "git" && args[0] === "write-tree") {
+        trees.push(readFileSync(join(opts.cwd, "tsconfig.test.json"), "utf8"));
+        return { code: 0, stdout: `tree${String(trees.length)}\n`, stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "show") {
+        const [tree, file] = (args[1] ?? "").split(":");
+        const text = trees[Number((tree ?? "").slice(4)) - 1];
+        return file === "tsconfig.test.json" && text !== undefined ? { code: 0, stdout: text, stderr: "" } : { code: 128, stdout: "", stderr: "no such path" };
+      }
+      if (cmd === "pnpm" && args[0] === "run" && args[1] === "typecheck") {
+        const code = typecheck?.(readFileSync(join(opts.cwd, "tsconfig.test.json"), "utf8")) ?? 0;
+        const stdout = code === 0 ? "" : "vitest.config.ts(4,16): error TS9037: Default exports can't be inferred with --isolatedDeclarations.\n";
+        return { code, stdout, stderr: "" };
+      }
       if (cmd === "git" && args.includes("commit")) message = args[args.indexOf("-m") + 1] ?? "";
       // The branch of the train does not exist yet
       if (cmd === "git" && args[0] === "fetch") return { code: 128, stdout: "", stderr: "no such ref" };
@@ -482,6 +505,11 @@ describe("gitUpdater and conventions fix", () => {
       }
       if (cmd === "pnpm" && args[0] === "dlx") {
         fixEnv.push(opts.env ?? {});
+        if (typecheck !== undefined) {
+          writeFileSync(join(opts.cwd, "tsconfig.test.json"), "fixed");
+          writeFileSync(join(opts.cwd, "vitest.config.ts"), "export default {};\n");
+          return { code: 0, stdout: JSON.stringify({ changed: ["tsconfig.test.json", "vitest.config.ts"], passes: 2, failed: false }), stderr: "" };
+        }
         return { code: 1, stdout: JSON.stringify({ changed: [".github/workflows/ci.yml", "vitest.config.ts"], passes: 2, failed: true }), stderr: "" };
       }
       const stdout = cmd === "pnpm" && args[0] === "--version" ? "12.10.1\n" : cmd === "git" && args[0] === "status" ? " M package.json\n" : "";
@@ -497,13 +525,37 @@ describe("gitUpdater and conventions fix", () => {
     // typed-files needs the typescript of the repository: an install with no scripts, just before the fix
     const fix = cmds.indexOf(`pnpm dlx ${CONVENTIONS}@0.8.2 fix --json`);
     expect(fix).toBeGreaterThan(0);
-    expect(cmds[fix - 1]).toBe("pnpm install --frozen-lockfile --ignore-scripts");
+    expect(cmds.slice(0, fix).filter((c) => c.startsWith("pnpm")).at(-1)).toBe("pnpm install --frozen-lockfile --ignore-scripts");
     expect(fixEnv[0]?.["GITHUB_REPOSITORY"]).toBe(`${OWNER}/lib-repo`);
     expect(fixEnv[0]).not.toHaveProperty("GITHUB_STEP_SUMMARY");
     expect(Object.keys(fixEnv[0] ?? {}).filter((key) => key.startsWith("GIT_CONFIG_"))).toEqual([]);
     expect(result).toMatchObject({ status: "pushed", fixed: [".github/workflows/ci.yml", "vitest.config.ts"] });
     expect(message).toContain("- conventions fix: .github/workflows/ci.yml, vitest.config.ts");
     expect(prBody(update("0.8.2"), result)).toContain("## Conventions fix");
+  });
+
+  it("removes a fix when the typecheck fails with it and passes without it", async () => {
+    const { cmds, message, result } = await start(update("0.8.2"), (config) => (config === "fixed" ? 2 : 0));
+    expect(cmds.filter((c) => c === "pnpm run typecheck")).toHaveLength(2);
+    expect(result).not.toHaveProperty("fixed");
+    expect(result).toMatchObject({ status: "pushed", reverted: ["tsconfig.test.json", "vitest.config.ts"] });
+    expect(result.fixError).toContain("TS9037");
+    expect(message).toContain("- conventions fix removed, it broke typecheck: tsconfig.test.json, vitest.config.ts");
+    const body = prBody(update("0.8.2"), result);
+    expect(body).toContain("## Conventions fix removed");
+    expect(body).toContain("error TS9037");
+  });
+
+  it("keeps a fix when the typecheck passes with it, or fails also without it", async () => {
+    const passes = await start(update("0.8.2"), () => 0);
+    expect(passes.cmds.filter((c) => c === "pnpm run typecheck")).toHaveLength(1);
+    expect(passes.result).toMatchObject({ fixed: ["tsconfig.test.json", "vitest.config.ts"] });
+    const fails = await start(update("0.8.2"), () => 2);
+    expect(fails.cmds.filter((c) => c === "pnpm run typecheck")).toHaveLength(2);
+    expect(fails.result).toMatchObject({ fixed: ["tsconfig.test.json", "vitest.config.ts"] });
+    expect(fails.result).not.toHaveProperty("reverted");
+    // The fix is back: the second snapshot restored it
+    expect(fails.cmds.filter((c) => c.startsWith("git show tree2:"))).toHaveLength(2);
   });
 
   it("does not start the fix for a version before the command", async () => {
