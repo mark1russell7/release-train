@@ -8,6 +8,18 @@ import { ageRuleEdit, globMatch } from "./settings.ts";
 import type { LockChange, ReleaseDone, RepoUpdate, UpdateResult, Updater, YoungItem } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
 import { TRAIN_BRANCH } from "./apply.ts";
+
+/**
+ * This function gives the name of the changeset file of an update. The name holds the fingerprint of the update, so a
+ * rebuild of the branch writes the same file. A name that the default branch has already (an unreleased changeset of an
+ * earlier run) gets a number: the Changesets check of the pull request needs a new file.
+ */
+export function changesetName(exists: (name: string) => boolean, fingerprint: string): string {
+  const base = `release-train-${fingerprint.slice(0, 8)}`;
+  let name = `${base}.md`;
+  for (let n = 2; exists(name); n++) name = `${base}-${n}.md`;
+  return name;
+}
 import { parseNpmLock, parsePnpmLock } from "./parse.ts";
 import { SYNC_BRANCH, syncCommitMessage, syncRepo, workflowsRefused } from "./sync.ts";
 import type { RepoFiles, SyncJob, SyncPush, SyncResult, SyncUpdater } from "./sync.ts";
@@ -343,8 +355,9 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           if (viaChangeset) {
             const deps = [...new Set(rels.flatMap((r) => r.changes.map((c) => c.dep)))];
             const summary = `The release train: the ranges of ${deps.join(", ")} change to a version outside the old range.`;
-            writeFileSync(join(dir, ".changeset", "release-train-cascade.md"), changesetText(releases, summary));
-            added.push(".changeset/release-train-cascade.md");
+            const name = changesetName((n) => existsSync(join(dir, ".changeset", n)), u.fingerprint);
+            writeFileSync(join(dir, ".changeset", name), changesetText(releases, summary));
+            added.push(`.changeset/${name}`);
           }
         }
 
