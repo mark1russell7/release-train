@@ -33,6 +33,7 @@ export function buildGraph(input: GraphInput): Graph {
       importers: repo.manifests.length,
       warnings: [...repo.warnings],
       pendingChangesets: repo.pendingChangesets ?? 0,
+      ...(repo.submodules?.length ? { submodules: repo.submodules } : {}),
       needsAgeRule: needsAgeRule({ lockKind: repo.lockKind, pnpmWorkspace: repo.pnpmWorkspace ?? null, packageManager: repo.packageManager ?? null }, ownScopes(input.owner)),
     };
     for (const { path, manifest: m } of repo.manifests) {

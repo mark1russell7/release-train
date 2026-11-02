@@ -52,6 +52,8 @@ export interface RepoUpdate {
   wave: number;
   why: string;
   lockKind: LockKind;
+  /** The git submodules in the folders of the workspace. The train cannot install such a workspace from its clone. */
+  submodules?: string[];
   items: UpdateItem[];
   /** The published packages of the repository that release with this update: the train adds their version bump. */
   releases?: ReleaseItem[];
@@ -119,6 +121,7 @@ function isAdopt(a: Action): a is Action & { kind: "adopt-in-range" | "adopt-bre
 export function selectUpdates(p: Plan, only: readonly string[] | null = null, cascade: readonly string[] | "all" = "all"): Selection {
   const latest = new Map(p.nodes.filter((n) => n.kind === "package").map((n) => [n.name, n.npmLatest]));
   const lock = new Map(p.repos.map((r) => [r.name, r.lockKind]));
+  const links = new Map(p.repos.filter((r) => r.submodules?.length).map((r) => [r.name, r.submodules ?? []]));
   const scopes = ownScopes(p.owner);
   const ageRule = new Set(p.repos.filter((r) => r.needsAgeRule).map((r) => r.name));
   const ageScopes = (repo: string): string[] | null => (ageRule.has(repo) ? scopes : null);
@@ -172,6 +175,7 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null, ca
       wave: a.wave,
       why: a.why,
       lockKind: lock.get(a.repo) ?? "none",
+      ...(links.has(a.repo) ? { submodules: links.get(a.repo) ?? [] } : {}),
       items,
       ageScopes: ageScopes(a.repo),
       ...(releases.length > 0 ? { releases } : {}),
@@ -192,6 +196,7 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null, ca
       wave: 0,
       why: "The release train updates the packages of the owner, so the release age check of pnpm must not make them wait",
       lockKind: r.lockKind,
+      ...(r.submodules?.length ? { submodules: r.submodules } : {}),
       items: [],
       ageScopes: scopes,
       fingerprint: fingerprint([], scopes),
@@ -798,6 +803,12 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length };
     if (u.lockKind === "yarn") {
       result({ ...common, state: "skipped", pr: prRef(existing), autoMerge: null, ci: null, detail: "The train cannot update a Yarn lockfile." });
+      continue;
+    }
+    if (u.submodules?.length) {
+      // Each run would fail the same way: the install in the clone does not find the packages of the submodules
+      const detail = `The workspace has git submodules (${u.submodules.join(", ")}). The clone of the train has no submodules, so the install cannot find their packages. Move the package into the repository or publish it.`;
+      result({ ...common, state: "skipped", pr: prRef(existing), autoMerge: null, ci: null, detail });
       continue;
     }
     if (o.dryRun) {

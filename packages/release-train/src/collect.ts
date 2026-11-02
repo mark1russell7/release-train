@@ -204,6 +204,9 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
         .filter((p) => p.endsWith("/package.json"))
         .map((p) => p.slice(0, -"/package.json".length));
       const wsDirs = matchWorkspaces(globs, dirs);
+      // A submodule is an entry of type "commit" in the tree
+      const links = matchWorkspaces(globs, tree.tree.filter((t) => t.type === "commit").map((t) => t.path));
+      if (links.length > 0) snap.submodules = links;
       const files = await pool(wsDirs, limit, async (d): Promise<ManifestFile | null> => {
         const text = await ghRaw(r.name, `${d}/package.json`, r.default_branch);
         if (text === null) return null;

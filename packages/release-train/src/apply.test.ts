@@ -270,6 +270,20 @@ describe("apply", () => {
     expect(calls.some((c) => c.method === "POST")).toBe(false);
   });
 
+  it("skips a workspace with git submodules, because its clone cannot install", async () => {
+    const p = fixture();
+    p.repos = p.repos.map((r) => (r.name === "lib-repo" ? { ...r, submodules: ["libs/linked"] } : r));
+    const { gh, calls } = server({ [`GET ${base}/lib-repo/pulls`]: () => [200, []], [`GET ${base}/lib-repo`]: meta });
+    const up = updater();
+    for (const dryRun of [true, false]) {
+      const r = await apply({ owner: OWNER, plan: p, gh, updater: up, dryRun, only: ["lib-repo"] });
+      expect(r.results[0]?.state).toBe("skipped");
+      expect(r.results[0]?.detail).toMatch(/git submodules \(libs\/linked\)/);
+    }
+    expect(up.seen).toEqual([]);
+    expect(calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
   it("closes the pull request with a mark when its versions are younger than the minimumReleaseAge", async () => {
     const { gh, calls } = server({
       [`GET ${base}/lib-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(4, "lib-repo")] : []],
