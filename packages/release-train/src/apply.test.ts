@@ -534,6 +534,9 @@ describe("gitUpdater and conventions fix", () => {
     expect(Object.keys(fixEnv[0] ?? {}).filter((key) => key.startsWith("GIT_CONFIG_"))).toEqual([]);
     expect(result).toMatchObject({ status: "pushed", fixed: [".github/workflows/ci.yml", "vitest.config.ts"] });
     expect(message).toContain("- conventions fix: .github/workflows/ci.yml, vitest.config.ts");
+    // A new file of the fix is not tracked, so `git add -u` does not stage it: the train stages each file of the fix by name
+    const commit = cmds.findIndex((c) => c.includes(" commit "));
+    expect(cmds.slice(0, commit)).toContain("git add -A -- .github/workflows/ci.yml vitest.config.ts");
     expect(prBody(update("0.8.2"), result)).toContain("## Conventions fix");
   });
 
