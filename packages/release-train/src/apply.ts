@@ -338,7 +338,7 @@ export interface SyncOptions {
   busyLimit?: number;
 }
 
-/** The fleet rule of the runner slots (40 per account): no new heavy start while 30 or more jobs run. */
+/** The rule of the runner slots (40 per account): no new heavy start while 30 or more jobs run. */
 export const BUSY_LIMIT = 30;
 
 /** The most sync branches of one run in the CLI. A sync push starts approximately 6 jobs (CI, the scans, the reviews). */

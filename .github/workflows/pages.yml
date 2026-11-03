@@ -1,8 +1,9 @@
 # Publishes the site of the repository to GitHub Pages at https://mark1russell7.github.io/release-train/, with
 # the shared Pages workflow of mark1russell7 (reusable-pages.yml of mark1russell7/template, its CI.md).
 # The Pages source of the repository is "GitHub Actions" (Settings > Pages).
-# The home page is README.md, which the Markdown API of GitHub makes into HTML. The site-pages action
-# adds the Releases page and the Status page.
+# The home page is the plan explorer of packages/site, a Vite build that runs the planner of the library in the browser.
+# The site-pages action adds the Releases page and the Status page.
+# A pull request builds and checks the site in a browser, with no deploy.
 name: Pages
 
 on:
@@ -12,17 +13,18 @@ on:
   schedule:
     - cron: "35 6 * * *"
   workflow_dispatch:
+  pull_request:
 
 permissions: {}
 
-# One deployment at a time. A newer push cancels a deployment that waits.
+# One deployment at a time. A newer push cancels a deployment that waits. Each pull request has its own group.
 concurrency:
-  group: pages
+  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
   cancel-in-progress: true
 
 jobs:
   pages:
-    uses: mark1russell7/template/.github/workflows/reusable-pages.yml@4df6a2d5a4de464ab3f8b50c20df52c234794af6 # main
+    uses: mark1russell7/template/.github/workflows/reusable-pages.yml@b0619385308bbeea892899ee265a1118d702984c # main
     # The build job of the shared workflow gets only the read permissions. Only its deploy job,
     # which runs no code of the repository, writes to Pages.
     permissions:
@@ -35,74 +37,29 @@ jobs:
       pages: write
       id-token: write
     with:
-      # gh sends README.md to the Markdown API with the token of the run (read permissions only).
-      github-token: true
-      build: |
-        set -euo pipefail
-        out=_site
-        repo="https://github.com/$GITHUB_REPOSITORY"
-        name="${GITHUB_REPOSITORY#*/}"
-        escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
-        about="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.description // ""' | escape)"
-        mkdir -p "$out"
-        # The relative links and images of the README go to the files on GitHub.
-        body="$(gh api markdown -f mode=gfm -f context="$GITHUB_REPOSITORY" -F text=@README.md \
-          | sed -E -e "s|href=\"([^\"#:/][^\":]*)\"|href=\"$repo/blob/HEAD/\1\"|g" \
-                   -e "s|src=\"([^\"#:/][^\":]*)\"|src=\"$repo/raw/HEAD/\1\"|g")"
-        cat > "$out/index.html" <<EOF
-        <!doctype html>
-        <html lang="en">
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta name="color-scheme" content="light dark">
-        <title>$name</title>
-        <meta name="description" content="$about">
-        <style>
-        :root{color-scheme:light dark;--bg:#f5f6f9;--surface:#fff;--sunken:#eef1f6;--fg:#151c2e;--muted:#5f6880;--rule:#d6dbe5;--accent:#2346c4;--accent-strong:#172f8f;
-        --font:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;--mono:ui-monospace,"Cascadia Mono","SFMono-Regular",Menlo,Consolas,monospace;--width:64rem}
-        @media (prefers-color-scheme:dark){:root{--bg:#0e1220;--surface:#151a2b;--sunken:#1c2236;--fg:#e6e9f3;--muted:#949cb3;--rule:#2b3350;--accent:#93abff;--accent-strong:#bccbff}}
-        *,*::before,*::after{box-sizing:border-box}
-        body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--font);line-height:1.55}
-        a{color:var(--accent);text-underline-offset:2px}
-        a:hover{color:var(--accent-strong)}
-        header{background:var(--surface);border-bottom:1px solid var(--rule)}
-        header nav{max-width:var(--width);margin:0 auto;padding:.6rem 16px;display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem 1.25rem}
-        header nav .home{margin-right:auto;font-weight:700;color:var(--fg);text-decoration:none}
-        main{max-width:var(--width);margin:0 auto;padding:16px;overflow-wrap:break-word}
-        footer{max-width:var(--width);margin:2rem auto 0;padding:16px;border-top:1px solid var(--rule);color:var(--muted);font-size:.875rem}
-        code{font-family:var(--mono);font-size:.9em;background:var(--sunken);border-radius:3px;padding:0 .25em}
-        pre{background:var(--sunken);border-radius:6px;padding:12px;overflow-x:auto}
-        pre code{padding:0;background:none}
-        table{border-collapse:collapse;display:block;overflow-x:auto;margin:0 0 1rem}
-        th,td{border:1px solid var(--rule);padding:.3rem .6rem;text-align:left;vertical-align:top}
-        th{background:var(--sunken)}
-        img{max-width:100%}
-        blockquote,.markdown-alert{margin:0 0 1rem;padding:.25rem 1rem;border-left:4px solid var(--rule);color:var(--muted)}
-        .markdown-alert svg{fill:currentColor;vertical-align:text-bottom;margin-right:.25rem}
-        h1,h2,h3{line-height:1.25}
-        </style>
-        </head>
-        <body>
-        <header><nav aria-label="Site"><a class="home" href="./">$name</a><a href="releases/">Releases</a><a href="status/">Status</a><a href="$repo">GitHub</a></nav></header>
-        <main>
-        $body
-        </main>
-        <footer>This page is the README of <a href="$repo">$GITHUB_REPOSITORY</a> at commit <code>${GITHUB_SHA:0:7}</code>.</footer>
-        </body>
-        </html>
-        EOF
-      out: _site
+      # The site bundles graph.ts and plan.ts of @release-train/release-train from the workspace,
+      # so the page plans with the same code as the CLI.
+      build: pnpm --filter @release-train/site run build
+      out: packages/site/dist
+      env: '{"SITE_BASE": "/${{ github.event.repository.name }}"}'
+      deploy: ${{ github.event_name != 'pull_request' }}
       # The site-pages action adds releases/, status/, data/releases.json and data/status.json to the built site.
       site-pages: true
       site-name: release-train
       # The Status page reads the items of this table.
       roadmap: docs/ROADMAP.md
+      # The check opens each page in a browser at 360, 400 and 1280 pixels, in light and dark.
+      # The probe drives the explorer: it bumps a package, then reads the waves, the new versions and the blocks.
+      # The build writes it from packages/site/src/check-probe.ts.
+      site-check: true
+      site-check-pages: /,/releases/,/status/
+      site-check-probe: packages/site/dist/check-probe.js
 
   # This job examines the deployed site: the home page and the pages of site-pages.
   # It starts no code of the repository and reads only the public site.
   served:
     needs: pages
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
