@@ -2,8 +2,8 @@
  * The probe of the plan explorer. The site check of the Pages workflow starts it in a browser at each width, before
  * the deploy. A failed check stops the deploy.
  *
- * The site check reads the probe as the body of an async function. The build of the site removes the types and the
- * `export` line, and it writes the result to `dist/check-probe.js` (`vite.config.ts`).
+ * The site check reads this TypeScript file directly. It removes the types and the `export` line, and it starts the
+ * result as the body of an async function.
  */
 
 // The site check gives these helpers to the probe.
