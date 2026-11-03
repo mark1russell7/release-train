@@ -241,44 +241,39 @@ main {
   display: grid;
   gap: 12px;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: "scen" "summary" "board" "detail" "pkgs" "plan";
+}
+
+.main-col {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  align-content: start;
 }
 
 @media (min-width: 1040px) {
   .explorer {
     grid-template-columns: minmax(0, 1fr) 330px;
     grid-template-areas:
-      "scen pkgs"
-      "summary pkgs"
-      "board pkgs"
-      "detail pkgs"
+      "main pkgs"
       "plan plan";
     align-items: start;
   }
-}
 
-.scen {
-  grid-area: scen;
-}
+  .main-col {
+    grid-area: main;
+  }
 
-.summary {
-  grid-area: summary;
-}
+  .packages {
+    grid-area: pkgs;
+    position: sticky;
+    top: 8px;
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
+  }
 
-.board {
-  grid-area: board;
-}
-
-.detail {
-  grid-area: detail;
-}
-
-.packages {
-  grid-area: pkgs;
-}
-
-.plan {
-  grid-area: plan;
+  .plan {
+    grid-area: plan;
+  }
 }
 
 .card {
@@ -546,19 +541,19 @@ main {
 }
 
 .box .box-title {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 650;
   fill: var(--fg);
 }
 
 .box .box-kind {
-  font-size: 11.5px;
+  font-size: 12.5px;
   font-weight: 600;
   fill: var(--c);
 }
 
 .box .box-line {
-  font-size: 11.5px;
+  font-size: 12px;
   fill: var(--muted);
   font-family: var(--mono);
 }

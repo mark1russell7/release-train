@@ -128,6 +128,8 @@ export function actionLine(a: Action): string {
     return first ? `${short(first.name)} ${first.to ?? "?"}${more}` : a.repo;
   }
   const n = a.items.length;
+  const one = a.items[0];
+  if (n === 1 && one) return `${short(one.dep)} ${one.newRange ?? one.to}`;
   return `${n} ${n === 1 ? "change" : "changes"}`;
 }
 

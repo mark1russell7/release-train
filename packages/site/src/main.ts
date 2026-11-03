@@ -92,7 +92,7 @@ function renderPackages(): void {
           "div",
           { class: "pkg-head" },
           el("button", { type: "button", class: "pkg-name", "data-select": node?.id ?? p.name, title: `Show ${p.name}` }, short(p.name)),
-          el("span", { class: `badge s-${status} status` }, `${STATUS_LABEL[status]}${status === "release" || status === "blocked" ? next : ""}`),
+          el("span", { class: `badge t-${status} status` }, `${STATUS_LABEL[status]}${status === "release" || status === "blocked" ? next : ""}`),
         ),
         el("div", { class: "pkg-meta" }, el("span", { class: "role" }, p.role), versions),
         p.app || !p.npm
@@ -218,7 +218,7 @@ function renderCanvas(): void {
       svg("rect", { width: BOX.w, height: BOX.h, rx: 9, class: "card-bg" }),
       svg("rect", { width: 5, height: BOX.h - 16, x: 7, y: 8, rx: 2.5, class: "stripe" }),
       svg("text", { x: 20, y: 21, class: "box-title" }, clip(info.title, 17)),
-      svg("text", { x: 20, y: 38, class: "box-kind" }, clip(info.kind, 20)),
+      svg("text", { x: 20, y: 38, class: "box-kind" }, clip(info.kind, 18)),
       svg("text", { x: 20, y: 55, class: "box-line" }, clip(info.line, 18)),
     );
     root.append(g);

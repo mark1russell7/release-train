@@ -98,7 +98,7 @@ export const SAMPLE: readonly SamplePackage[] = [
     path: "",
     npm: null,
     app: true,
-    role: "an app, not on npm",
+    role: "a web app",
     deps: [
       { name: "@acme/chart", type: "dependencies", spec: "^2.1.0", locked: "2.1.0" },
       { name: "@acme/grid", type: "dependencies", spec: "^0.6.0", locked: "0.6.1" },
