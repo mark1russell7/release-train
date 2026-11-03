@@ -280,8 +280,8 @@ export interface RepoResult {
   state: RepoState;
   items: number;
   pr: { number: number; url: string } | null;
-  /** `native`: GitHub merges on green. `train`: the train merges on green in a later run. */
-  autoMerge: "native" | "train" | null;
+  /** `train`: only the train merges, on green and on the current default branch. The native auto-merge of GitHub stays off. */
+  autoMerge: "train" | null;
   ci: CiState | null;
   detail: string;
   /** The problems that a person must correct, and the changes that wait. Only the template sync gives them. */
@@ -679,16 +679,25 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     }
   };
 
-  const enableAutoMerge = async (repo: string, pr: Pull, meta: RepoMeta): Promise<"native" | "train"> => {
-    if (pr.auto_merge) return "native";
-    const mutation = "mutation($id: ID!, $m: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $m }) { clientMutationId } }";
-    const vars = { id: pr.node_id, m: mergeMethod(meta).toUpperCase() };
-    let res = await gh.graphql(mutation, vars);
-    if (res.errors.length > 0 && !meta.allow_auto_merge && res.errors.some((e) => /auto.?merge is not allowed|not allowed for this repository/i.test(e))) {
-      const set = await gh.request("PATCH", `${base}/${repo}`, { allow_auto_merge: true });
-      if (set.ok) res = await gh.graphql(mutation, vars);
+  /**
+   * This function turns off the native auto-merge of GitHub on a pull request of the train. GitHub merges on green CI of the
+   * head, also when the default branch moved after the run. Two lockfile changes then merge with no conflict into a lockfile
+   * that does not agree with `package.json`. So only `settle` merges, after it compares the branch with the default branch.
+   */
+  const disableAutoMerge = async (pr: Pull): Promise<"train"> => {
+    if (pr.auto_merge) {
+      await gh.graphql("mutation($id: ID!) { disablePullRequestAutoMerge(input: { pullRequestId: $id }) { clientMutationId } }", { id: pr.node_id });
     }
-    return res.errors.length === 0 ? "native" : "train";
+    return "train";
+  };
+
+  /**
+   * This function gives the number of commits of the default branch that are not in `sha`, or null when GitHub does not
+   * answer. A branch that is behind has CI on an old base. A merge then can give a lockfile with no entry for a version.
+   */
+  const behindBy = async (repo: string, sha: string, defaultBranch: string): Promise<number | null> => {
+    const res = await gh.request<{ behind_by: number }>("GET", `${base}/${repo}/compare/${encodeURIComponent(defaultBranch)}...${sha}`);
+    return typeof res.data?.behind_by === "number" ? res.data.behind_by : null;
   };
 
   const ciOf = async (repo: string, sha: string): Promise<CiState> => {
@@ -717,18 +726,27 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
 
   const hasLabel = (pr: Pull, name: string): boolean => (pr.labels ?? []).some((l) => l.name === name);
 
-  /** This function merges a green pull request, or labels a red one. It gives the new state. */
-  const settle = async (repo: string, pr: Pull, autoMerge: "native" | "train", meta: RepoMeta | null, branch: string = TRAIN_BRANCH): Promise<{ state: RepoState; ci: CiState; detail: string }> => {
+  /**
+   * This function merges a green pull request, or labels a red one. It gives the new state. It merges only a branch that
+   * has each commit of the default branch, so CI ran on the current base. A branch that is behind waits for a new build.
+   */
+  const settle = async (repo: string, pr: Pull, meta: RepoMeta | null, branch: string = TRAIN_BRANCH): Promise<{ state: RepoState; ci: CiState; detail: string }> => {
     const ci = await ciOf(repo, pr.head.sha);
     if (ci === "failed") {
       if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
       return { state: "blocked", ci, detail: "CI failed. The pull request stays open with the blocked label." };
     }
-    if (ci === "green" && autoMerge === "train") {
+    if (ci === "green") {
       const ageHours = pr.created_at ? ((o.now ?? new Date()).getTime() - Date.parse(pr.created_at)) / 3_600_000 : 0;
       const others = ageHours < YIELD_MAX_HOURS ? await otherRuns(repo, branch, meta) : 0;
       if (others > 0) {
         return { state: "unchanged", ci, detail: `CI is green, but ${others} workflow run(s) of other branches are not done. The train merges in a later run, so their result stays valid.` };
+      }
+      const main = meta?.default_branch ?? "main";
+      const behind = await behindBy(repo, pr.head.sha, main);
+      if (behind === null) return { state: "unchanged", ci, detail: `CI is green, but GitHub did not compare the branch with ${main}. The train does not merge it now.` };
+      if (behind > 0) {
+        return { state: "unchanged", ci, detail: `CI is green, but the branch is ${behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.` };
       }
       const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
@@ -737,7 +755,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       }
       return { state: "unchanged", ci, detail: `CI is green, but the merge failed (HTTP ${m.status}${m.message ? `: ${m.message}` : ""}).` };
     }
-    const why = ci === "none" ? "No CI check started yet." : ci === "running" ? "CI runs." : "CI is green. GitHub merges it.";
+    const why = ci === "none" ? "No CI check started yet." : "CI runs.";
     return { state: "unchanged", ci, detail: why };
   };
 
@@ -754,18 +772,23 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     return (closed.data ?? []).find((p) => !p.merged_at && !(p.body ?? "").includes(CLOSED_MARK) && bodyFingerprint(p.body) === fp);
   };
 
-  /** This function tells if the branch of an open pull request must start again from the default branch: GitHub cannot merge it. */
-  const needsRebuild = async (repo: string, existing: Pull | null): Promise<boolean> => {
+  /**
+   * This function tells if the branch of an open pull request must start again from the default branch, with a new install.
+   * That is so when GitHub cannot merge it, or when it is behind the default branch. A merge of the default branch into the branch is not the fix:
+   * it makes the same merge of two lockfiles.
+   */
+  const needsRebuild = async (repo: string, existing: Pull | null, defaultBranch: string): Promise<boolean> => {
     if (!existing) return false;
     const full = await gh.request<Pull>("GET", `${base}/${repo}/pulls/${existing.number}`);
-    return full.data?.mergeable === false;
+    if (full.data?.mergeable === false) return true;
+    return ((await behindBy(repo, existing.head.sha, defaultBranch)) ?? 0) > 0;
   };
 
   const prRef = (p: Pull | null) => (p ? { number: p.number, url: p.html_url } : null);
 
   /**
    * This function opens or updates the pull request of a branch after the work in a clone. It adds the labels, turns on
-   * auto-merge, and merges or blocks the pull request from its CI state. The update pull requests and the template sync use it.
+   * the native auto-merge off, and merges or blocks the pull request from its CI state. The update pull requests and the template sync use it.
    */
   const publish = async (p: {
     common: Pick<RepoResult, "repo" | "private" | "actionId" | "kind" | "wave" | "items" | "needs">;
@@ -804,13 +827,13 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     }
     await ensureLabels(repo);
     if (!hasLabel(pr, TRAIN_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [TRAIN_LABEL] });
-    const autoMerge = await enableAutoMerge(repo, pr, p.meta);
-    const how = autoMerge === "native" ? "GitHub auto-merge is on." : "The train merges it on green in a later run.";
+    const autoMerge = await disableAutoMerge(pr);
+    const how = "The train merges it on green in a later run.";
     if (state === "opened" || state === "updated") {
       result({ ...p.common, state, pr: prRef(pr), autoMerge, ci: "none", detail: `${how}${p.note}` });
       return;
     }
-    const s = await settle(repo, pr, autoMerge, p.meta, p.branch);
+    const s = await settle(repo, pr, p.meta, p.branch);
     result({ ...p.common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: s.state === "merged" ? s.detail : `${s.detail} ${how}` });
   };
 
@@ -831,7 +854,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const base0 = { repo: w.repo, private: w.private, actionId: w.actionId, kind: null, wave: w.wave, items: 0, autoMerge: null };
     if (pr && !o.dryRun) {
       const meta = (await gh.request<RepoMeta>("GET", `${base}/${w.repo}`)).data;
-      const s = await settle(w.repo, pr, pr.auto_merge ? "native" : "train", meta);
+      await disableAutoMerge(pr);
+      const s = await settle(w.repo, pr, meta);
       result({ ...base0, state: s.state === "unchanged" ? "waiting" : s.state, pr: { number: pr.number, url: pr.html_url }, ci: s.ci, detail: `${s.detail} The rest of the update waits for ${w.dependsOn.join(", ") || "npm"}.` });
       continue;
     }
@@ -869,7 +893,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           continue;
         }
       }
-      const rebuild = await needsRebuild(u.repo, existing);
+      const rebuild = await needsRebuild(u.repo, existing, meta.default_branch);
       const r = await o.updater.update(u, { defaultBranch: meta.default_branch, rebuild });
       if (r.status === "failed") {
         result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: `The update failed: ${r.error ?? "unknown error"}` });
@@ -979,7 +1003,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
             continue;
           }
         }
-        const rebuild = await needsRebuild(repo, existing);
+        const rebuild = await needsRebuild(repo, existing, meta.default_branch);
         let r: SyncPush;
         if (existing && !rebuild && bodyFingerprint(existing.body) === planned.fingerprint) {
           // The branch has these changes already: no clone and no push.
@@ -1062,7 +1086,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           result({ ...base0, state: "planned", pr: { number: vpr.number, url: vpr.html_url }, ci: null, detail: "The run merges the version pull request when CI is green." });
           continue;
         }
-        const s = await settle(repo, vpr, "train", meta, VERSION_BRANCH);
+        const s = await settle(repo, vpr, meta, VERSION_BRANCH);
         result({ ...base0, state: s.state, pr: { number: vpr.number, url: vpr.html_url }, ci: s.ci, detail: `Version pull request: ${s.detail}` });
         continue;
       }

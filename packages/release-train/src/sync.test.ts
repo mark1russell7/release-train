@@ -393,6 +393,7 @@ describe("apply with the template sync", () => {
         [`GET ${base}/demo-repo/commits/s6/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }],
         [`GET ${base}/demo-repo/commits/s6/status`]: () => [200, { state: "pending", total_count: 0 }],
         [`POST /graphql`]: () => [200, { errors: [{ message: "Auto merge is not allowed for this repository" }] }],
+        [`GET ${base}/demo-repo/compare/main...s6`]: () => [200, { behind_by: 0 }],
         [`PATCH ${base}/demo-repo`]: () => [403, { message: "no" }],
         [`PUT ${base}/demo-repo/pulls/6/merge`]: () => [200, { merged: true }],
         [`DELETE ${base}/demo-repo/git/refs/heads/${SYNC_BRANCH}`]: () => [204, null],

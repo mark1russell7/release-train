@@ -112,6 +112,7 @@ const meta: Handler = () => [200, { default_branch: "main", allow_auto_merge: fa
 const green: Record<string, Handler> = {
   [`GET ${base}/secret-repo/commits/sha7/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }],
   [`GET ${base}/secret-repo/commits/sha7/status`]: () => [200, { state: "pending", total_count: 0 }],
+  [`GET ${base}/secret-repo/compare/main...sha7`]: () => [200, { behind_by: 0 }],
 };
 
 describe("selection", () => {
@@ -168,8 +169,8 @@ describe("apply", () => {
     const up = updater();
     const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: up, dryRun: false });
     const by = Object.fromEntries(r.results.map((x) => [x.repo, x]));
-    expect(by["lib-repo"]).toMatchObject({ state: "opened", autoMerge: "native", pr: { number: 9 } });
-    expect(by["secret-repo"]).toMatchObject({ state: "updated", autoMerge: "native", pr: { number: 7 } });
+    expect(by["lib-repo"]).toMatchObject({ state: "opened", autoMerge: "train", pr: { number: 9 } });
+    expect(by["secret-repo"]).toMatchObject({ state: "updated", autoMerge: "train", pr: { number: 7 } });
     expect(by["stale-repo"]?.state).toBe("closed");
 
     const opened = calls.filter((c) => c.method === "POST" && c.path.endsWith("/pulls"));
@@ -195,15 +196,18 @@ describe("apply", () => {
       [`GET ${base}/secret-repo/commits/sha7/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: "failure" }] }],
       [`GET ${base}/secret-repo/commits/sha7/status`]: () => [200, { state: "pending", total_count: 0 }],
       [`POST ${base}/secret-repo/issues/7/labels`]: () => [200, []],
+      [`POST /graphql`]: () => [200, { data: { disablePullRequestAutoMerge: { clientMutationId: null } } }],
     });
     const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"] });
     expect(r.results).toHaveLength(1);
-    expect(r.results[0]).toMatchObject({ state: "blocked", ci: "failed", autoMerge: "native" });
+    // The native auto-merge of GitHub goes off, so only the train merges.
+    expect(calls.some((c) => c.path === "/graphql" && String(c.body?.["query"]).includes("disablePullRequestAutoMerge"))).toBe(true);
+    expect(r.results[0]).toMatchObject({ state: "blocked", ci: "failed", autoMerge: "train" });
     const label = calls.find((c) => c.path === `${base}/secret-repo/issues/7/labels`);
     expect(label?.body).toEqual({ labels: [BLOCKED_LABEL] });
   });
 
-  it("merges a green pull request itself when GitHub auto-merge is not available", async () => {
+  it("merges a green pull request itself on the current default branch, and turns on no native auto-merge", async () => {
     const { gh, calls } = server({
       ...green,
       [`GET ${base}/secret-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo")] : []],
@@ -218,8 +222,64 @@ describe("apply", () => {
     });
     const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"] });
     expect(r.results[0]).toMatchObject({ state: "merged", ci: "green", autoMerge: "train" });
-    expect(calls.some((c) => c.method === "PATCH" && c.path === `${base}/secret-repo` && c.body?.["allow_auto_merge"] === true)).toBe(true);
+    expect(calls.some((c) => c.path === "/graphql" || (c.method === "PATCH" && c.path === `${base}/secret-repo`))).toBe(false);
+    expect(calls.some((c) => c.path === `${base}/secret-repo/compare/main...sha7`)).toBe(true);
     expect(calls.find((c) => c.method === "PUT")?.body).toEqual({ merge_method: "merge", sha: "sha7" });
+  });
+
+  it("builds a green branch again from main, with a new install, when its base is behind main, and does not merge it", async () => {
+    const routes = (behind: number) => ({
+      ...green,
+      [`GET ${base}/secret-repo/compare/main...sha7`]: () => [200, { behind_by: behind }],
+      [`GET ${base}/secret-repo/pulls`]: (_b: unknown, u: URL) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo")] : []],
+      [`GET ${base}/secret-repo/pulls/7`]: () => [200, { ...pull(7, "secret-repo"), mergeable: true }],
+      [`PATCH ${base}/secret-repo/pulls/7`]: (b: Record<string, unknown> | undefined) => [200, { ...pull(7, "secret-repo"), ...b }],
+      [`GET ${base}/secret-repo`]: meta,
+      [`POST ${base}/secret-repo/labels`]: () => [201, {}],
+      [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
+      [`DELETE ${base}/secret-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+    }) as Record<string, Handler>;
+    // Behind: the updater gets rebuild, the branch gets a new head, and CI runs again before a merge.
+    const behind = server(routes(2));
+    const seen: boolean[] = [];
+    const up: Updater = { async update(_u, ctx) { seen.push(ctx.rebuild); return { status: "pushed", sha: "newsha", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: behind.gh, updater: up, dryRun: false, only: ["secret-repo"] });
+    expect(seen).toEqual([true]);
+    expect(r.results[0]).toMatchObject({ state: "updated", ci: "none", autoMerge: "train" });
+    expect(behind.calls.some((c) => c.method === "PUT")).toBe(false);
+    // Up to date: no rebuild, and the green pull request merges.
+    const current = server(routes(0));
+    const seen2: boolean[] = [];
+    const same: Updater = { async update(_u, ctx) { seen2.push(ctx.rebuild); return { status: "same", sha: "sha7", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
+    const r2 = await apply({ owner: OWNER, plan: fixture(), gh: current.gh, updater: same, dryRun: false, only: ["secret-repo"] });
+    expect(seen2).toEqual([false]);
+    expect(r2.results[0]).toMatchObject({ state: "merged", ci: "green" });
+  });
+
+  it("does not merge a green branch that fell behind main during the run, and does not merge when GitHub does not compare", async () => {
+    const run = async (compare: Handler) => {
+      const s = server({
+        ...green,
+        [`GET ${base}/secret-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo")] : []],
+        [`GET ${base}/secret-repo/pulls/7`]: () => [200, { ...pull(7, "secret-repo"), mergeable: true }],
+        [`PATCH ${base}/secret-repo/pulls/7`]: (b) => [200, { ...pull(7, "secret-repo"), ...b }],
+        [`GET ${base}/secret-repo`]: meta,
+        [`POST ${base}/secret-repo/labels`]: () => [201, {}],
+        [`GET ${base}/secret-repo/compare/main...sha7`]: compare,
+        [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
+      });
+      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"] });
+      return { r, calls: s.calls };
+    };
+    // The first compare (before the update) gives 0, the second (before the merge) gives 1: main moved in between.
+    let n = 0;
+    const moved = await run(() => [200, { behind_by: n++ === 0 ? 0 : 1 }]);
+    expect(moved.r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+    expect(moved.r.results[0]?.detail).toContain("1 commit(s) behind main");
+    expect(moved.calls.some((c) => c.method === "PUT")).toBe(false);
+    const unknown = await run(() => [404, { message: "Not Found" }]);
+    expect(unknown.r.results[0]?.detail).toMatch(/did not compare the branch with main/);
+    expect(unknown.calls.some((c) => c.method === "PUT")).toBe(false);
   });
 
   it("waits with a green merge while a workflow run of another branch is not done, but not longer than YIELD_MAX_HOURS", async () => {

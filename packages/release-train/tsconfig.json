@@ -5,6 +5,7 @@
     "noEmit": false,
     "emitDeclarationOnly": true,
     "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
     "composite": false,
     "incremental": false
   }
