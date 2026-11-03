@@ -1,4 +1,5 @@
-import { backoffDelay, type Backoff } from "@mark1russell7/service/backoff";
+import { retry, retryAfterDelay, type Clock } from "@mark1russell7/service";
+import type { Backoff } from "@mark1russell7/service/backoff";
 import { DEP_TYPES } from "./types.ts";
 import type { LockKind, Manifest, ManifestFile, NpmInfo, Provenance, RepoSnapshot } from "./types.ts";
 import { manifestWorkspaces, matchWorkspaces, parseNpmLock, parsePnpmLock, parsePnpmWorkspace } from "./parse.ts";
@@ -34,8 +35,8 @@ export interface RetryOptions {
   backoff?: Backoff;
   /** This time is the most wait that a `Retry-After` header can ask for. The default is 60 s. */
   maxRetryAfter?: number;
-  /** This function waits. Tests give a function that does not wait. */
-  sleep?: (ms: number) => Promise<void>;
+  /** This clock waits between the tries. Tests give a clock that does not wait. */
+  clock?: Clock;
   /** This function gives the random numbers of the jitter, from 0 up to 1. */
   random?: () => number;
 }
@@ -46,46 +47,11 @@ export const DEFAULT_BACKOFF: Backoff = { base: 1000, factor: 2, cap: 15000, jit
 /** This function tells if a status can pass with time: 429 (too many requests) and each 5xx status. */
 export const retryableStatus = (status: number): boolean => status === 429 || status >= 500;
 
-/** This function gives the wait of a `Retry-After` header in milliseconds, or null when the header has no valid value. */
-export function retryAfterMs(header: string | null, now: number): number | null {
-  if (header === null || header.trim() === "") return null;
-  const seconds = Number(header);
-  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : null;
-  const at = Date.parse(header);
-  return Number.isNaN(at) ? null : Math.max(0, at - now);
-}
-
-/**
- * This function gives a fetch that tries a read again after a 429, a 5xx or a network error.
- * The delays come from the backoff policy, and a 429 waits for its `Retry-After`. After the last try,
- * the fetch gives the last response, or it throws the last network error.
- */
-export function withRetry(f: FetchFn, opts: RetryOptions = {}, log: (line: string) => void = () => {}): FetchFn {
-  const attempts = Math.max(1, Math.floor(opts.attempts ?? 4));
-  const policy = opts.backoff ?? DEFAULT_BACKOFF;
-  const maxAfter = opts.maxRetryAfter ?? 60_000;
-  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
-  const random = opts.random ?? Math.random;
-  return async (url, init) => {
-    for (let attempt = 1; ; attempt++) {
-      let res: Response;
-      try {
-        res = await f(url, init);
-      } catch (err) {
-        if (attempt >= attempts) throw err;
-        const delay = backoffDelay(policy, attempt, random);
-        log(`retry ${attempt} of ${attempts - 1} in ${Math.round(delay)} ms: ${err instanceof Error ? err.message : String(err)} for ${url}`);
-        await sleep(delay);
-        continue;
-      }
-      if (!retryableStatus(res.status) || attempt >= attempts) return res;
-      const after = res.status === 429 ? retryAfterMs(res.headers.get("retry-after"), Date.now()) : null;
-      const delay = after === null ? backoffDelay(policy, attempt, random) : Math.min(after, maxAfter);
-      log(`retry ${attempt} of ${attempts - 1} in ${Math.round(delay)} ms: HTTP ${res.status} for ${url}`);
-      await res.body?.cancel();
-      await sleep(delay);
-    }
-  };
+/** A GitHub answer with a status that can pass with time. The retries of `retry` catch it. */
+class BusyAnswer extends Error {
+  constructor(readonly response: Response, url: string) {
+    super(`HTTP ${response.status} for ${url}`);
+  }
 }
 
 /** The data that `collect` gives to the graph builder. */
@@ -150,8 +116,37 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   const log = opts.log ?? (() => {});
   const warnings: string[] = [];
   // Only the GitHub reads get the retries. A failed npm read is a warning already.
-  const gh = withRetry(f, opts.retry, log);
-  const tries = (status: number): number => (retryableStatus(status) ? Math.max(1, Math.floor(opts.retry?.attempts ?? 4)) : 1);
+  const attempts = Math.max(1, Math.floor(opts.retry?.attempts ?? 4));
+  const maxAfter = opts.retry?.maxRetryAfter ?? 60_000;
+  // retry of @mark1russell7/service makes the tries. A 429 or a 5xx throws BusyAnswer, so that it gets a new try.
+  // After the last try, the read gives the last answer, and the caller throws HttpError with the count of tries.
+  const gh: FetchFn = (url, init) =>
+    retry(
+      async () => {
+        const res = await f(url, init);
+        if (retryableStatus(res.status)) throw new BusyAnswer(res, url);
+        return res;
+      },
+      {
+        ...(opts.retry?.backoff ?? DEFAULT_BACKOFF),
+        tries: attempts,
+        ...(opts.retry?.clock ? { clock: opts.retry.clock } : {}),
+        ...(opts.retry?.random ? { random: opts.retry.random } : {}),
+        delayOf: (error, attempt) => {
+          log(`retry ${attempt} of ${attempts - 1}: ${error instanceof Error ? error.message : String(error)}${error instanceof BusyAnswer ? "" : ` for ${url}`}`);
+          if (!(error instanceof BusyAnswer) || error.response.status !== 429) return null;
+          const after = retryAfterDelay(error.response.headers.get("retry-after"), Date.now());
+          return after === null ? null : Math.min(after, maxAfter);
+        },
+      },
+    ).then(
+      (res) => res,
+      async (error: unknown) => {
+        if (!(error instanceof BusyAnswer)) throw error;
+        return error.response;
+      },
+    );
+  const tries = (status: number): number => (retryableStatus(status) ? attempts : 1);
 
   const ghHeaders = (accept: string): Record<string, string> => {
     const h: Record<string, string> = { accept, "x-github-api-version": "2022-11-28", "user-agent": "release-train" };

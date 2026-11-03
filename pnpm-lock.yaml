@@ -194,8 +194,8 @@ importers:
   packages/release-train:
     dependencies:
       '@mark1russell7/service':
-        specifier: ^0.6.4
-        version: 0.6.4
+        specifier: ^0.6.5
+        version: 0.6.5
       semver:
         specifier: ^7.8.5
         version: 7.8.5
@@ -459,8 +459,8 @@ packages:
     resolution: {integrity: sha512-N5o3II0AClHgsWCWtzuBzckQdReydJnLUS8Kdt9hWXVpTzb0dxucrN1bWdDN+75YompOR1rAmsIX8zuHqoQdqA==}
     engines: {node: '>=22'}
 
-  '@mark1russell7/service@0.6.4':
-    resolution: {integrity: sha512-bw0FV7rlAgx5RzKxKZK6X3GYITp1WxE7tBCcxwMLONeutcmetB5ALVn+tZnCjYGizYX1A0LcLjmmwSyPVuiylQ==}
+  '@mark1russell7/service@0.6.5':
+    resolution: {integrity: sha512-USBAaZX8lQ3nmBzaTycF+6xQJyIQ51ZTWIxw9rZnZ5bhaqZe5FydTgVPYr92/gb8VWcOG4jxWsPnLPBBEaxzSA==}
     engines: {node: '>=22.19'}
     peerDependencies:
       '@grpc/grpc-js': ^1.14.6
@@ -1178,7 +1178,7 @@ snapshots:
 
   '@mark1russell7/rigor-generators@0.1.1': {}
 
-  '@mark1russell7/service@0.6.4':
+  '@mark1russell7/service@0.6.5':
     dependencies:
       '@mark1russell7/algebra': 0.8.1
       '@mark1russell7/quantity': 0.3.0
