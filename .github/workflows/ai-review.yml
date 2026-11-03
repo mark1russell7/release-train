@@ -13,6 +13,6 @@ permissions:
 
 jobs:
   review:
-    uses: mark1russell7/template/.github/workflows/reusable-ai-review.yml@20dea158bc3a00838428ea75cbe6ff88b25606bb # main
+    uses: mark1russell7/template/.github/workflows/reusable-ai-review.yml@4df6a2d5a4de464ab3f8b50c20df52c234794af6 # main
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
