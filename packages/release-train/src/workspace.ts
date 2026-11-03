@@ -573,6 +573,9 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
         ].join("\n");
         await sh("git", ["add", "-u"], "git add");
         if (added.length > 0) await sh("git", ["add", "--", ...added], "git add");
+        // A fix can write a new file (license-file writes LICENSE). `git add -u` does not see a new file, so the train
+        // stages each file of the fix by name. With -A, a file that the fix removed is staged as removed (packing #232, 11-03).
+        if (fixed.length > 0) await sh("git", ["add", "-A", "--", ...fixed], "git add");
         await sh("git", ["-c", `user.name=${o.author.name}`, "-c", `user.email=${o.author.email}`, "commit", "--quiet", "--no-verify", "-m", msg], "git commit");
 
         // 7. No push when the branch already has the same content in the files of the train.
