@@ -49,8 +49,10 @@ export const retryableStatus = (status: number): boolean => status === 429 || st
 
 /** A GitHub answer with a status that can pass with time. The retries of `retry` catch it. */
 class BusyAnswer extends Error {
-  constructor(readonly response: Response, url: string) {
+  readonly response: Response;
+  constructor(response: Response, url: string) {
     super(`HTTP ${response.status} for ${url}`);
+    this.response = response;
   }
 }
 
