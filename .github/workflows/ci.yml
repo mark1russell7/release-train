@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: mark1russell7/template/.github/workflows/reusable-ci.yml@20dea158bc3a00838428ea75cbe6ff88b25606bb # main
+    uses: mark1russell7/template/.github/workflows/reusable-ci.yml@4df6a2d5a4de464ab3f8b50c20df52c234794af6 # main
 
   # Each preset of `pnpm package add` makes a package, and that package passes its typecheck and its tests.
   # The tests of the preset service hold its entry to describe() and lint() of @mark1russell7/service (OTH-5).
