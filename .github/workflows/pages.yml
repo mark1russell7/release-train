@@ -17,10 +17,11 @@ on:
 
 permissions: {}
 
-# One deployment at a time. A newer push cancels a deployment that waits. Each pull request has its own group.
+# One deployment at a time. A deployment in progress ends, and GitHub keeps only the newest deployment that waits.
+# Each pull request has its own group, and a newer push cancels its run.
 concurrency:
   group: pages-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pages:
