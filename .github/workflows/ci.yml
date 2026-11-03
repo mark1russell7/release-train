@@ -53,3 +53,34 @@ jobs:
       - run: pnpm install --no-frozen-lockfile
       - run: pnpm --filter "@template/$PACKAGE" typecheck
       - run: pnpm --filter "@template/$PACKAGE" test
+
+  # The one check of the ruleset of main (CI.md of mark1russell7/template, "The check of the ruleset").
+  # It passes only when each job of needs passed, or was skipped by its own if and ALLOW_SKIP names it.
+  # A new job of this file goes in needs, so the ruleset never has to change, and gh pr merge --auto
+  # waits for the whole gate.
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [ci, presets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Each job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          # The jobs that their own if may skip, separated by spaces. Each other job must pass.
+          ALLOW_SKIP: "presets"
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key) \(.value.result)"' > results
+          cat results
+          if [ ! -s results ]; then echo "::error::no job in needs"; exit 1; fi
+          bad=0
+          while read -r job result; do
+            case "$result" in
+              success) ;;
+              skipped) case " $ALLOW_SKIP " in *" $job "*) ;; *) echo "::error::$job was skipped, and ALLOW_SKIP does not name it"; bad=1 ;; esac ;;
+              *) echo "::error::$job: $result"; bad=1 ;;
+            esac
+          done < results
+          exit $bad
