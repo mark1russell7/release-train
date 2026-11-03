@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   pages:
-    uses: mark1russell7/template/.github/workflows/reusable-pages.yml@4df6a2d5a4de464ab3f8b50c20df52c234794af6 # main
+    uses: mark1russell7/template/.github/workflows/reusable-pages.yml@21c4cb628bc2e0e1be5b21fa92fd3c688400ecab # main
     # The build job of the shared workflow gets only the read permissions. Only its deploy job,
     # which runs no code of the repository, writes to Pages.
     permissions:
@@ -50,10 +50,10 @@ jobs:
       roadmap: docs/ROADMAP.md
       # The check opens each page in a browser at 360, 400 and 1280 pixels, in light and dark.
       # The probe drives the explorer: it bumps a package, then reads the waves, the new versions and the blocks.
-      # The build writes it from packages/site/src/check-probe.ts.
+      # The check reads the TypeScript source and removes its types.
       site-check: true
       site-check-pages: /,/releases/,/status/
-      site-check-probe: packages/site/dist/check-probe.js
+      site-check-probe: packages/site/src/check-probe.ts
 
   # This job examines the deployed site: the home page and the pages of site-pages.
   # It starts no code of the repository and reads only the public site.
