@@ -32,7 +32,7 @@ export interface Drawing {
 }
 
 /** The size of a box and of the gaps between the boxes, in SVG units. */
-export const BOX = { w: 168, h: 58, gapX: 44, gapY: 14, top: 30, pad: 8 } as const;
+export const BOX = { w: 156, h: 66, gapX: 32, gapY: 14, top: 30, pad: 8 } as const;
 
 function place<T extends { id: string }>(groups: T[][]): Map<string, Box> {
   const out = new Map<string, Box>();

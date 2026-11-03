@@ -246,7 +246,7 @@ main {
 
 @media (min-width: 1040px) {
   .explorer {
-    grid-template-columns: minmax(0, 1fr) 360px;
+    grid-template-columns: minmax(0, 1fr) 330px;
     grid-template-areas:
       "scen pkgs"
       "summary pkgs"
@@ -551,8 +551,14 @@ main {
   fill: var(--fg);
 }
 
+.box .box-kind {
+  font-size: 11.5px;
+  font-weight: 600;
+  fill: var(--c);
+}
+
 .box .box-line {
-  font-size: 12px;
+  font-size: 11.5px;
   fill: var(--muted);
   font-family: var(--mono);
 }

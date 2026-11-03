@@ -165,15 +165,16 @@ function renderSummary(): void {
 
 // The drawings.
 
-function boxLabel(id: string): { title: string; line: string; tone: string; aria: string } {
+function boxLabel(id: string): { title: string; kind: string; line: string; tone: string; aria: string } {
   if (state.view === "train") {
     const a = state.plan.actions.find((x) => x.id === id) as Action;
     const tone = a.blocked ? "blocked" : a.kind;
-    return { title: `${KIND_LABEL[a.kind]}: ${a.repo}`, line: a.blocked ? `Blocked · ${actionLine(a)}` : actionLine(a), tone, aria: `${wave(a.wave)}, ${KIND_LABEL[a.kind]} of ${a.repo}` };
+    const kind = a.blocked ? `Blocked ${KIND_LABEL[a.kind].toLowerCase()}` : KIND_LABEL[a.kind];
+    return { title: a.repo, kind, line: actionLine(a), tone, aria: `${wave(a.wave)}, ${kind} of ${a.repo}` };
   }
   const n = state.plan.nodes.find((x) => x.id === id) as NodeState;
   const version = n.kind === "app" ? "app" : n.next ? `${n.npmLatest ?? "new"} → ${n.next}` : (n.npmLatest ?? n.version ?? "");
-  return { title: short(n.name), line: `${STATUS_LABEL[n.status]} · ${version}`, tone: n.status, aria: `${n.name}: ${STATUS_LABEL[n.status]}` };
+  return { title: short(n.name), kind: STATUS_LABEL[n.status], line: version, tone: n.status, aria: `${n.name}: ${STATUS_LABEL[n.status]}` };
 }
 
 function renderCanvas(): void {
@@ -216,8 +217,9 @@ function renderCanvas(): void {
     g.append(
       svg("rect", { width: BOX.w, height: BOX.h, rx: 9, class: "card-bg" }),
       svg("rect", { width: 5, height: BOX.h - 16, x: 7, y: 8, rx: 2.5, class: "stripe" }),
-      svg("text", { x: 20, y: 24, class: "box-title" }, clip(info.title, 19)),
-      svg("text", { x: 20, y: 43, class: "box-line" }, clip(info.line, 24)),
+      svg("text", { x: 20, y: 21, class: "box-title" }, clip(info.title, 17)),
+      svg("text", { x: 20, y: 38, class: "box-kind" }, clip(info.kind, 20)),
+      svg("text", { x: 20, y: 55, class: "box-line" }, clip(info.line, 18)),
     );
     root.append(g);
   }
