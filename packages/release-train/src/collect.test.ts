@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { summary } from "./cli.ts";
-import { collect } from "./collect.ts";
+import { retryAfterDelay, type Clock } from "@mark1russell7/service";
+import { collect, HttpError } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { docId, writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
@@ -245,5 +246,92 @@ describe("writeDb", () => {
       expect(docId(id)).toMatch(/^[A-Za-z0-9_\-.~@+]+$/);
       expect(docId(id).endsWith(".")).toBe(false);
     }
+  });
+});
+
+describe("the retries of the GitHub reads", () => {
+  // This clock does not wait: it records each delay and starts the next try at once.
+  const instant = (waits: number[] = []): Clock => ({
+    now: () => 0,
+    after: (ms, run) => {
+      waits.push(ms);
+      queueMicrotask(run);
+      return Object.assign(() => {}, { unref: () => {} }) as ReturnType<Clock["after"]>;
+    },
+  });
+  const noWait = () => ({ clock: instant(), random: () => 0.5 });
+
+  it("reads the data when the first try of a read gives HTTP 500", async () => {
+    const calls: string[] = [];
+    const inner = fakeFetch(REPOS, { "@ex/core": "1.4.0" }, calls);
+    let failed = "";
+    const f: FetchFn = async (url, init) => {
+      if (failed === "" && url.includes("/contents/")) {
+        failed = url;
+        return new Response("server error", { status: 500 });
+      }
+      return inner(url, init);
+    };
+    const lines: string[] = [];
+    const data = await collect({ owner: "example-owner", token: null, fetch: f, retry: noWait(), log: (line) => lines.push(line) });
+    const clean = await collect({ owner: "example-owner", token: null, fetch: fakeFetch(REPOS, { "@ex/core": "1.4.0" }) });
+    expect(failed).not.toBe("");
+    expect(data.repos).toEqual(clean.repos);
+    expect(lines.some((line) => line.startsWith("retry 1 of 3") && line.includes("HTTP 500"))).toBe(true);
+  });
+
+  it("stops after the cap of tries, with a clear message", async () => {
+    let n = 0;
+    const f: FetchFn = async () => {
+      n++;
+      return new Response("down", { status: 503 });
+    };
+    const error = await collect({ owner: "example-owner", token: null, fetch: f, retry: { ...noWait(), attempts: 3 } }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(HttpError);
+    expect((error as HttpError).message).toMatch(/^HTTP 503 for .* after 3 tries$/);
+    expect(n).toBe(3);
+  });
+
+  it("does not try again after a status that does not pass with time", async () => {
+    let n = 0;
+    const f: FetchFn = async () => {
+      n++;
+      return new Response("no", { status: 403 });
+    };
+    const error = await collect({ owner: "example-owner", token: null, fetch: f, retry: noWait() }).catch((e: unknown) => e);
+    expect((error as HttpError).status).toBe(403);
+    expect((error as HttpError).message).not.toContain("tries");
+    expect(n).toBe(1);
+  });
+
+  it("waits for the Retry-After of a 429, up to its cap", async () => {
+    const waits: number[] = [];
+    const inner = fakeFetch(REPOS, { "@ex/core": "1.4.0" });
+    const answers = [
+      new Response("", { status: 429, headers: { "retry-after": "2" } }),
+      new Response("", { status: 429, headers: { "retry-after": "600" } }),
+    ];
+    const f: FetchFn = async (url, init) => (url.includes("/repos?") && answers.length > 0 ? (answers.shift() as Response) : inner(url, init));
+    const data = await collect({ owner: "example-owner", token: null, fetch: f, retry: { clock: instant(waits), maxRetryAfter: 30_000 } });
+    expect(data.repos.length).toBeGreaterThan(0);
+    expect(waits).toEqual([2000, 30_000]);
+  });
+
+  it("tries again after a network error, and throws the last error after the cap", async () => {
+    let n = 0;
+    const f: FetchFn = async () => {
+      n++;
+      throw new TypeError("fetch failed");
+    };
+    await expect(collect({ owner: "example-owner", token: null, fetch: f, retry: { ...noWait(), attempts: 2 } })).rejects.toThrow("fetch failed");
+    expect(n).toBe(2);
+  });
+
+  it("reads the seconds and the date forms of Retry-After with retryAfterDelay of the service", () => {
+    const now = Date.parse("2026-01-01T00:00:00Z");
+    expect(retryAfterDelay("5", now)).toBe(5000);
+    expect(retryAfterDelay("Thu, 01 Jan 2026 00:00:10 GMT", now)).toBe(10_000);
+    expect(retryAfterDelay("soon", now)).toBeNull();
+    expect(retryAfterDelay(null, now)).toBeNull();
   });
 });

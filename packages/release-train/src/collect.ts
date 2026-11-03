@@ -1,3 +1,5 @@
+import { retry, retryAfterDelay, type Clock } from "@mark1russell7/service";
+import type { Backoff } from "@mark1russell7/service/backoff";
 import { DEP_TYPES } from "./types.ts";
 import type { LockKind, Manifest, ManifestFile, NpmInfo, Provenance, RepoSnapshot } from "./types.ts";
 import { manifestWorkspaces, matchWorkspaces, parseNpmLock, parsePnpmLock, parsePnpmWorkspace } from "./parse.ts";
@@ -21,6 +23,35 @@ export interface CollectOptions {
   log?: (line: string) => void;
   /** The collector gives the list of repositories to this function before it reads them, for example to hide private names. */
   onRepos?: (repos: readonly { name: string; private: boolean }[]) => void;
+  /** These options control the retries of the GitHub reads. */
+  retry?: RetryOptions;
+}
+
+/** The options of the retries of a GitHub read. Each time is in milliseconds. */
+export interface RetryOptions {
+  /** This number is the most tries of one read, the first try included. The default is 4. */
+  attempts?: number;
+  /** This policy gives the delay before each new try. The default starts at 1 s, doubles, and stops at 15 s, with the full jitter. */
+  backoff?: Backoff;
+  /** This time is the most wait that a `Retry-After` header can ask for. The default is 60 s. */
+  maxRetryAfter?: number;
+  /** This clock waits between the tries. Tests give a clock that does not wait. */
+  clock?: Clock;
+  /** This function gives the random numbers of the jitter, from 0 up to 1. */
+  random?: () => number;
+}
+
+/** The default backoff of the GitHub reads: 1 s, 2 s, 4 s and more, up to 15 s, with the full jitter. */
+export const DEFAULT_BACKOFF: Backoff = { base: 1000, factor: 2, cap: 15000, jitter: { kind: "subtract", fraction: 1 } };
+
+/** This function tells if a status can pass with time: 429 (too many requests) and each 5xx status. */
+export const retryableStatus = (status: number): boolean => status === 429 || status >= 500;
+
+/** A GitHub answer with a status that can pass with time. The retries of `retry` catch it. */
+class BusyAnswer extends Error {
+  constructor(readonly response: Response, url: string) {
+    super(`HTTP ${response.status} for ${url}`);
+  }
 }
 
 /** The data that `collect` gives to the graph builder. */
@@ -47,8 +78,8 @@ interface TreeEntry {
 /** This error holds the HTTP status of a failed request. */
 export class HttpError extends Error {
   readonly status: number;
-  constructor(status: number, url: string) {
-    super(`HTTP ${status} for ${url}`);
+  constructor(status: number, url: string, tries = 1) {
+    super(`HTTP ${status} for ${url}${tries > 1 ? ` after ${tries} tries` : ""}`);
     this.status = status;
   }
 }
@@ -84,6 +115,38 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   const limit = opts.concurrency ?? 6;
   const log = opts.log ?? (() => {});
   const warnings: string[] = [];
+  // Only the GitHub reads get the retries. A failed npm read is a warning already.
+  const attempts = Math.max(1, Math.floor(opts.retry?.attempts ?? 4));
+  const maxAfter = opts.retry?.maxRetryAfter ?? 60_000;
+  // retry of @mark1russell7/service makes the tries. A 429 or a 5xx throws BusyAnswer, so that it gets a new try.
+  // After the last try, the read gives the last answer, and the caller throws HttpError with the count of tries.
+  const gh: FetchFn = (url, init) =>
+    retry(
+      async () => {
+        const res = await f(url, init);
+        if (retryableStatus(res.status)) throw new BusyAnswer(res, url);
+        return res;
+      },
+      {
+        ...(opts.retry?.backoff ?? DEFAULT_BACKOFF),
+        tries: attempts,
+        ...(opts.retry?.clock ? { clock: opts.retry.clock } : {}),
+        ...(opts.retry?.random ? { random: opts.retry.random } : {}),
+        delayOf: (error, attempt) => {
+          log(`retry ${attempt} of ${attempts - 1}: ${error instanceof Error ? error.message : String(error)}${error instanceof BusyAnswer ? "" : ` for ${url}`}`);
+          if (!(error instanceof BusyAnswer) || error.response.status !== 429) return null;
+          const after = retryAfterDelay(error.response.headers.get("retry-after"), Date.now());
+          return after === null ? null : Math.min(after, maxAfter);
+        },
+      },
+    ).then(
+      (res) => res,
+      async (error: unknown) => {
+        if (!(error instanceof BusyAnswer)) throw error;
+        return error.response;
+      },
+    );
+  const tries = (status: number): number => (retryableStatus(status) ? attempts : 1);
 
   const ghHeaders = (accept: string): Record<string, string> => {
     const h: Record<string, string> = { accept, "x-github-api-version": "2022-11-28", "user-agent": "release-train" };
@@ -92,16 +155,16 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   };
 
   const ghJson = async <T>(url: string): Promise<{ data: T; next: string | null }> => {
-    const res = await f(url.startsWith("http") ? url : `${api}${url}`, { headers: ghHeaders("application/vnd.github+json") });
-    if (!res.ok) throw new HttpError(res.status, url);
+    const res = await gh(url.startsWith("http") ? url : `${api}${url}`, { headers: ghHeaders("application/vnd.github+json") });
+    if (!res.ok) throw new HttpError(res.status, url, tries(res.status));
     return { data: (await res.json()) as T, next: nextLink(res.headers.get("link")) };
   };
 
   const ghRaw = async (repo: string, path: string, ref: string): Promise<string | null> => {
     const url = `${api}/repos/${opts.owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`;
-    const res = await f(url, { headers: ghHeaders("application/vnd.github.raw") });
+    const res = await gh(url, { headers: ghHeaders("application/vnd.github.raw") });
     if (res.status === 404) return null;
-    if (!res.ok) throw new HttpError(res.status, url);
+    if (!res.ok) throw new HttpError(res.status, url, tries(res.status));
     return res.text();
   };
 
