@@ -1,3 +1,4 @@
+import { backoffDelay, type Backoff } from "@mark1russell7/service/backoff";
 import { DEP_TYPES } from "./types.ts";
 import type { LockKind, Manifest, ManifestFile, NpmInfo, Provenance, RepoSnapshot } from "./types.ts";
 import { manifestWorkspaces, matchWorkspaces, parseNpmLock, parsePnpmLock, parsePnpmWorkspace } from "./parse.ts";
@@ -21,6 +22,70 @@ export interface CollectOptions {
   log?: (line: string) => void;
   /** The collector gives the list of repositories to this function before it reads them, for example to hide private names. */
   onRepos?: (repos: readonly { name: string; private: boolean }[]) => void;
+  /** These options control the retries of the GitHub reads. */
+  retry?: RetryOptions;
+}
+
+/** The options of the retries of a GitHub read. Each time is in milliseconds. */
+export interface RetryOptions {
+  /** This number is the most tries of one read, the first try included. The default is 4. */
+  attempts?: number;
+  /** This policy gives the delay before each new try. The default starts at 1 s, doubles, and stops at 15 s, with the full jitter. */
+  backoff?: Backoff;
+  /** This time is the most wait that a `Retry-After` header can ask for. The default is 60 s. */
+  maxRetryAfter?: number;
+  /** This function waits. Tests give a function that does not wait. */
+  sleep?: (ms: number) => Promise<void>;
+  /** This function gives the random numbers of the jitter, from 0 up to 1. */
+  random?: () => number;
+}
+
+/** The default backoff of the GitHub reads: 1 s, 2 s, 4 s and more, up to 15 s, with the full jitter. */
+export const DEFAULT_BACKOFF: Backoff = { base: 1000, factor: 2, cap: 15000, jitter: { kind: "subtract", fraction: 1 } };
+
+/** This function tells if a status can pass with time: 429 (too many requests) and each 5xx status. */
+export const retryableStatus = (status: number): boolean => status === 429 || status >= 500;
+
+/** This function gives the wait of a `Retry-After` header in milliseconds, or null when the header has no valid value. */
+export function retryAfterMs(header: string | null, now: number): number | null {
+  if (header === null || header.trim() === "") return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : null;
+  const at = Date.parse(header);
+  return Number.isNaN(at) ? null : Math.max(0, at - now);
+}
+
+/**
+ * This function gives a fetch that tries a read again after a 429, a 5xx or a network error.
+ * The delays come from the backoff policy, and a 429 waits for its `Retry-After`. After the last try,
+ * the fetch gives the last response, or it throws the last network error.
+ */
+export function withRetry(f: FetchFn, opts: RetryOptions = {}, log: (line: string) => void = () => {}): FetchFn {
+  const attempts = Math.max(1, Math.floor(opts.attempts ?? 4));
+  const policy = opts.backoff ?? DEFAULT_BACKOFF;
+  const maxAfter = opts.maxRetryAfter ?? 60_000;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  const random = opts.random ?? Math.random;
+  return async (url, init) => {
+    for (let attempt = 1; ; attempt++) {
+      let res: Response;
+      try {
+        res = await f(url, init);
+      } catch (err) {
+        if (attempt >= attempts) throw err;
+        const delay = backoffDelay(policy, attempt, random);
+        log(`retry ${attempt} of ${attempts - 1} in ${Math.round(delay)} ms: ${err instanceof Error ? err.message : String(err)} for ${url}`);
+        await sleep(delay);
+        continue;
+      }
+      if (!retryableStatus(res.status) || attempt >= attempts) return res;
+      const after = res.status === 429 ? retryAfterMs(res.headers.get("retry-after"), Date.now()) : null;
+      const delay = after === null ? backoffDelay(policy, attempt, random) : Math.min(after, maxAfter);
+      log(`retry ${attempt} of ${attempts - 1} in ${Math.round(delay)} ms: HTTP ${res.status} for ${url}`);
+      await res.body?.cancel();
+      await sleep(delay);
+    }
+  };
 }
 
 /** The data that `collect` gives to the graph builder. */
@@ -47,8 +112,8 @@ interface TreeEntry {
 /** This error holds the HTTP status of a failed request. */
 export class HttpError extends Error {
   readonly status: number;
-  constructor(status: number, url: string) {
-    super(`HTTP ${status} for ${url}`);
+  constructor(status: number, url: string, tries = 1) {
+    super(`HTTP ${status} for ${url}${tries > 1 ? ` after ${tries} tries` : ""}`);
     this.status = status;
   }
 }
@@ -84,6 +149,9 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   const limit = opts.concurrency ?? 6;
   const log = opts.log ?? (() => {});
   const warnings: string[] = [];
+  // Only the GitHub reads get the retries. A failed npm read is a warning already.
+  const gh = withRetry(f, opts.retry, log);
+  const tries = (status: number): number => (retryableStatus(status) ? Math.max(1, Math.floor(opts.retry?.attempts ?? 4)) : 1);
 
   const ghHeaders = (accept: string): Record<string, string> => {
     const h: Record<string, string> = { accept, "x-github-api-version": "2022-11-28", "user-agent": "release-train" };
@@ -92,16 +160,16 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   };
 
   const ghJson = async <T>(url: string): Promise<{ data: T; next: string | null }> => {
-    const res = await f(url.startsWith("http") ? url : `${api}${url}`, { headers: ghHeaders("application/vnd.github+json") });
-    if (!res.ok) throw new HttpError(res.status, url);
+    const res = await gh(url.startsWith("http") ? url : `${api}${url}`, { headers: ghHeaders("application/vnd.github+json") });
+    if (!res.ok) throw new HttpError(res.status, url, tries(res.status));
     return { data: (await res.json()) as T, next: nextLink(res.headers.get("link")) };
   };
 
   const ghRaw = async (repo: string, path: string, ref: string): Promise<string | null> => {
     const url = `${api}/repos/${opts.owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`;
-    const res = await f(url, { headers: ghHeaders("application/vnd.github.raw") });
+    const res = await gh(url, { headers: ghHeaders("application/vnd.github.raw") });
     if (res.status === 404) return null;
-    if (!res.ok) throw new HttpError(res.status, url);
+    if (!res.ok) throw new HttpError(res.status, url, tries(res.status));
     return res.text();
   };
 

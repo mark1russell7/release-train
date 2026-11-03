@@ -193,6 +193,9 @@ importers:
 
   packages/release-train:
     dependencies:
+      '@mark1russell7/service':
+        specifier: ^0.6.4
+        version: 0.6.4
       semver:
         specifier: ^7.8.5
         version: 7.8.5
@@ -414,6 +417,15 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
+  '@mark1russell7/algebra@0.8.1':
+    resolution: {integrity: sha512-lpuX4jO56Ht7F6ugymJwPCoL1F6fMVX/HAfuWaxfxBUCTrZxpSwD8qVk6O9M0fqaiyj2XUE+D5fz1XQP6BQlRA==}
+    engines: {node: '>=22.19'}
+    peerDependencies:
+      zod: ^4.1.0
+    peerDependenciesMeta:
+      zod:
+        optional: true
+
   '@mark1russell7/api-report@0.2.1':
     resolution: {integrity: sha512-3bP316h+Thc6m4W2yvame5wTvDIMp7JDCM5CQBvDWZtjfsgr02Z7Vii9YjuPvogvkWvA4t09ihhnr73h0IKkRQ==}
     engines: {node: '>=22'}
@@ -429,6 +441,50 @@ packages:
     version: 1.0.2
     engines: {node: '>=22'}
     hasBin: true
+
+  '@mark1russell7/quantity@0.3.0':
+    resolution: {integrity: sha512-psfyKmVrOz5ynHgr2ED7WM5Pa/XVy6DR28jCaSGY42gvV0CJEq7HJRpV6sgkvWx8s3Et7evJWR56aG5tjCHZIw==}
+    engines: {node: '>=22.19'}
+    peerDependencies:
+      zod: ^4.1.0
+    peerDependenciesMeta:
+      zod:
+        optional: true
+
+  '@mark1russell7/rational@0.1.0':
+    resolution: {integrity: sha512-kYUuKI9STA4mlCpJCx/FpUSe8sokryDJzSuyd/Abev9Len7lotztPEOPH4A8WoxLvEsKEwHA33kg7lbLVjGZWw==}
+    engines: {node: '>=22'}
+
+  '@mark1russell7/rigor-generators@0.1.1':
+    resolution: {integrity: sha512-N5o3II0AClHgsWCWtzuBzckQdReydJnLUS8Kdt9hWXVpTzb0dxucrN1bWdDN+75YompOR1rAmsIX8zuHqoQdqA==}
+    engines: {node: '>=22'}
+
+  '@mark1russell7/service@0.6.4':
+    resolution: {integrity: sha512-bw0FV7rlAgx5RzKxKZK6X3GYITp1WxE7tBCcxwMLONeutcmetB5ALVn+tZnCjYGizYX1A0LcLjmmwSyPVuiylQ==}
+    engines: {node: '>=22.19'}
+    peerDependencies:
+      '@grpc/grpc-js': ^1.14.6
+      amqplib: ^2.2.0
+      ioredis: ^6.0.0
+      mongodb: ^7.7.0
+      pg: ^8.23.1
+      ws: ^8.22.0
+      zod: ^4.1.0
+    peerDependenciesMeta:
+      '@grpc/grpc-js':
+        optional: true
+      amqplib:
+        optional: true
+      ioredis:
+        optional: true
+      mongodb:
+        optional: true
+      pg:
+        optional: true
+      ws:
+        optional: true
+      zod:
+        optional: true
 
   '@mark1russell7/ste-lint@https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905':
     resolution: {gitHosted: true, integrity: sha512-VWKTHvPQEnTV/nbBzNaFmm/yzfZxqiakZwlroonxX2S8kchU1xssZi5gTgO+Wm5o+Lnhyk7mwLdnq3Sh5gkp4w==, tarball: https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905}
@@ -1104,11 +1160,29 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.6.0
 
+  '@mark1russell7/algebra@0.8.1':
+    dependencies:
+      '@mark1russell7/quantity': 0.3.0
+
   '@mark1russell7/api-report@0.2.1': {}
 
   '@mark1russell7/conventions@0.15.0': {}
 
   '@mark1russell7/cue@https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8': {}
+
+  '@mark1russell7/quantity@0.3.0':
+    dependencies:
+      '@mark1russell7/rational': 0.1.0
+
+  '@mark1russell7/rational@0.1.0': {}
+
+  '@mark1russell7/rigor-generators@0.1.1': {}
+
+  '@mark1russell7/service@0.6.4':
+    dependencies:
+      '@mark1russell7/algebra': 0.8.1
+      '@mark1russell7/quantity': 0.3.0
+      '@mark1russell7/rigor-generators': 0.1.1
 
   '@mark1russell7/ste-lint@https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905':
     dependencies:
