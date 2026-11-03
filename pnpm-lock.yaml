@@ -170,8 +170,8 @@ importers:
         specifier: ^0.2.0
         version: 0.2.2
       '@mark1russell7/conventions':
-        specifier: ^0.24.0
-        version: 0.24.1
+        specifier: ^0.25.0
+        version: 0.25.0
       '@mark1russell7/cue':
         specifier: github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8
         version: https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8
@@ -431,8 +431,8 @@ packages:
     engines: {node: '>=22'}
     hasBin: true
 
-  '@mark1russell7/conventions@0.24.1':
-    resolution: {integrity: sha512-4FATOd/MOOMHFBZtrRP+ZFeEUHwgannQD9FjWH81wVT6TbMJVNbFNH/uXSb3cP+0f+jM/xV9tT6jZ4ZOPfrMEg==}
+  '@mark1russell7/conventions@0.25.0':
+    resolution: {integrity: sha512-p49TqkjzhugGqhKdWjKq5bXOd2ljkwEHdbkEUVzmHSz8b805t2NhGLvbq63oBHMHMv0lKfJDgU0LMIXmpEgqhA==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -1166,7 +1166,7 @@ snapshots:
 
   '@mark1russell7/api-report@0.2.2': {}
 
-  '@mark1russell7/conventions@0.24.1': {}
+  '@mark1russell7/conventions@0.25.0': {}
 
   '@mark1russell7/cue@https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8': {}
 
