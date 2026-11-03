@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>release-train: the release plan of a set of npm packages, in dependency order</title>
+    <meta name="description" content="Bump one package of a sample set. The page shows the release train: the waves of releases and updates, the new version of each dependent and each block." />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23182a5c'/%3E%3Crect x='4' y='12' width='7' height='8' rx='2' fill='%2390b0ff'/%3E%3Crect x='13' y='12' width='7' height='8' rx='2' fill='%23f6a15c'/%3E%3Crect x='22' y='12' width='7' height='8' rx='2' fill='%235cc9b9'/%3E%3Cpath d='M3 24h26' stroke='%23e6e9f3' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <script>
+      // The saved theme applies before the first paint, so a dark page does not flash white.
+      try {
+        const t = localStorage.getItem("release-train-theme");
+        if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+      } catch {}
+    </script>
+  </head>
+  <body>
+    <a class="skip" href="#explorer">Skip to the plan explorer</a>
+    <header class="top">
+      <div class="topbar">
+        <a class="brand" href="./"><span class="logo" aria-hidden="true"><i></i><i></i><i></i></span>release-train</a>
+        <nav class="links" aria-label="Site">
+          <a href="#explorer">Explorer</a>
+          <a href="#how">How it works</a>
+          <a href="#use">Use</a>
+          <a href="releases/">Releases</a>
+          <a href="status/">Status</a>
+          <a href="https://github.com/mark1russell7/release-train">GitHub</a>
+          <button type="button" class="theme" id="theme" aria-label="Color theme">Theme: auto</button>
+        </nav>
+      </div>
+      <div class="intro">
+        <h1>Bump one package. The train of releases follows.</h1>
+        <p class="lead">
+          This page contains the real planner of release-train. It operates in your browser on eight made-up packages. Choose a scenario or change a bump. The plan shows
+          each release and each update in waves, the new version of each dependent with its SemVer reason, and each block.
+        </p>
+      </div>
+    </header>
+
+    <main>
+      <section id="explorer" class="explorer" aria-label="Plan explorer">
+        <div class="scen card">
+          <div class="scen-head">
+            <h2>Try a scenario</h2>
+            <div class="scen-buttons" id="scenarios" role="group" aria-label="Scenarios"></div>
+          </div>
+          <p class="hint" id="hint" aria-live="polite"></p>
+        </div>
+
+        <div class="summary" id="summary" aria-live="polite"></div>
+
+        <div class="board card">
+          <div class="board-head">
+            <div class="tabs" id="view-tabs" role="tablist" aria-label="Drawing">
+              <button type="button" role="tab" data-view="train" aria-selected="true">The train</button>
+              <button type="button" role="tab" data-view="deps" aria-selected="false">Dependencies</button>
+            </div>
+            <ul class="legend" id="legend-train">
+              <li><i class="sw t-release"></i>Release</li>
+              <li><i class="sw t-adopt-breaking"></i>Change ranges</li>
+              <li><i class="sw t-adopt-in-range"></i>Update lockfile</li>
+              <li><i class="sw t-new-package"></i>New package</li>
+              <li><i class="sw t-blocked"></i>Blocked</li>
+            </ul>
+            <ul class="legend" id="legend-deps" hidden>
+              <li><i class="ln e-breaking"></i>outside the range</li>
+              <li><i class="ln e-adopt"></i>in range, old lockfile</li>
+              <li><i class="ln e-waiting"></i>waits</li>
+              <li><i class="ln e-blocked"></i>blocks</li>
+              <li><i class="ln e-current"></i>current</li>
+            </ul>
+          </div>
+          <div class="canvas" id="canvas" tabindex="0" aria-label="Drawing. Scroll sideways on a small screen."></div>
+          <p class="canvas-note">An arrow goes from an action to each action that waits for it. Select a box to see why.</p>
+        </div>
+
+        <div class="detail card" id="detail" aria-live="polite"></div>
+
+        <aside class="packages card" aria-labelledby="packages-title">
+          <h2 id="packages-title">The packages</h2>
+          <p class="note">Set the bump on <code>main</code>. Clear <b>provenance</b> for a version that <code>release.yml</code> did not build. Press a dependency to use a <code>github:</code> specifier.</p>
+          <ul class="pkg-list" id="packages-list"></ul>
+        </aside>
+
+        <section class="plan card" aria-labelledby="plan-title">
+          <h2 id="plan-title">The plan, step by step</h2>
+          <div id="waves"></div>
+          <h3>Blocks and holds</h3>
+          <div id="issues"></div>
+        </section>
+      </section>
+
+      <section id="how" class="prose">
+        <h2>How the train works</h2>
+        <p>
+          The release train reads the npm packages of the GitHub account <code>mark1russell7</code>. It makes the dependency graph of these packages and a plan of
+          the next releases and updates. The train does not publish to npm itself. The release workflow of each repository publishes.
+        </p>
+        <div class="grid3">
+          <div class="step"><span class="n">1</span><h3>Plan</h3><p>The train reads each repository, each lockfile and npm. It gives the actions in waves. This stage changes nothing.</p></div>
+          <div class="step"><span class="n">2</span><h3>Apply</h3><p>The train opens one pull request for each repository of the current wave, with the new ranges and the new lockfile.</p></div>
+          <div class="step"><span class="n">3</span><h3>Template sync</h3><p>The train keeps the files from the template current in each repository, in a second pull request.</p></div>
+        </div>
+
+        <h3>The actions of the plan</h3>
+        <div class="table">
+          <table>
+            <thead><tr><th>Action</th><th>When</th></tr></thead>
+            <tbody>
+              <tr><td><span class="badge t-new-package">New package</span></td><td>The package is not on npm. Only the owner can make a new package.</td></tr>
+              <tr><td><span class="badge t-release">Release</span></td><td>The version on <code>main</code> is newer than npm, or a dependency range of the package changes.</td></tr>
+              <tr><td><span class="badge t-adopt-in-range">Update lockfile</span></td><td>The range lets the newest version in, but the lockfile holds an older version. A lockfile update is sufficient.</td></tr>
+              <tr><td><span class="badge t-adopt-breaking">Change ranges</span></td><td>The newest version is outside the range. The range changes to a caret range of the new version.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Each repository gets one combined action of each kind. The plan puts the actions in a topological sequence and shows each cycle.</p>
+
+        <h3>The new version of a dependent</h3>
+        <ul>
+          <li>A new version outside the range of a dependent changes that range. The dependent then needs a release too, else its users do not get the change.</li>
+          <li>A change of a peer range breaks the API. This gives MAJOR, or MINOR before <code>1.0.0</code>.</li>
+          <li>For a change of a runtime range, <code>apply</code> reads the public types of the dependent. When the types name the changed package, the release breaks the API. Else it is a patch.</li>
+        </ul>
+
+        <h3>Blocks and holds</h3>
+        <ul>
+          <li>A <code>github:</code>, <code>git</code>, <code>file:</code> or <code>link:</code> specifier in a runtime section of a published package blocks its release. npm users cannot install it.</li>
+          <li>The train moves a repository only to a version that the <code>release.yml</code> of its own repository built. npm gives this provenance. A version with no provenance waits for a person.</li>
+          <li>A release waits for the range changes of its repository, and for each runtime dependency on npm.</li>
+        </ul>
+      </section>
+
+      <section id="use" class="prose">
+        <h2>Use</h2>
+        <pre><code>GH_TOKEN=$(gh auth token) pnpm --filter @release-train/release-train plan
+node packages/release-train/src/bin.ts plan --json
+node packages/release-train/src/bin.ts plan --write-db &lt;folder&gt;
+GH_TOKEN=&lt;token&gt; node packages/release-train/src/bin.ts apply --dry-run</code></pre>
+        <ul>
+          <li><code>--public-only</code> removes each private repository from the output.</li>
+          <li><code>--out &lt;file&gt;</code> writes the full plan as JSON.</li>
+          <li><code>--dry-run</code> shows the pull requests of <code>apply</code> and changes nothing.</li>
+          <li><code>--only &lt;repo&gt;</code> changes only the given repositories.</li>
+        </ul>
+        <h3>CI</h3>
+        <ul>
+          <li><code>plan.yml</code> computes the plan every 6 hours with the default token, so it sees only public repositories.</li>
+          <li><code>train.yml</code> starts every 30 minutes and on each new release. It uses the token of a GitHub App, so its pull requests start CI.</li>
+          <li>The log and the artifacts of a run give each private repository only as a count or a hash.</li>
+        </ul>
+        <p>The <a href="https://github.com/mark1russell7/release-train#readme">README</a> tells each stage in full.</p>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <p>
+        <a href="https://github.com/mark1russell7/release-train">mark1russell7/release-train</a> · The sample packages are made up. · Build <code id="build"></code>
+      </p>
+    </footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

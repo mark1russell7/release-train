@@ -36,6 +36,13 @@ node packages/release-train/src/bin.ts plan --write-db <folder>
 - `--out <file>` writes the full plan as JSON.
 - `--no-progress` does not read the pull requests and the release runs.
 
+## The site
+
+The site at <https://mark1russell7.github.io/release-train/> is a plan explorer. The package `packages/site` bundles `graph.ts` and `plan.ts` of the library, so the page plans with the same code as the CLI.
+
+- The page shows eight made-up packages. Change a bump, a provenance or a `github:` specifier. The page then shows the new plan in waves.
+- `pages.yml` builds the site on each pull request and checks it in a browser. A push to `main` deploys it.
+
 ## CI
 
 `plan.yml` computes the plan every 6 hours and on a manual start. It keeps `plan.json` as a workflow artifact. It uses the default token, so it sees only public repositories.

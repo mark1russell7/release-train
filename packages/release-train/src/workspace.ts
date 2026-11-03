@@ -166,7 +166,7 @@ function readText(file: string): string {
   return existsSync(file) ? readFileSync(file, "utf8") : "";
 }
 
-/** The package of the fleet conventions, and its first version with `conventions fix`. */
+/** The package of the shared conventions, and its first version with `conventions fix`. */
 export const CONVENTIONS = "@mark1russell7/conventions";
 export const FIX_SINCE = "0.8.2";
 
