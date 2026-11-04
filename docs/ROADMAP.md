@@ -17,5 +17,5 @@ This file gives the items of the release train and their status. The Status page
 | RT9 | The site: a plan explorer that runs the planner of the library in the browser | Done | #79 |
 | RT10 | The update pushes obey the limit of pushes, and an urgent update passes it | Done | #93 |
 | RT11 | An urgent package passes the age rule with its exact version | Done | #95 |
-| RT12 | The tag backfill: a published version with no tag gets its release from a local run | In progress | #97 |
-| RT13 | A run sends the ready items of a repository, and only the other items wait | In progress | #98 |
+| RT12 | The tag backfill: a published version with no tag gets its release from a local run | Done | #97 |
+| RT13 | A run sends the ready items of a repository, and only the other items wait | Done | #98 |
