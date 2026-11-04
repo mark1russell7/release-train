@@ -10,3 +10,4 @@ export * from "./github.ts";
 export * from "./workspace.ts";
 export * from "./cli.ts";
 export * from "./sync.ts";
+export * from "./tags.ts";

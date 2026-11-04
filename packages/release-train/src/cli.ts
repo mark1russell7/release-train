@@ -12,6 +12,7 @@ import type { Progress } from "./progress.ts";
 import { awaitRelease } from "./release.ts";
 import { SYNC_RULES, apiFiles, syncFacts, syncRepo, syncSummary } from "./sync.ts";
 import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
+import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tagsSummary, validDate } from "./tags.ts";
 import { gitUpdater } from "./workspace.ts";
 
 /** The options of the command line. */
@@ -47,6 +48,10 @@ export interface CliOptions {
   maxPushes: number;
   /** `apply`: the public packages with a security fix. Their updates go first and pass the limit of pushes. */
   urgent: string[] | null;
+  /** `tags`: the start date, as `YYYY-MM-DD`. The command does not examine a version from before it. */
+  since: string;
+  /** `tags`: this option makes the missing releases. Without it, the command makes no write. */
+  write: boolean;
 }
 
 /** This function reads the arguments of the command line. */
@@ -71,6 +76,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     workflows: "auto",
     maxPushes: MAX_PUSHES,
     urgent: null,
+    since: defaultSince(),
+    write: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -94,6 +101,12 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--release-dispatch") o.releaseDispatch = true;
     else if (a === "--minutes") o.minutes = Number(value());
     else if (a === "--no-sync") o.sync = false;
+    else if (a === "--write") o.write = true;
+    else if (a === "--since") {
+      const v = value().trim();
+      if (!validDate(v)) throw new Error(`--since needs a date of the form YYYY-MM-DD, not ${v}.`);
+      o.since = v;
+    }
     else if (a === "--max-pushes") {
       const v = Number(value());
       if (!Number.isInteger(v) || v < 0) throw new Error(`--max-pushes needs a whole number of 0 or more.`);
@@ -111,6 +124,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a !== undefined && !a.startsWith("-")) o.command = a;
     else throw new Error(`Unknown option ${a}.`);
   }
+  if (o.write) checkWriteWindow(o.since);
   return o;
 }
 
@@ -171,12 +185,20 @@ export function redactName(text: string, name: string, by: string): string {
   return text.replace(new RegExp(`(?<![\\w-])${esc}(?![\\w-])`, "g"), by);
 }
 
+/** This function replaces each given name in a text with its hash. A longer name goes first. */
+export function redactNames(text: string, names: Iterable<string>, key: string): string {
+  let t = text;
+  for (const n of [...names].sort((a, b) => b.length - a.length)) t = redactName(t, n, hashName(n, key));
+  return t;
+}
+
 /** This function starts the command line. */
 export async function main(argv: readonly string[]): Promise<number> {
   const o = parseArgs(argv);
   if (o.command === "await-release") return runAwait(o);
+  if (o.command === "tags") return runTags(o);
   if (o.command !== "plan" && o.command !== "apply") {
-    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply" and "await-release".\n`);
+    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply", "await-release" and "tags".\n`);
     return 2;
   }
   return o.command === "apply" ? runApply(o) : runPlan(o);
@@ -239,10 +261,7 @@ async function runApply(o: CliOptions): Promise<number> {
     }
   };
   const redact = (text: string): string => {
-    if (o.showPrivate) return text;
-    let t = text;
-    for (const n of [...secrets].sort((a, b) => b.length - a.length)) t = redactName(t, n, hashName(n, key));
-    return t;
+    return o.showPrivate ? text : redactNames(text, secrets, key);
   };
   const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);
   try {
@@ -285,6 +304,45 @@ async function runApply(o: CliOptions): Promise<number> {
     if (summaryFile) appendFileSync(summaryFile, ["", "```", text, "```", ""].join("\n"));
     process.stdout.write(`${text}\n`);
     return 0;
+  } catch (e) {
+    process.stderr.write(`${redact(e instanceof Error ? e.message : String(e))}\n`);
+    return 1;
+  }
+}
+
+/**
+ * The tags command: it finds each published version with no git tag, and with `--write` it makes each missing release.
+ * Its output gives each private repository and package only as a hash. `--dry-run` wins over `--write`.
+ */
+async function runTags(o: CliOptions): Promise<number> {
+  const key = process.env["RELEASE_TRAIN_HASH_KEY"] ?? "";
+  const secrets = new Set<string>();
+  const redact = (text: string): string => (o.showPrivate ? text : redactNames(text, secrets, key));
+  const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);
+  try {
+    const data = await collect({
+      owner: o.owner,
+      token: token(),
+      publicOnly: o.publicOnly,
+      log,
+      onRepos: (repos) => {
+        for (const r of repos) if (r.private) secrets.add(r.name);
+      },
+    });
+    const graph = buildGraph({ owner: o.owner, repos: data.repos, npm: data.npm, warnings: data.warnings });
+    for (const p of graph.packages) if (p.repoPrivate) secrets.add(p.name);
+    const report = await backfillTags({
+      owner: o.owner,
+      repos: tagRepos(data.repos, graph.packages, o.only),
+      gh: ghCommand,
+      since: o.since,
+      write: o.write && !o.dryRun,
+      log,
+    });
+    const json = `${redact(JSON.stringify(report, null, 2))}\n`;
+    if (o.out) writeFileSync(o.out, json);
+    process.stdout.write(o.json ? json : `${redact(tagsSummary(report))}\n`);
+    return report.rows.some((r) => r.state === "failed" || r.state === "error") ? 1 : 0;
   } catch (e) {
     process.stderr.write(`${redact(e instanceof Error ? e.message : String(e))}\n`);
     return 1;
