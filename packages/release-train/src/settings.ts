@@ -10,6 +10,7 @@ export function ownScopes(owner: string): string[] {
 
 const KEY = "minimumReleaseAgeExclude";
 const SCOPE_COMMENT = "# Our own packages: the release train updates them, so the release age check of pnpm does not apply to them.";
+const URGENT_COMMENT = "# An urgent update: a person named these versions, so they do not wait for the release age check of pnpm.";
 
 /** This function matches a text against a pattern in which `*` stands for any text. It uses no regular expression. */
 export function globMatch(pattern: string, text: string): boolean {
@@ -122,6 +123,32 @@ export function ageRuleEdit(yaml: string | null, scopes: readonly string[]): Age
   }
   const out = [...before, `${KEY}:`, ...scopeLines, ...kept, ...lines.slice(end)];
   return { text: `${out.join(eol)}${eol}`, changed: true, removed };
+}
+
+/**
+ * This function adds exact versions to `minimumReleaseAgeExclude`, after the entries of the list. It keeps the other entries.
+ * The text gets the scope patterns first, so the list exists and is a block list.
+ */
+export function ageExcludeAdd(yaml: string | null, scopes: readonly string[], entries: readonly string[]): string {
+  const text = ageRuleEdit(yaml, scopes).text;
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((l) => l.startsWith(`${KEY}:`));
+  const present = new Set<string>();
+  let last = start;
+  for (let n = start + 1; n < lines.length; n++) {
+    const l = lines[n] ?? "";
+    const t = l.trim();
+    if (t !== "" && l === l.trimStart() && !t.startsWith("-")) break;
+    if (!t.startsWith("-")) continue;
+    present.add(itemValue(l));
+    last = n;
+  }
+  const missing = entries.filter((e) => !present.has(e));
+  if (missing.length === 0) return text;
+  const indent = /^\s*/.exec(lines[last] ?? "")?.[0] || "  ";
+  lines.splice(last + 1, 0, `${indent}${URGENT_COMMENT}`, ...missing.map((e) => `${indent}- "${e}"`));
+  return lines.join(eol);
 }
 
 /** This function tells if a repository needs the age rule: it uses pnpm, and its settings do not have the rule yet. */
