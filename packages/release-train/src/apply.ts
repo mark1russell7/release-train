@@ -286,8 +286,10 @@ export interface RepoResult {
   detail: string;
   /** The problems that a person must correct, and the changes that wait. Only the template sync gives them. */
   needs?: string[];
-  /** This value is true when a push waits for the pace of the shared runners. A later run pushes the branch. */
+  /** This value is true when a push waits for a later run: for the limit of pushes, or a sync push for the busy runners. */
   paced?: boolean;
+  /** This value is true when the update changes a package of `urgent`. */
+  urgent?: boolean;
 }
 
 /** The result of one run of the train. */
@@ -298,6 +300,8 @@ export interface ApplyReport {
   results: RepoResult[];
   /** The public packages whose version on main is not on npm yet. The release workflow of each repository publishes them. */
   inFlight?: { name: string; version: string }[];
+  /** The count of the names of `urgent` that change no ready update. The report has only the count, so it stays public. */
+  urgentUnused?: number;
 }
 
 /** The options of `apply`. */
@@ -327,8 +331,13 @@ export interface ApplyOptions {
   maxPushes?: number;
   /** This function gives the number of jobs that run at this time on the runners of the account, or null when it is not known. */
   runnersBusy?: () => Promise<number | null>;
-  /** A push waits while `runnersBusy` gives this number of jobs or more. The default is `BUSY_LIMIT`. */
+  /** A sync push waits while `runnersBusy` gives this number of jobs or more. The default is `BUSY_LIMIT`. An update push does not wait. */
   busyLimit?: number;
+  /**
+   * The names of public packages with a security fix. A person gives them. An update of such a package goes first, does not
+   * wait for `maxPushes` and does not use its count. All other checks stay. A private package has no effect here.
+   */
+  urgent?: readonly string[] | null;
 }
 
 /** The options of the template sync of `apply`. */
@@ -341,12 +350,15 @@ export interface SyncOptions {
   rules?: readonly SyncRule[];
 }
 
-/** The rule of the runner slots (40 per account): no new heavy start while 30 or more jobs run. */
+/**
+ * The rule of the runner slots (40 per account): no new heavy start while 30 or more jobs run. Only a sync push waits for
+ * this rule. The account has 30 jobs or more for most of a day, and this rule must not stop the update pushes for so long.
+ */
 export const BUSY_LIMIT = 30;
 
 /**
  * The most branches of one run in the CLI, for the update pushes and the sync pushes together. A push starts approximately
- * 6 jobs (CI, the scans, the reviews), so 5 pushes start approximately the 30 jobs of `BUSY_LIMIT`.
+ * 6 jobs (CI, the scans, the reviews), so 5 pushes start approximately 30 jobs.
  */
 export const MAX_PUSHES = 5;
 
@@ -627,8 +639,14 @@ export function applySummary(r: ApplyReport): string {
   }
   const paced = r.results.filter((x) => x.paced);
   if (paced.length > 0) {
-    lines.push(`Waiting for the runners: ${paced.length}. Public: ${paced.filter((x) => !x.private).map((x) => x.repo).join(", ") || "none"}. Count of private repositories: ${paced.filter((x) => x.private).length}.`);
+    lines.push(`Waiting for a later run: ${paced.length}. Public: ${paced.filter((x) => !x.private).map((x) => x.repo).join(", ") || "none"}. Count of private repositories: ${paced.filter((x) => x.private).length}.`);
   }
+  const urgent = r.results.filter((x) => x.urgent);
+  if (urgent.length > 0) {
+    const states = [...new Set(urgent.map((x) => x.state))].map((s) => `${s} ${urgent.filter((x) => x.state === s).length}`).join(", ");
+    lines.push(`Urgent: ${urgent.length} (${states}). Public: ${urgent.filter((x) => !x.private).map((x) => x.repo).join(", ") || "none"}. Count of private repositories: ${urgent.filter((x) => x.private).length}.`);
+  }
+  if (r.urgentUnused) lines.push(`Urgent names with no ready update: ${r.urgentUnused}.`);
   const counts = new Map<RepoState, number>();
   for (const x of r.results) counts.set(x.state, (counts.get(x.state) ?? 0) + 1);
   lines.push(`States: ${[...counts].map(([k, v]) => `${v} ${k}`).join(", ") || "none"}`, "");
@@ -862,17 +880,20 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const pacing = o.maxPushes !== undefined || o.runnersBusy !== undefined;
   const slot = Math.floor((o.now ?? new Date()).getTime() / RUN_MS);
   let pushes = 0;
-  /**
-   * This function gives the reason why a push waits for a later run, or null when it can push. With `full` false, it
-   * examines only the limit of pushes, so a branch that has its changes costs no count of the runners.
-   */
-  const paceWait = async (full = true): Promise<string | null> => {
-    if (o.maxPushes !== undefined && pushes >= o.maxPushes) return `This run pushed ${pushes} branches, the most of one run, because the runners are shared. A later run pushes this one.`;
-    if (!full || !o.runnersBusy) return null;
+  /** This function gives the reason why a push waits for the limit of pushes, or null when it can push. */
+  const limitWait = (): string | null =>
+    o.maxPushes !== undefined && pushes >= o.maxPushes ? `This run pushed ${pushes} branches, the most of one run, because the runners are shared. A later run pushes this one.` : null;
+  /** This function gives the reason why a sync push waits for the busy runners, or null when it can push. */
+  const busyWait = async (): Promise<string | null> => {
+    if (!o.runnersBusy) return null;
     const busy = await o.runnersBusy();
     const limit = o.busyLimit ?? BUSY_LIMIT;
-    return busy !== null && busy >= limit ? `${busy} jobs run on the runners of the account, and a push waits at ${limit} or more. A later run pushes this one.` : null;
+    return busy !== null && busy >= limit ? `${busy} jobs run on the runners of the account, and a sync push waits at ${limit} or more. A later run pushes this one.` : null;
   };
+  // Only a public name counts: GitHub shows the input of a run, so a private name must not change what a run does.
+  const publicPackages = new Set(o.plan.nodes.filter((n) => n.kind === "package" && !n.repoPrivate).map((n) => n.name));
+  const urgentNames = new Set((o.urgent ?? []).filter((n) => publicPackages.has(n)));
+  const isUrgent = (u: RepoUpdate): boolean => u.items.some((i) => urgentNames.has(i.dep));
 
   // 1. Close each open pull request of the train that the plan no longer needs.
   for (const [repo, pr] of open) {
@@ -900,8 +921,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   }
 
   // 3 and 4. The adoptions of the current wave and the template sync. One limit covers the pushes of both, so with a pace
-  // they go first in turn, and a long queue of one kind does not stop the other kind.
-  const syncFirst = pacing && slot % 2 === 1;
+  // they go first in turn, and a long queue of one kind does not stop the other kind. An urgent update goes before the sync.
+  const syncFirst = pacing && slot % 2 === 1 && !sel.ready.some(isUrgent);
   if (syncFirst && o.sync) await syncAll(o.sync);
   await updateAll();
   if (!syncFirst && o.sync) await syncAll(o.sync);
@@ -912,12 +933,13 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    */
   async function updateAll(): Promise<void> {
     // A ready adoption waits for no action, so it is in wave 0, and the pace cannot put a later wave first. But a later wave
-    // can wait for it, so an adoption that another action waits for goes first. The other adoptions turn.
+    // can wait for it, so an adoption that another action waits for goes first, after the urgent adoptions. The other adoptions turn.
     const waitedFor = new Set(o.plan.actions.flatMap((a) => a.dependsOn));
-    const rank = (u: RepoUpdate): number => (waitedFor.has(u.actionId) ? 0 : 1);
+    const rank = (u: RepoUpdate): number => (isUrgent(u) ? 0 : waitedFor.has(u.actionId) ? 1 : 2);
     for (const u of pacing ? rotate(sel.ready, slot).sort((x, y) => rank(x) - rank(y)) : sel.ready) {
       const existing = open.get(u.repo) ?? null;
-      const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length };
+      const urgent = isUrgent(u);
+      const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length, ...(urgent ? { urgent } : {}) };
       if (u.lockKind === "yarn") {
         result({ ...common, state: "skipped", pr: prRef(existing), autoMerge: null, ci: null, detail: "The train cannot update a Yarn lockfile." });
         continue;
@@ -941,12 +963,12 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           }
         }
         const rebuild = await needsRebuild(u.repo, existing, meta.default_branch);
-        // A branch with these changes on the current default branch needs no push. Only such a branch skips the count of the runners.
+        // A branch with these changes on the current default branch needs no push.
         const due = !existing || rebuild || bodyFingerprint(existing.body) !== u.fingerprint;
-        const wait = await paceWait(due);
+        const wait = urgent ? null : limitWait();
         if (o.dryRun && (wait === null || !due)) {
           const what = !existing ? "The run opens a pull request" : due ? `The run updates PR #${existing.number}` : `The run keeps PR #${existing.number}`;
-          if (due) pushes += 1;
+          if (due && !urgent) pushes += 1;
           result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length === 0 ? "the pnpm settings" : `${u.items.length} ${u.items.length === 1 ? "change" : "changes"}`}${u.items.length > 0 && u.ageScopes ? " and the pnpm settings" : ""}${u.releases?.length ? `, with the release of ${u.releases.map((x) => x.name).join(", ")}` : ""}.` });
           continue;
         }
@@ -960,7 +982,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           continue;
         }
         const r = await o.updater.update(u, { defaultBranch: meta.default_branch, rebuild });
-        if (r.status === "pushed") pushes += 1;
+        if (r.status === "pushed" && !urgent) pushes += 1;
         if (r.status === "failed") {
           result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: `The update failed: ${r.error ?? "unknown error"}` });
           continue;
@@ -1055,7 +1077,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         }
         const rebuild = await needsRebuild(repo, existing, meta.default_branch);
         const same = existing !== null && !rebuild && bodyFingerprint(existing.body) === planned.fingerprint;
-        const wait = same ? null : await paceWait();
+        const wait = same ? null : (limitWait() ?? (await busyWait()));
         if (wait !== null) {
           result({ ...commonOf(planned), state: "waiting", paced: true, pr: prRef(existing), autoMerge: null, ci: null, detail: wait });
           continue;
@@ -1177,7 +1199,9 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     }
   }
 
-  return { owner, at: (o.now ?? new Date()).toISOString(), dryRun: o.dryRun, results, inFlight };
+  const changed = new Set(sel.ready.flatMap((u) => u.items.map((i) => i.dep)));
+  const urgentUnused = [...new Set(o.urgent ?? [])].filter((n) => !urgentNames.has(n) || !changed.has(n)).length;
+  return { owner, at: (o.now ?? new Date()).toISOString(), dryRun: o.dryRun, results, inFlight, ...(urgentUnused > 0 ? { urgentUnused } : {}) };
 }
 
 /** The branch of the version pull request of changesets. */

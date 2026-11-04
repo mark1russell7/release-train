@@ -444,6 +444,38 @@ describe("apply with the template sync", () => {
     expect(await run(1, 2)).toEqual({ updates: 1, syncs: 1, states: ["sync opened", "update opened"] });
   });
 
+  describe("on a busy account", () => {
+    const pkg = (name: string, dep: boolean): RepoSnapshot => ({ name, private: false, defaultBranch: "main", manifests: [{ path: "", manifest: dep ? { name: "demo", private: true, devDependencies: { "@ex/tool": "^1.0.0" } } : { name: "@ex/tool", version: "1.1.0" } }], lockKind: "pnpm", resolved: dep ? { "": { "@ex/tool": "1.0.0" } } : {}, warnings: [] });
+    const p = () => plan(buildGraph({ owner: OWNER, repos: [pkg("demo-repo", true), pkg("tool-repo", false)], npm: { "@ex/tool": { exists: true, latest: "1.1.0" } }, now: new Date("2026-01-01T00:00:00Z") }));
+    const run = async (o: { slot: number; busy: number; urgent?: string[] }) => {
+      const { gh } = server(repoRoutes("demo-repo"));
+      const order: string[] = [];
+      const inner = syncer([]);
+      const up: SyncUpdater = { sync: async (job, ctx) => { order.push("sync"); return inner.sync(job, ctx); } };
+      const updater: Updater = { async update() { order.push("update"); return { status: "pushed", sha: "s8", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
+      const r = await apply({ owner: OWNER, plan: p(), gh, updater, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes: 5, runnersBusy: async () => o.busy, urgent: o.urgent ?? null, now: new Date(o.slot * RUN_MS) });
+      return { order, sync: r.results.find((x) => x.kind === SYNC_KIND) };
+    };
+
+    it("stops a sync push and not an update push", async () => {
+      for (const slot of [0, 1]) {
+        const busy = await run({ slot, busy: BUSY_LIMIT });
+        expect(busy.order).toEqual(["update"]);
+        expect(busy.sync).toMatchObject({ state: "waiting", paced: true });
+        expect(busy.sync?.detail).toContain("a sync push waits at 30 or more");
+      }
+    });
+
+    it("gives the sync its turn when the account is not busy", async () => {
+      expect((await run({ slot: 1, busy: BUSY_LIMIT - 1 })).order).toEqual(["sync", "update"]);
+      expect((await run({ slot: 0, busy: BUSY_LIMIT - 1 })).order).toEqual(["update", "sync"]);
+    });
+
+    it("puts an urgent update before the sync, also in the turn of the sync", async () => {
+      expect((await run({ slot: 1, busy: 0, urgent: ["@ex/tool"] })).order).toEqual(["update", "sync"]);
+    });
+  });
+
   it("gives the same waiting state in a dry run, and pushes nothing", async () => {
     const { gh, calls } = server(repoRoutes("demo-repo"));
     const up = syncer([]);

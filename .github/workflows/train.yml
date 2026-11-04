@@ -20,6 +20,10 @@ on:
         description: The value of --cascade for this run (public names, "all" or "none"). Empty means CASCADE of the workflow.
         type: string
         default: ""
+      urgent:
+        description: The packages with a security fix (comma-separated public names). Their updates go first and pass the limit of pushes. Empty means none.
+        type: string
+        default: ""
   repository_dispatch:
     types: [released]
   schedule:
@@ -93,6 +97,7 @@ jobs:
           INPUT_DRY: ${{ inputs.dry-run }}
           ONLY: ${{ inputs.only }}
           INPUT_CASCADE: ${{ inputs.cascade }}
+          URGENT: ${{ inputs.urgent }}
           OWNER: ${{ github.repository_owner }}
           AUTHOR: ${{ steps.bot.outputs.author }}
           WORKFLOWS: ${{ steps.wf.outcome == 'success' && 'yes' || 'no' }}
@@ -101,6 +106,7 @@ jobs:
           args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR")
           if [ "$dry" != "false" ]; then args+=(--dry-run); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
+          if [ -n "$URGENT" ]; then args+=(--urgent "$URGENT"); fi
           if [ "$RELEASE_DISPATCH" = "true" ]; then args+=(--release-dispatch); fi
           args+=(--cascade "${INPUT_CASCADE:-$CASCADE}")
           if [ "$SYNC" = "true" ]; then args+=(--workflows "$WORKFLOWS"); else args+=(--no-sync); fi

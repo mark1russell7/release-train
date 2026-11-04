@@ -77,18 +77,43 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 - `--show-private` shows the private names in the output. Do not use it in CI.
 - `--cascade <repos>` sets the repositories (comma-separated) whose breaking adoptions carry a release, or `all` (the default). The adoptions of other repositories with a release wait.
 - `--release-dispatch` starts the release workflows that start only by hand. Refer to "Releases".
-- `--max-pushes <n>` is the most branches that one run pushes (default 5). The update branches and the sync branches share this limit. Each push starts approximately 6 jobs in its repository, and all repositories of the account share 40 runners. A push also waits while 30 or more jobs run on the account. The other repositories get `waiting`, and a later run pushes them. When the list of runs is not readable, only the limit of pushes applies.
+- `--max-pushes <n>` is the most branches that one run pushes (default 5). The update branches and the sync branches share this limit. The other repositories get `waiting`, and a later run pushes them.
+- `--urgent <packages>` names public packages with a security fix (comma-separated). Refer to "An urgent update".
 
 ### The pace of the pushes
 
 One new version of a package that most repositories use changes approximately 35 repositories. The pace stops such a version from starting CI in all of them in one run.
 
-- Five pushes start approximately 30 jobs, so the default limit keeps one run under the busy limit. At the default, 35 repositories need 7 runs, approximately 3.5 hours. A `released` event adds a run, and a busy account stops a run.
+- Each push starts approximately 6 jobs in its repository, and all repositories of the account share 40 runners. So 5 pushes start approximately 30 jobs.
+- An update push waits only for `--max-pushes`. A sync push also waits while 30 or more jobs run on the account. The account has so many jobs for most of a day, so that gate on an update push stops the train in silence. When the list of runs is not readable, a sync push waits only for the limit.
 - A branch that gets a new commit counts. A branch that has its changes on the current default branch needs no push. It does not wait, and the train merges or blocks its pull request.
 - At the limit, the train does not clone. A repository that waits has no cost, and an open pull request still merges on green or gets the blocked label. The next run reads the plan again, so it pushes the newest versions and skips the versions between.
 - An update is ready only when it waits for no action, so the pace cannot put a later wave first. An update that another action waits for goes first.
 - The other updates move one place in the order every 30 minutes, so no repository stays at the end. The sync order moves too. The update pushes and the sync pushes go first in turn.
 - `--max-pushes 0` lets a run only merge or block.
+
+At the default, 35 repositories need 7 runs, approximately 3.5 hours, when the sync takes no pushes. A sync with a long queue takes each second run while the account is not busy. Then the 35 repositories need approximately 7 hours. A `released` event adds a run.
+
+### An urgent update
+
+A person names the package. The train does not detect a security update. A run from the schedule or from a `released` event has no urgent names.
+
+```sh
+gh workflow run train.yml -R <owner>/release-train -f dry-run=false -f urgent=<package>
+```
+
+You can also start the workflow `Train` on the Actions page of this repository. Set `dry-run` to false, because its default is true. Give only public names, because GitHub shows the inputs. The name of a private package has no effect.
+
+- The update goes first in the run, and it goes before the sync.
+- The update does not wait for `--max-pushes`, and it does not use the count of the run. The train has no other limit for such a push, so a popular package starts CI in all its repositories at once.
+- The push carries each other change of the update branch of that repository.
+- All other checks stay. They are the wave order, `--only`, `--cascade`, the provenance check, the age rule, the closed pull request of a person, and the Yarn and submodule skips.
+- CI and the checks of each repository stay too. The train still merges only on green, in a later run.
+- The wave order stays, so an update in a later wave waits for its release. Give each package of the chain to go fast, and start a new run after each release.
+- The age rule stays. The scopes `@<owner>/*` and `@procedures/*` have no wait, because the train excludes them from the rule. Each other package waits for `minimumReleaseAge` of the repository, 1 day by default. After that time, a person starts the run again. Else the update waits for the limit.
+- A later run with no urgent names merges the pull requests, and it paces each push that is still due.
+- One run can wait while another run operates. A newer run replaces the run that waits, so check that your run starts.
+- The summary has a line `Urgent` with the count and the states, and a line with the count of the names that change no ready update.
 
 ## Releases
 
@@ -132,7 +157,7 @@ GitHub refuses a change to a workflow file from an App without the permission Wo
 
 `train.yml` starts every 30 minutes, on a manual start and on the `released` event of `repository_dispatch`. It makes a token of the GitHub App `mark1russell7-release-train` with `actions/create-github-app-token`. Pull requests with that token start CI in the repositories.
 
-- A manual start has the inputs `dry-run` (default true), `only` and `cascade`. Give only public names to `only` and `cascade`, because GitHub shows the inputs.
+- A manual start has the inputs `dry-run` (default true), `only`, `cascade` and `urgent`. Give only public names to `only`, `cascade` and `urgent`, because GitHub shows the inputs.
 - The schedule and `repository_dispatch` change repositories only when `LIVE` in `train.yml` is `"true"`. It is `"true"` since 2026-10-25. Set it to `"false"` to stop the train.
 - The log, the step summary and the artifact `apply` give each private repository only as a count or a hash. The run also masks each private name in the log.
 - After `apply`, the step "Wait for a release" waits up to 15 minutes for a version in flight.
