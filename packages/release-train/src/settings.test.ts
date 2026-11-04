@@ -70,7 +70,7 @@ describe("ageRuleEdit", () => {
 
 describe("ageExcludeAdd", () => {
   it("adds the exact version after the scopes and keeps the next setting", () => {
-    const yaml = 'minimumReleaseAgeExclude:\n  - "@ex/*"\n  - "@procedures/*"\nonlyBuiltDependencies: []\n';
+    const yaml = 'minimumReleaseAgeExclude:\n  - "@ex/*"\n  - "@tools/*"\nonlyBuiltDependencies: []\n';
     const text = ageExcludeAdd(yaml, SCOPES, ["fix@1.0.1"]);
     expect(releaseAgePolicy(text, "", "12.0.0").exclude).toEqual([...SCOPES, "fix@1.0.1"]);
     expect(text).toContain("onlyBuiltDependencies: []");
@@ -86,7 +86,7 @@ describe("ageExcludeAdd", () => {
   });
 
   it("keeps the line endings of the file", () => {
-    const text = ageExcludeAdd('minimumReleaseAgeExclude:\r\n  - "@ex/*"\r\n  - "@procedures/*"\r\n', SCOPES, ["fix@1.0.1"]);
+    const text = ageExcludeAdd('minimumReleaseAgeExclude:\r\n  - "@ex/*"\r\n  - "@tools/*"\r\n', SCOPES, ["fix@1.0.1"]);
     expect(text).toContain('  - "fix@1.0.1"\r\n');
     expect(text.replace(/\r\n/g, "")).not.toContain("\n");
   });
@@ -224,7 +224,7 @@ describe("gitUpdater with the settings", () => {
     expect(r.young.map((y) => y.dep)).toEqual(["other"]);
     expect(r.urgentAge).toEqual(["fix@2.0.0"]);
     expect(r.status).not.toBe("young");
-    expect(releaseAgePolicy(written, "", "12.0.0").exclude).toEqual([...SCOPES, "fix@2.0.0"]);
+    expect(releaseAgePolicy(written, "", "12.0.0").exclude).toEqual([...ownScopes("ex"), "fix@2.0.0"]);
     expect(commit).toContain("fix@2.0.0 in minimumReleaseAgeExclude");
   });
 
