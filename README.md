@@ -149,7 +149,7 @@ node packages/release-train/src/bin.ts tags --write
 
 The command reads the packages of the plan, their versions on npm and the tags of each repository. It starts `gh` with an argument list and no shell. A default run makes no write. It shows each version with no tag and its state.
 
-A local run with the token of the owner writes only to a private repository. The one exception is `tags --write`, which makes only the release of a version that is on npm, in the last 14 days. So `--write` refuses a start date that is older than 14 days. A dry run reads older dates.
+`--write` refuses a start date that is older than 14 days. A dry run reads older dates. The rule for a local run with the token of the owner is in `CLAUDE.md`.
 
 | State | Meaning |
 |---|---|
