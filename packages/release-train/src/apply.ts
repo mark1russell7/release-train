@@ -2,7 +2,8 @@ import { createHash, createHmac } from "node:crypto";
 import semver from "semver";
 import { pool } from "./collect.ts";
 import type { GitHub } from "./github.ts";
-import type { Action, Plan } from "./plan.ts";
+import { adoptWhy, moveSets } from "./plan.ts";
+import type { Action, ActionItem, Plan } from "./plan.ts";
 import type { DepType, LockKind } from "./types.ts";
 import { ownScopes } from "./settings.ts";
 import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, apiFiles, syncBody, syncNeeds, syncRepo } from "./sync.ts";
@@ -42,6 +43,14 @@ export interface UpdateItem {
   why: string;
 }
 
+/** The items of an adoption that stay for a later run. The names are only in the pull request of the repository. */
+export interface HeldItems {
+  /** The count of the items. */
+  items: number;
+  /** The packages of the items. */
+  deps: string[];
+}
+
 /** The combined update of one repository: one branch and one pull request. */
 export interface RepoUpdate {
   repo: string;
@@ -55,6 +64,8 @@ export interface RepoUpdate {
   /** The git submodules in the folders of the workspace. The train cannot install such a workspace from its clone. */
   submodules?: string[];
   items: UpdateItem[];
+  /** The items of the action that stay for a later run. Not set: the update has all items of the action. */
+  held?: HeldItems;
   /** The published packages of the repository that release with this update: the train adds their version bump. */
   releases?: ReleaseItem[];
   /** The scopes that the update puts into `minimumReleaseAgeExclude` of pnpm, or null when the settings need no change. */
@@ -84,7 +95,7 @@ export interface ReleaseDone {
   via: "changeset" | "version";
 }
 
-/** An adoption that waits for a release of a package that it needs. */
+/** An adoption with no item that can go. */
 export interface WaitingUpdate {
   repo: string;
   private: boolean;
@@ -93,7 +104,7 @@ export interface WaitingUpdate {
   dependsOn: string[];
 }
 
-/** The adoptions of a plan, split into the adoptions of the current wave and the adoptions that wait. */
+/** The adoptions of a plan: an adoption with an item that can go is ready, each other adoption waits. */
 export interface Selection {
   ready: RepoUpdate[];
   waiting: WaitingUpdate[];
@@ -117,8 +128,24 @@ function isAdopt(a: Action): a is Action & { kind: "adopt-in-range" | "adopt-bre
 }
 
 /**
- * This function selects the adoptions that the train applies in this run. An adoption is ready when it waits for no action
- * of the plan and npm has the target version of each of its items. Each other adoption waits for a later run.
+ * This function gives the packages of an adoption that stay for a later run. These are the packages in `late`, and each
+ * package that must move with one of them. `carried` holds the packages that change a published range. They move together.
+ */
+function heldDeps(items: readonly ActionItem[], late: readonly string[], carried: readonly string[], sets: ReadonlyMap<string, number>): Set<string> {
+  const held = new Set(late);
+  for (let size = -1; size !== held.size; ) {
+    size = held.size;
+    const setsOfHeld = new Set([...held].map((d) => sets.get(d)));
+    for (const i of items) if (setsOfHeld.has(sets.get(i.dep))) held.add(i.dep);
+    if (carried.some((d) => held.has(d))) for (const d of carried) held.add(d);
+  }
+  return held;
+}
+
+/**
+ * This function selects the items that the train applies in this run. An item is ready when npm has its target version and
+ * nothing holds it (`heldDeps`). The ready items of a repository go, and a later run sends the other items.
+ * The plan does not change: its action stays one action with all its items, so the wave order of its waits stays.
  */
 export function selectUpdates(p: Plan, only: readonly string[] | null = null, cascade: readonly string[] | "all" = "all"): Selection {
   const latest = new Map(p.nodes.filter((n) => n.kind === "package").map((n) => [n.name, n.npmLatest]));
@@ -127,9 +154,12 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null, ca
   const scopes = ownScopes(p.owner);
   const ageRule = new Set(p.repos.filter((r) => r.needsAgeRule).map((r) => r.name));
   const ageScopes = (repo: string): string[] | null => (ageRule.has(repo) ? scopes : null);
+  const sets = moveSets([...latest.keys()], p.edges);
   // A breaking adoption of a public repository with a cascade release carries the version bump in the same pull request:
-  // after the merge, the plan no longer sees the need for the release. A release that waits for something else holds the adoption.
-  const releaseOf = new Map(p.actions.filter((a) => a.kind === "release" && !a.repoPrivate && a.packages.some((x) => x.bump !== null)).map((a) => [a.repo, a]));
+  // after the merge, the plan no longer sees the need for the release. A release that waits for something else holds the
+  // items that change a published range. A release is one action of a repository, and a repository can fix the versions of
+  // its packages together, so these items of all its packages go together or wait together.
+  const releaseOf = new Map(p.actions.filter((a) => a.kind === "release" && !a.repoPrivate).map((a) => [a.repo, a]));
   const pick = (repo: string): boolean => !only || only.includes(repo);
   const ready: RepoUpdate[] = [];
   const waiting: WaitingUpdate[] = [];
@@ -138,19 +168,26 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null, ca
     if (!isAdopt(a)) continue;
     needed.add(a.repo);
     if (!pick(a.repo)) continue;
-    const onNpm = a.items.every((i) => {
+    const onNpm = (i: ActionItem): boolean => {
       const l = latest.get(i.dep);
       return Boolean(l && semver.valid(l) && semver.valid(i.to) && semver.gte(l, i.to));
-    });
+    };
     const rel = a.kind === "adopt-breaking" ? releaseOf.get(a.repo) : undefined;
-    // A cascade that is not on for the repository (option --cascade) holds the adoption too.
-    const off = rel && cascade !== "all" && !cascade.includes(a.repo);
-    const relWaits = rel ? (off ? [`cascade-off:${rel.id}`] : rel.blocked ? [`blocked:${rel.id}`] : rel.dependsOn.filter((d) => d !== a.id)) : [];
-    if (a.dependsOn.length > 0 || !onNpm || relWaits.length > 0) {
+    const cascades = rel?.packages.some((x) => x.bump !== null) ? rel : undefined;
+    // A cascade that is not on for the repository (option --cascade) holds the published ranges too.
+    const off = cascades && cascade !== "all" && !cascade.includes(a.repo);
+    const relWaits = cascades ? (off ? [`cascade-off:${cascades.id}`] : cascades.blocked ? [`blocked:${cascades.id}`] : cascades.dependsOn.filter((d) => d !== a.id)) : [];
+    const releasing = new Set(rel?.packages.map((x) => x.name));
+    const carried = a.items.filter((i) => i.dependent !== null && releasing.has(i.dependent) && i.newRange && RUNTIME.has(i.type)).map((i) => i.dep);
+    const late = a.items.filter((i) => !onNpm(i)).map((i) => i.dep);
+    const held = heldDeps(a.items, relWaits.length > 0 ? [...late, ...carried] : late, carried, sets);
+    const going = a.items.filter((i) => !held.has(i.dep));
+    if (going.length === 0) {
       waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: [...a.dependsOn, ...relWaits] });
       continue;
     }
-    const releases: ReleaseItem[] = (rel?.packages ?? [])
+    const carries = relWaits.length === 0 && !carried.some((d) => held.has(d));
+    const releases: ReleaseItem[] = (carries ? (cascades?.packages ?? []) : [])
       .filter((x) => x.bump !== null && x.from !== null)
       .map((x) => ({
         name: x.name,
@@ -158,7 +195,7 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null, ca
         from: x.from as string,
         changes: a.items.filter((i) => i.dependent === x.name && i.newRange && RUNTIME.has(i.type)).map((i) => ({ dep: i.dep, type: i.type })),
       }));
-    const items: UpdateItem[] = a.items.map((i) => ({
+    const items: UpdateItem[] = going.map((i) => ({
       path: i.path,
       dependent: i.dependent,
       dep: i.dep,
@@ -173,12 +210,14 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null, ca
       repo: a.repo,
       private: a.repoPrivate,
       actionId: a.id,
-      kind: a.kind,
-      wave: a.wave,
-      why: a.why,
+      kind: items.some((i) => i.newRange) ? "adopt-breaking" : "adopt-in-range",
+      // Each item that goes waits for no action, so the update is in wave 0, also when the action is in a later wave.
+      wave: 0,
+      why: adoptWhy(a.repo, items),
       lockKind: lock.get(a.repo) ?? "none",
       ...(links.has(a.repo) ? { submodules: links.get(a.repo) ?? [] } : {}),
       items,
+      ...(held.size > 0 ? { held: { items: a.items.length - items.length, deps: [...held].sort() } } : {}),
       ageScopes: ageScopes(a.repo),
       ...(releases.length > 0 ? { releases } : {}),
       fingerprint: fingerprint(items, ageScopes(a.repo), releases),
@@ -296,6 +335,8 @@ export interface RepoResult {
   paced?: boolean;
   /** This value is true when the update changes a package of `urgent`. */
   urgent?: boolean;
+  /** The count of the items of the repository that stay for a later run. A private repository gives only this count. */
+  held?: number;
 }
 
 /** The result of one run of the train. */
@@ -530,6 +571,10 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
     const list = r.young.map((y) => `\`${y.dep}@${y.version}\` (ready at ${y.readyAt})`).join(", ");
     lines.push("", `These versions are younger than the minimumReleaseAge of pnpm, so a later run adds them: ${list}.`);
   }
+  if (u.held) {
+    const list = u.held.deps.map((d) => `\`${d}\``).join(", ");
+    lines.push("", `These packages wait for a release, or move with a package that waits, so a later run adds them: ${list}.`);
+  }
   lines.push("", `The train made the lockfile with \`${r?.tool ?? "the package manager of the repository"}\`. ${prTrailer(u.fingerprint)}`);
   return lines.join("\n");
 }
@@ -648,6 +693,11 @@ export function applySummary(r: ApplyReport): string {
   const wait = r.results.filter((x) => x.state === "waiting" && !x.paced);
   if (wait.length > 0) {
     lines.push(`Waiting for a release: ${wait.length}. Public: ${wait.filter((x) => !x.private).map((x) => x.repo).join(", ") || "none"}. Count of private repositories: ${wait.filter((x) => x.private).length}.`);
+  }
+  const held = r.results.filter((x) => x.held);
+  if (held.length > 0) {
+    const count = held.reduce((n, x) => n + (x.held ?? 0), 0);
+    lines.push(`Items that wait for a release: ${count} in ${held.length} repositories. Public: ${held.filter((x) => !x.private).map((x) => x.repo).join(", ") || "none"}. Count of private repositories: ${held.filter((x) => x.private).length}.`);
   }
   const paced = r.results.filter((x) => x.paced);
   if (paced.length > 0) {
@@ -843,7 +893,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    * the native auto-merge off, and merges or blocks the pull request from its CI state. The update pull requests and the template sync use it.
    */
   const publish = async (p: {
-    common: Pick<RepoResult, "repo" | "private" | "actionId" | "kind" | "wave" | "items" | "needs">;
+    common: Pick<RepoResult, "repo" | "private" | "actionId" | "kind" | "wave" | "items" | "needs" | "held">;
     branch: string;
     existing: Pull | null;
     meta: RepoMeta;
@@ -951,7 +1001,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     for (const u of pacing ? rotate(sel.ready, slot).sort((x, y) => rank(x) - rank(y)) : sel.ready) {
       const existing = open.get(u.repo) ?? null;
       const urgent = isUrgent(u);
-      const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length, ...(urgent ? { urgent } : {}) };
+      const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length, ...(urgent ? { urgent } : {}), ...(u.held ? { held: u.held.items } : {}) };
       if (u.lockKind === "yarn") {
         result({ ...common, state: "skipped", pr: prRef(existing), autoMerge: null, ci: null, detail: "The train cannot update a Yarn lockfile." });
         continue;

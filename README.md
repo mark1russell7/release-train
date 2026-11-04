@@ -51,7 +51,7 @@ The site at <https://mark1russell7.github.io/release-train/> is a plan explorer.
 
 `apply` makes the plan again from the real state, then changes the repositories. It keeps no state between runs.
 
-- It applies only the `adopt-in-range` and `adopt-breaking` actions of the current wave. Such an action waits for no other action, and npm has each target version.
+- It applies only the items that are ready. npm has the target version of such an item, and nothing holds it. Refer to "A partial update".
 - Each repository gets one branch `release-train/update` and one combined pull request. A next run updates that branch and does not open a second pull request.
 - A breaking adoption changes the range to a caret range of the new version (`^x.y.z`).
 - The lockfile comes from the package manager of the repository. For pnpm, the train sets each range to the exact target version and starts `pnpm install --lockfile-only`. Then it sets each range to its final value (the old range, or the new caret range) and starts the install again, and a check with `--frozen-lockfile` must pass. For npm, it uses `npm install` and `npm update` with `--package-lock-only`. The train does not write a lockfile itself.
@@ -75,10 +75,33 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 - `--report <file>` writes the report without private names.
 - `--author "Name <email>"` sets the author of the commits.
 - `--show-private` shows the private names in the output. Do not use it in CI.
-- `--cascade <repos>` sets the repositories (comma-separated) whose breaking adoptions carry a release, or `all` (the default). The adoptions of other repositories with a release wait.
+- `--cascade <repos>` sets the repositories (comma-separated) whose breaking adoptions carry a release, or `all` (the default). In other repositories with a release, the items that change a published range wait.
 - `--release-dispatch` starts the release workflows that start only by hand. Refer to "Releases".
 - `--max-pushes <n>` is the most branches that one run pushes (default 5). The update branches and the sync branches share this limit. The other repositories get `waiting`, and a later run pushes them.
 - `--urgent <packages>` names public packages with a security fix (comma-separated). Refer to "An urgent update".
+
+### A partial update
+
+An adopt action of the plan has all the items of one repository. One item with a target that is not on npm does not stop the other items. The train sends the ready items, and a later run sends the items that wait. The plan does not change, so the action stays in its wave and keeps its waits.
+
+An item waits in these three cases:
+
+- npm does not have its target version.
+- It is in one set with an item that waits. A peer range joins two packages. A runtime `workspace:` range also joins them, because npm gets an exact version of it. The sets include packages that the repository does not use itself. A `workspace:` range in `devDependencies` joins nothing, and a range of a private app joins nothing.
+- It changes a published range, and the release of the repository cannot go with it. Read the rule below.
+
+The plan does not group items by set. The train reads the sets from the edges of the plan. All items of one package in a repository go together or wait together, so the lockfile keeps one version of the package.
+
+**The rule for a package with a release of its own.** A release is one action of a repository, and a repository can fix the versions of its packages together. So the train keeps these items together: the items of a public repository that change a runtime range of a package with a release action.
+
+- They go in one pull request with the version bump when npm has each target and the release waits for no other action.
+- When one of these items waits, or the release is blocked, waits for another action or has its cascade off, all of them wait. No package publishes before a dependency that it must carry, and the wave and cascade order stay.
+- A lockfile item and an item in `devDependencies` change nothing on npm, so they do not wait for the release.
+- The train publishes no package of a private repository, so this rule does not apply there.
+
+One branch stays the design. A later run makes the update again from the default branch, with a new fingerprint, and it pushes to the open pull request. The train does not close the pull request for this. When no item can go, the repository is in the waiting list and an open pull request still merges on green.
+
+The body of the pull request gives the names of the packages that wait. The report gives only the count, in the field `held`, and the summary has one line for all repositories. A private repository stays a count or a hash.
 
 ### The pace of the pushes
 
@@ -88,7 +111,7 @@ One new version of a package that most repositories use changes approximately 35
 - An update push waits only for `--max-pushes`. A sync push also waits while 30 or more jobs run on the account. The account has so many jobs for most of a day, so that gate on an update push stops the train in silence. When the list of runs is not readable, a sync push waits only for the limit.
 - A branch that gets a new commit counts. A branch that has its changes on the current default branch needs no push. It does not wait, and the train merges or blocks its pull request.
 - At the limit, the train does not clone. A repository that waits has no cost, and an open pull request still merges on green or gets the blocked label. The next run reads the plan again, so it pushes the newest versions and skips the versions between.
-- An update is ready only when it waits for no action, so the pace cannot put a later wave first. An update that another action waits for goes first.
+- Each item of an update waits for no action, so the pace cannot put a later wave first. An update that another action waits for goes first.
 - The other updates move one place in the order every 30 minutes, so no repository stays at the end. The sync order moves too. The update pushes and the sync pushes go first in turn.
 - `--max-pushes 0` lets a run only merge or block.
 
@@ -109,7 +132,7 @@ You can also start the workflow `Train` on the Actions page of this repository. 
 - The push carries each other change of the update branch of that repository.
 - All other checks stay: the wave order, `--only`, `--cascade` and the provenance check. A closed pull request of a person and the Yarn and submodule skips also stay.
 - CI and the checks of each repository stay too. The train still merges only on green, in a later run.
-- The wave order stays, so an update in a later wave waits for its release. Give each package of the chain to go fast, and start a new run after each release.
+- The wave order stays, so an item that waits for a release does not go. Give each package of the chain to go fast, and start a new run after each release.
 - The age rule stays for each package that you do not name. The scopes `@<owner>/*` and `@procedures/*` have no wait in a repository whose settings exclude them.
 - A named package outside these scopes gets one entry in `minimumReleaseAgeExclude` of each repository with an age rule. The entry has the exact version, for example `fix@1.0.1`, so a newer version waits again. The pull request tells it.
 - A later run with no urgent names merges the pull requests, and it paces each push that is still due.
@@ -129,7 +152,7 @@ When a dependency gets a new version outside the range of a dependent (a new maj
 - When the repository has Prettier, each file that the train changed gets the format of the repository. The lockfiles stay.
 - The body of the pull request has a table "Releases" with each package, its version, the release type and the reason.
 - A private repository gets the pull request, but its packages are not published.
-- When the release of the dependent is blocked, its range change waits too.
+- When the release of the dependent is blocked, its range change waits too. Refer to "A partial update".
 
 After the merge, the release workflow of the repository publishes the new version with OIDC. Some release workflows start only by hand (for example with changesets: one start makes the version pull request, and one start after its merge publishes). With `--release-dispatch`, the train merges a green version pull request (branch `changeset-release/main`) and starts such a workflow when CI on `main` is green. This needs the permission Actions: write of the GitHub App.
 
