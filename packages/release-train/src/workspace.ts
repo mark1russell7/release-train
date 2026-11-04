@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import semver from "semver";
 import { changesetText, decideBump, setManifestVersion, typedFiles } from "./release.ts";
-import { ageRuleEdit, globMatch } from "./settings.ts";
+import { ageExcludeAdd, ageRuleEdit, globMatch, ownScopes } from "./settings.ts";
 import type { LockChange, ReleaseDone, RepoUpdate, UpdateResult, Updater, YoungItem } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
 import { TRAIN_BRANCH } from "./apply.ts";
@@ -408,6 +408,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
         // 0. The minimumReleaseAge of pnpm: CI refuses a lockfile with a younger version. Such an item waits.
         let tool: string | null = null;
         const youngBy = new Map<string, YoungItem>();
+        const urgentAge = new Set<string>();
         // The scopes of the owner go into minimumReleaseAgeExclude first, so the check below reads the new settings.
         let settingsChanged = false;
         let newSettingsFile = false;
@@ -432,10 +433,19 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
                 const t = Date.parse(times[i.to] ?? "");
                 if (Number.isNaN(t) || ageExcluded(policy.exclude, dep, i.to)) continue;
                 const readyAt = t + policy.minutes * 60_000;
-                if (readyAt > now()) youngBy.set(dep, { dep, version: i.to, readyAt: new Date(readyAt).toISOString() });
+                if (readyAt <= now()) continue;
+                if (u0.urgentDeps?.includes(dep)) urgentAge.add(`${dep}@${i.to}`);
+                else youngBy.set(dep, { dep, version: i.to, readyAt: new Date(readyAt).toISOString() });
               }
             }
           }
+        }
+        // A person named these versions as urgent. Only the exact version passes the age rule, in this repository.
+        if (urgentAge.size > 0) {
+          const existed = existsSync(wsFile);
+          writeFileSync(wsFile, ageExcludeAdd(existed ? readFileSync(wsFile, "utf8") : null, ownScopes(o.owner), [...urgentAge].sort()));
+          settingsChanged = true;
+          newSettingsFile ||= !existed;
         }
         const young = [...youngBy.values()];
         const u: RepoUpdate = { ...u0, items: u0.items.filter((i) => !youngBy.has(i.dep)) };
@@ -567,7 +577,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           ...u.items.map((i) => `- ${i.dep} in ${i.path || "."}: ${i.newRange ? `${i.range} -> ${i.newRange}` : i.range}, lockfile -> ${after[i.path]?.[i.dep] ?? i.to}`),
           ...releases.map((r) => `- release ${r.name}: ${r.from} -> ${r.to} (${r.type}, ${r.via === "changeset" ? "changeset" : "package.json"})`),
           ...(hooks.ran.length > 0 ? [`- version script: ${hooks.ran.map((p) => `${p}/package.json`).join(", ")}`] : []),
-          ...(settingsChanged ? [`- pnpm-workspace.yaml: ${(u.ageScopes ?? []).join(", ")} in minimumReleaseAgeExclude`] : []),
+          ...(settingsChanged ? [`- pnpm-workspace.yaml: ${[...(u.ageScopes ?? []), ...urgentAge].join(", ")} in minimumReleaseAgeExclude`] : []),
           ...(fixed.length > 0 ? [`- conventions fix: ${fixed.join(", ")}`] : []),
           ...(reverted.length > 0 ? [`- conventions fix removed, it broke typecheck: ${reverted.join(", ")}`] : []),
         ].join("\n");
@@ -580,7 +590,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
 
         // 7. No push when the branch already has the same content in the files of the train.
         const pushed = await pushHead(dir, sh, TRAIN_BRANCH, remote, ctx.rebuild);
-        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError } : {}) };
+        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(urgentAge.size > 0 ? { urgentAge: [...urgentAge].sort() } : {}), ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError } : {}) };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       } finally {

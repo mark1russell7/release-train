@@ -7,7 +7,7 @@ import type { RepoUpdate } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
 import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
-import { ageRuleEdit, needsAgeRule, ownScopes } from "./settings.ts";
+import { ageExcludeAdd, ageRuleEdit, needsAgeRule, ownScopes } from "./settings.ts";
 import type { Manifest, RepoSnapshot } from "./types.ts";
 import { gitUpdater, releaseAgePolicy } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
@@ -65,6 +65,35 @@ describe("ageRuleEdit", () => {
     const yaml = 'packages:\n  - a\nminimumReleaseAgeExclude:\n  - "@ex/*"\n  - "@tools/*"\n';
     expect(ageRuleEdit(yaml, SCOPES)).toEqual({ text: yaml, changed: false, removed: [] });
     expect(needsAgeRule({ lockKind: "pnpm", pnpmWorkspace: yaml, packageManager: "pnpm@12.0.0" }, SCOPES)).toBe(false);
+  });
+});
+
+describe("ageExcludeAdd", () => {
+  it("adds the exact version after the scopes and keeps the next setting", () => {
+    const yaml = 'minimumReleaseAgeExclude:\n  - "@ex/*"\n  - "@tools/*"\nonlyBuiltDependencies: []\n';
+    const text = ageExcludeAdd(yaml, SCOPES, ["fix@1.0.1"]);
+    expect(releaseAgePolicy(text, "", "12.0.0").exclude).toEqual([...SCOPES, "fix@1.0.1"]);
+    expect(text).toContain("onlyBuiltDependencies: []");
+  });
+
+  it("makes a new file with the scopes and the version", () => {
+    expect(releaseAgePolicy(ageExcludeAdd(null, SCOPES, ["fix@1.0.1"]), "", "12.0.0").exclude).toEqual([...SCOPES, "fix@1.0.1"]);
+  });
+
+  it("changes an inline list into a block list", () => {
+    const text = ageExcludeAdd("minimumReleaseAgeExclude: [a]\n", SCOPES, ["fix@1.0.1"]);
+    expect(releaseAgePolicy(text, "", "12.0.0").exclude).toEqual([...SCOPES, "a", "fix@1.0.1"]);
+  });
+
+  it("keeps the line endings of the file", () => {
+    const text = ageExcludeAdd('minimumReleaseAgeExclude:\r\n  - "@ex/*"\r\n  - "@tools/*"\r\n', SCOPES, ["fix@1.0.1"]);
+    expect(text).toContain('  - "fix@1.0.1"\r\n');
+    expect(text.replace(/\r\n/g, "")).not.toContain("\n");
+  });
+
+  it("does not add a version that the list has", () => {
+    const once = ageExcludeAdd(null, SCOPES, ["fix@1.0.1"]);
+    expect(ageExcludeAdd(once, SCOPES, ["fix@1.0.1"])).toBe(once);
   });
 });
 
@@ -173,6 +202,46 @@ describe("gitUpdater with the settings", () => {
     expect(r.young.map((y) => y.dep)).toEqual(["other"]);
     expect(r.status).not.toBe("young");
     expect(cmds.filter((c) => c.startsWith("pnpm install")).length).toBe(3);
+  });
+
+  it("does not wait for the exact young version of an urgent package, and the other package waits", async () => {
+    let written = "";
+    let commit = "";
+    const run: RunFn = async (cmd, args, opts) => {
+      if (cmd === "git" && args[0] === "clone") {
+        writeFileSync(join(opts.cwd, "package.json"), `${JSON.stringify({ name: "x", dependencies: { fix: "^1.0.0", other: "^1.0.0" } })}\n`);
+        writeFileSync(join(opts.cwd, "pnpm-workspace.yaml"), 'minimumReleaseAgeExclude:\n  - "@ex/*"\n  - "@procedures/*"\n');
+      }
+      if (cmd === "pnpm" && args[0] === "install") writeFileSync(join(opts.cwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      fix:\n        specifier: ^2.0.0\n        version: 2.0.0\n");
+      if (cmd === "git" && args[0] === "add") written = readFileSync(join(opts.cwd, "pnpm-workspace.yaml"), "utf8");
+      if (cmd === "git" && args[0] === "-c") commit = args.join(" ");
+      const out = cmd === "pnpm" && args[0] === "--version" ? "12.0.0\n" : cmd === "git" && args[0] === "status" ? " M pnpm-workspace.yaml\n" : "";
+      return { code: 0, stdout: out, stderr: "" };
+    };
+    const young: FetchFn = async () => new Response(JSON.stringify({ time: { "2.0.0": "2026-01-01T12:00:00.000Z" } }), { status: 200 });
+    const up = gitUpdater({ owner: "ex", token: "t", author: { name: "a", email: "a@b" }, run, fetch: young, now: () => Date.parse("2026-01-01T13:00:00.000Z") });
+    const item = (dep: string) => ({ path: "", dependent: "x", dep, type: "dependencies" as const, range: "^1.0.0", newRange: "^2.0.0", from: "1.0.0", to: "2.0.0", why: "w" });
+    const r = await up.update({ ...base, kind: "adopt-breaking", items: [item("fix"), item("other")], urgentDeps: ["fix"] }, { defaultBranch: "main", rebuild: false });
+    expect(r.young.map((y) => y.dep)).toEqual(["other"]);
+    expect(r.urgentAge).toEqual(["fix@2.0.0"]);
+    expect(r.status).not.toBe("young");
+    expect(releaseAgePolicy(written, "", "12.0.0").exclude).toEqual(["@ex/*", "@tools/*", "@procedures/*", "fix@2.0.0"]);
+    expect(commit).toContain("fix@2.0.0 in minimumReleaseAgeExclude");
+  });
+
+  it("adds no entry for an urgent package in a repository with no age rule", async () => {
+    let settings = false;
+    const run: RunFn = async (cmd, args, opts) => {
+      if (cmd === "git" && args[0] === "clone") writeFileSync(join(opts.cwd, "package.json"), `${JSON.stringify({ name: "x", dependencies: { fix: "^1.0.0" } })}\n`);
+      if (cmd === "git" && args[0] === "add" && args.includes("pnpm-workspace.yaml")) settings = true;
+      return { code: 0, stdout: cmd === "pnpm" && args[0] === "--version" ? "10.4.0\n" : "", stderr: "" };
+    };
+    const young: FetchFn = async () => new Response(JSON.stringify({ time: { "2.0.0": "2026-01-01T12:00:00.000Z" } }), { status: 200 });
+    const up = gitUpdater({ owner: "ex", token: "t", author: { name: "a", email: "a@b" }, run, fetch: young, now: () => Date.parse("2026-01-01T13:00:00.000Z") });
+    const item = { path: "", dependent: "x", dep: "fix", type: "dependencies" as const, range: "^1.0.0", newRange: "^2.0.0", from: "1.0.0", to: "2.0.0", why: "w" };
+    const r = await up.update({ ...base, ageScopes: null, kind: "adopt-breaking", items: [item], urgentDeps: ["fix"] }, { defaultBranch: "main", rebuild: false });
+    expect(r.urgentAge).toBeUndefined();
+    expect(settings).toBe(false);
   });
 });
 

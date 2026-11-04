@@ -59,6 +59,8 @@ export interface RepoUpdate {
   releases?: ReleaseItem[];
   /** The scopes that the update puts into `minimumReleaseAgeExclude` of pnpm, or null when the settings need no change. */
   ageScopes?: string[] | null;
+  /** The packages of the update that a person named as urgent. A young version of such a package does not wait. */
+  urgentDeps?: string[];
   fingerprint: string;
 }
 
@@ -236,6 +238,8 @@ export interface UpdateResult {
   unresolved: string[];
   /** The packages that wait for the minimumReleaseAge of pnpm. The update leaves them out. */
   young: YoungItem[];
+  /** The exact versions that the update puts into `minimumReleaseAgeExclude`, because a person named them as urgent. */
+  urgentAge?: string[];
   tool: string | null;
   error: string | null;
   /** The version bumps of the cascade that the update added. */
@@ -439,7 +443,7 @@ export function prTitle(u: RepoUpdate): string {
 }
 
 /** This function gives the body of the pull request of an update. */
-export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; fixError?: string | null }) | null): string {
+export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; fixError?: string | null; urgentAge?: string[] }) | null): string {
   const lockOf = new Map((r?.changes ?? []).map((c) => [`${c.path}|${c.dep}`, c]));
   const rows = u.items.map((i) => {
     const c = lockOf.get(`${i.path}|${i.dep}`);
@@ -513,6 +517,10 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
   else for (const c of other) lines.push(`- \`${c.dep}\` in \`${c.path || "."}\`: ${c.from ?? "none"} -> ${c.to ?? "removed"}`);
   if (r && r.unresolved.length > 0) {
     lines.push("", `The lockfile does not hold the target version of: ${r.unresolved.map((d) => `\`${d}\``).join(", ")}. A next run tries again.`);
+  }
+  if (r?.urgentAge && r.urgentAge.length > 0) {
+    const list = r.urgentAge.map((e) => `\`${e}\``).join(", ");
+    lines.push("", `A person named these versions as urgent, so \`minimumReleaseAgeExclude\` of \`pnpm-workspace.yaml\` gets each exact version: ${list}.`);
   }
   if (r?.young && r.young.length > 0) {
     const list = r.young.map((y) => `\`${y.dep}@${y.version}\` (ready at ${y.readyAt})`).join(", ");
@@ -981,7 +989,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           result({ ...common, state, ...(state === "waiting" ? { paced: true } : {}), pr: prRef(existing), autoMerge: s ? "train" : null, ci: s?.ci ?? null, detail });
           continue;
         }
-        const r = await o.updater.update(u, { defaultBranch: meta.default_branch, rebuild });
+        const urgentDeps = [...new Set(u.items.map((i) => i.dep).filter((dep) => urgentNames.has(dep)))];
+        const r = await o.updater.update(urgent ? { ...u, urgentDeps } : u, { defaultBranch: meta.default_branch, rebuild });
         if (r.status === "pushed" && !urgent) pushes += 1;
         if (r.status === "failed") {
           result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: `The update failed: ${r.error ?? "unknown error"}` });

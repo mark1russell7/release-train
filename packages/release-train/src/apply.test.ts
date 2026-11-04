@@ -726,6 +726,20 @@ describe("an urgent update", () => {
     expect(applySummary(r)).toContain("Urgent: 2 (waiting 2).");
   });
 
+  it("names only the urgent packages to the updater", async () => {
+    const seen: (string[] | undefined)[] = [];
+    const up: Updater = { async update(u) { seen.push(u.urgentDeps); return { status: "pushed", sha: "newsha", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
+    await apply({ owner: OWNER, plan: mixed(), gh: memory(all).gh, updater: up, dryRun: false, maxPushes: 9, urgent, now: slot(0) });
+    expect(seen.filter(Boolean)).toEqual([["@ex/fix"], ["@ex/fix"]]);
+    expect(seen.filter((names) => names === undefined).length).toBeGreaterThan(0);
+  });
+
+  it("tells a reader the exact versions that pass the age rule", () => {
+    const u = selectUpdates(mixed(), ["y-repo"]).ready[0];
+    if (!u) throw new Error("no update");
+    expect(prBody(u, { changes: [], unresolved: [], tool: "pnpm 12.0.0", young: [], urgentAge: ["fix@1.0.1"] })).toContain("gets each exact version: `fix@1.0.1`.");
+  });
+
   it("keeps the closed pull request of a person", async () => {
     const fp = selectUpdates(mixed(), ["y-repo"]).ready[0]?.fingerprint;
     const body = `x <!-- release-train:fingerprint=${fp} -->`;
