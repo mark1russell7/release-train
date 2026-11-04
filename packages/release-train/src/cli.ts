@@ -43,8 +43,10 @@ export interface CliOptions {
   sync: boolean;
   /** `plan` and `apply`: can the GitHub App change workflow files? `auto`: the first push that GitHub refuses tells. */
   workflows: WorkflowsMode;
-  /** `apply`: the most sync branches that one run pushes. */
+  /** `apply`: the most branches that one run pushes, for the update pushes and the sync pushes together. */
   maxPushes: number;
+  /** `apply`: the public packages with a security fix. Their updates go first and pass the limit of pushes. */
+  urgent: string[] | null;
 }
 
 /** This function reads the arguments of the command line. */
@@ -68,6 +70,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     sync: true,
     workflows: "auto",
     maxPushes: MAX_PUSHES,
+    urgent: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -84,6 +87,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--no-progress") o.progress = false;
     else if (a === "--dry-run") o.dryRun = true;
     else if (a === "--only") o.only = [...(o.only ?? []), ...value().split(",").map((x) => x.trim()).filter(Boolean)];
+    else if (a === "--urgent") o.urgent = [...(o.urgent ?? []), ...value().split(",").map((x) => x.trim()).filter(Boolean)];
     else if (a === "--report") o.report = value();
     else if (a === "--author") o.author = value();
     else if (a === "--show-private") o.showPrivate = true;
@@ -108,6 +112,11 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else throw new Error(`Unknown option ${a}.`);
   }
   return o;
+}
+
+/** This function gives the options of `apply` for the pace of the pushes. */
+export function paceOptions(o: Pick<CliOptions, "maxPushes" | "urgent">): { maxPushes: number; urgent: string[] | null } {
+  return { maxPushes: o.maxPushes, urgent: o.urgent };
 }
 
 /** This function gives a short text summary of the plan. */
@@ -258,10 +267,10 @@ async function runApply(o: CliOptions): Promise<number> {
             updater,
             facts: await syncFacts({ gh, owner: o.owner }),
             workflows: o.workflows,
-            maxPushes: o.maxPushes,
-            runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
           }
         : null,
+      ...paceOptions(o),
+      runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
       dryRun: o.dryRun,
       only: o.only,
       releaseDispatch: o.releaseDispatch,

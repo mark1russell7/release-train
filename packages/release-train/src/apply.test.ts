@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   BLOCKED_LABEL,
+  BUSY_LIMIT,
   CLAUDE_LINE,
+  RUN_MS,
   TRAIN_BRANCH,
   TRAIN_LABEL,
   apply,
@@ -14,6 +16,7 @@ import {
   latestRuns,
   prBody,
   publicReport,
+  rotate,
   selectUpdates,
 } from "./apply.ts";
 import type { RepoUpdate, UpdateResult, Updater } from "./apply.ts";
@@ -140,6 +143,8 @@ describe("apply", () => {
   it("changes nothing in a dry run", async () => {
     const { gh, calls } = server({
       [`GET ${base}/stale-repo/pulls`]: () => [200, [pull(3, "stale-repo")]],
+      [`GET ${base}/lib-repo`]: meta,
+      [`GET ${base}/secret-repo`]: meta,
     });
     const up = updater();
     const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: up, dryRun: true });
@@ -382,7 +387,7 @@ describe("apply", () => {
   });
 
   it("keeps each private name out of the log, the public report and the summary", async () => {
-    const { gh } = server({ [`GET ${base}/secret-repo/pulls`]: () => [200, [pull(7, "secret-repo")]] });
+    const { gh } = server({ [`GET ${base}/secret-repo/pulls`]: () => [200, [pull(7, "secret-repo")]], [`GET ${base}/lib-repo`]: meta, [`GET ${base}/secret-repo`]: meta });
     const lines: string[] = [];
     const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater(), dryRun: true, log: (l) => lines.push(l) });
     const pub = publicReport(r, "key");
@@ -390,6 +395,399 @@ describe("apply", () => {
     expect(text).not.toContain("secret");
     expect(text).toContain("lib-repo");
     expect(applySummary(pub)).toContain("Wave 0: 2 pull requests. Public: lib-repo. Count of private repositories: 1.");
+  });
+});
+
+/** A plan where each repository of `names` has one lockfile update of the same dev dependency. */
+function fan(names: readonly string[], priv: readonly string[] = []) {
+  const repos = [
+    repo("tool-repo", { "": { name: "@ex/tool", version: "1.1.0" } }),
+    ...names.map((n) => repo(n, { "": { name: n, private: true, devDependencies: { "@ex/tool": "^1.0.0" } } }, { private: priv.includes(n), resolved: { "": { "@ex/tool": "1.0.0" } } })),
+  ];
+  return plan(buildGraph({ owner: OWNER, repos, npm: { "@ex/tool": npm("1.1.0") }, now: new Date("2026-01-01T00:00:00Z") }));
+}
+
+/** The start of a run in the slot `n`. Slot 0 is even, so the update pushes go first. */
+const slot = (n: number): Date => new Date(n * RUN_MS);
+
+/** A GitHub that remembers the open pull requests of the train, so one run sees the pull requests of an earlier run. */
+function memory(names: readonly string[]) {
+  const prs = new Map<string, ReturnType<typeof pull>>();
+  const routes: Record<string, Handler> = {};
+  names.forEach((name, i) => {
+    const n = 10 + i;
+    routes[`GET ${base}/${name}`] = meta;
+    routes[`GET ${base}/${name}/pulls`] = (_b, u) => {
+      const pr = prs.get(name);
+      return [200, u.searchParams.get("state") === "open" && pr ? [pr] : []];
+    };
+    routes[`GET ${base}/${name}/pulls/${n}`] = () => [200, { ...prs.get(name), mergeable: true }];
+    routes[`POST ${base}/${name}/pulls`] = (b) => {
+      const pr = pull(n, name, { ...b, labels: [] });
+      prs.set(name, pr);
+      return [201, pr];
+    };
+    routes[`PATCH ${base}/${name}/pulls/${n}`] = () => [200, prs.get(name)];
+    routes[`POST ${base}/${name}/labels`] = () => [201, {}];
+    routes[`POST ${base}/${name}/issues/${n}/labels`] = () => [200, []];
+    routes[`GET ${base}/${name}/compare/main...sha${n}`] = () => [200, { behind_by: 0 }];
+    routes[`GET ${base}/${name}/commits/sha${n}/check-runs`] = () => [200, { check_runs: [{ status: "in_progress", conclusion: null }] }];
+    routes[`GET ${base}/${name}/commits/sha${n}/status`] = () => [200, { state: "pending", total_count: 0 }];
+  });
+  return { ...server(routes), prs };
+}
+
+/** An updater that pushes a branch one time. After it, the branch has the changes, as with the real updater. */
+function once(): Updater & { pushed: string[]; cloned: string[] } {
+  const pushed: string[] = [];
+  const cloned: string[] = [];
+  return {
+    pushed,
+    cloned,
+    async update(u) {
+      cloned.push(u.repo);
+      const first = !pushed.includes(u.repo);
+      if (first) pushed.push(u.repo);
+      return { status: first ? "pushed" : "same", sha: "newsha", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null };
+    },
+  };
+}
+
+const stateOf = (r: { results: { repo: string; state: string }[] }) => Object.fromEntries(r.results.map((x) => [x.repo, x.state]));
+
+describe("the pace of the update pushes", () => {
+  const names = ["a-repo", "b-repo", "c-repo", "d-repo", "e-repo"];
+
+  it("stops the update pushes at the limit, with no clone and no write for the repositories that wait", async () => {
+    const { gh, calls } = memory(names);
+    const up = once();
+    const r = await apply({ owner: OWNER, plan: fan(names), gh, updater: up, dryRun: false, maxPushes: 2, now: slot(0) });
+    expect(up.cloned).toEqual(["a-repo", "b-repo"]);
+    expect(stateOf(r)).toEqual({ "a-repo": "opened", "b-repo": "opened", "c-repo": "waiting", "d-repo": "waiting", "e-repo": "waiting" });
+    expect(calls.filter((c) => c.method !== "GET" && /(c|d|e)-repo/.test(c.path))).toEqual([]);
+    const waiting = r.results.find((x) => x.repo === "c-repo");
+    expect(waiting).toMatchObject({ paced: true, pr: null, ci: null, autoMerge: null });
+    expect(waiting?.detail).toContain("This run pushed 2 branches, the most of one run");
+    expect(applySummary(r)).toContain("Waiting for a later run: 3. Public: c-repo, d-repo, e-repo. Count of private repositories: 0.");
+    expect(applySummary(r)).not.toContain("Waiting for a release");
+  });
+
+  it("does not stop an update push while the runners are busy, and does not read the count of the runners", async () => {
+    const { gh } = memory(names);
+    const up = once();
+    let counts = 0;
+    const runnersBusy = async () => {
+      counts += 1;
+      return BUSY_LIMIT + 10;
+    };
+    const r = await apply({ owner: OWNER, plan: fan(names), gh, updater: up, dryRun: false, maxPushes: 2, runnersBusy, now: slot(0) });
+    expect(up.pushed).toEqual(["a-repo", "b-repo"]);
+    expect(counts).toBe(0);
+    expect(r.results.find((x) => x.repo === "c-repo")?.detail).not.toContain("jobs run on the runners");
+  });
+
+  it("takes a repository that waits in a later run, pushes each repository one time, and clones no waiting repository", async () => {
+    const { gh } = memory(names);
+    const p = fan(names);
+    const up = once();
+    const pushedBy: number[] = [];
+    let last = stateOf({ results: [] });
+    for (let n = 0; n < 3; n++) {
+      const before = up.pushed.length;
+      last = stateOf(await apply({ owner: OWNER, plan: p, gh, updater: up, dryRun: false, maxPushes: 2, now: slot(2 * n) }));
+      pushedBy.push(up.pushed.length - before);
+    }
+    expect(pushedBy).toEqual([2, 2, 1]);
+    expect([...up.pushed].sort()).toEqual(names);
+    expect(Object.values(last).includes("waiting")).toBe(false);
+  });
+
+  it("pushes the newest versions when a repository that waited gets its turn", async () => {
+    const { gh } = memory(["a-repo", "b-repo"]);
+    const up = once();
+    await apply({ owner: OWNER, plan: fan(["a-repo", "b-repo"]), gh, updater: up, dryRun: false, maxPushes: 1, now: slot(0) });
+    const newer = plan(buildGraph({
+      owner: OWNER,
+      repos: [
+        repo("tool-repo", { "": { name: "@ex/tool", version: "1.2.0" } }),
+        ...["a-repo", "b-repo"].map((n) => repo(n, { "": { name: n, private: true, devDependencies: { "@ex/tool": "^1.0.0" } } }, { resolved: { "": { "@ex/tool": "1.0.0" } } })),
+      ],
+      npm: { "@ex/tool": npm("1.2.0") },
+      now: new Date("2026-01-01T00:00:00Z"),
+    }));
+    const seen: string[] = [];
+    const record: Updater = { async update(u) { seen.push(`${u.repo} ${u.items[0]?.to ?? ""}`); return { status: "same", sha: "newsha", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
+    await apply({ owner: OWNER, plan: newer, gh, updater: record, dryRun: false, maxPushes: 5, now: slot(2) });
+    expect(seen).toContain("b-repo 1.2.0");
+  });
+
+  it("merges a green open pull request at the limit, with no clone", async () => {
+    const fp = selectUpdates(fixture(), ["secret-repo"]).ready[0]?.fingerprint;
+    const body = `x <!-- release-train:fingerprint=${fp} -->`;
+    const { gh, calls } = server({
+      ...green,
+      [`GET ${base}/secret-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo", { body })] : []],
+      [`GET ${base}/secret-repo/pulls/7`]: () => [200, pull(7, "secret-repo", { body })],
+      [`GET ${base}/secret-repo`]: meta,
+      [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
+      [`DELETE ${base}/secret-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+    });
+    const up = updater();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: up, dryRun: false, only: ["secret-repo"], maxPushes: 0, now: slot(0) });
+    expect(up.seen).toEqual([]);
+    expect(r.results[0]).toMatchObject({ state: "merged", ci: "green", autoMerge: "train" });
+    expect(r.results[0]).not.toHaveProperty("paced");
+    expect(calls.some((c) => c.method === "PUT")).toBe(true);
+  });
+
+  it("settles an open pull request whose push waits: green merges, red blocks, and a branch that is behind waits", async () => {
+    const run = async (checks: { status: string; conclusion: string | null }[], behind: number) => {
+      const s = server({
+        ...green,
+        [`GET ${base}/secret-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo")] : []],
+        [`GET ${base}/secret-repo/pulls/7`]: () => [200, { ...pull(7, "secret-repo"), mergeable: true }],
+        [`GET ${base}/secret-repo`]: meta,
+        [`GET ${base}/secret-repo/commits/sha7/check-runs`]: () => [200, { check_runs: checks }],
+        [`GET ${base}/secret-repo/compare/main...sha7`]: () => [200, { behind_by: behind }],
+        [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
+        [`DELETE ${base}/secret-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+        [`POST ${base}/secret-repo/issues/7/labels`]: () => [200, []],
+      });
+      const up = updater();
+      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: ["secret-repo"], maxPushes: 0, now: slot(0) });
+      expect(up.seen).toEqual([]);
+      return { x: r.results[0], calls: s.calls };
+    };
+    const ok = { status: "completed", conclusion: "success" };
+    expect((await run([ok], 0)).x).toMatchObject({ state: "merged", ci: "green" });
+    const red = await run([{ status: "completed", conclusion: "failure" }], 0);
+    expect(red.x).toMatchObject({ state: "blocked", ci: "failed" });
+    expect(red.calls.find((c) => c.path === `${base}/secret-repo/issues/7/labels`)?.body).toEqual({ labels: [BLOCKED_LABEL] });
+    const behind = await run([ok], 2);
+    expect(behind.x).toMatchObject({ state: "waiting", ci: "green", paced: true, pr: { number: 7 } });
+    expect(behind.x?.detail).toContain("2 commit(s) behind main");
+    expect(behind.x?.detail).toContain("the most of one run");
+    expect(behind.calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  it("counts only a real push: a clone that pushes nothing leaves the limit free, and a branch that has its changes can still push", async () => {
+    const quiet = updater({ status: "young", sha: null, young: [{ dep: "@ex/tool", version: "1.1.0", readyAt: "2026-01-02T00:00:00.000Z" }] });
+    await apply({ owner: OWNER, plan: fan(names), gh: memory(names).gh, updater: quiet, dryRun: false, maxPushes: 1, now: slot(0) });
+    expect(quiet.seen).toHaveLength(names.length);
+
+    const two = ["a-repo", "b-repo"];
+    const m = memory(two);
+    const fp = selectUpdates(fan(two), ["a-repo"]).ready[0]?.fingerprint;
+    m.prs.set("a-repo", pull(10, "a-repo", { body: `x <!-- release-train:fingerprint=${fp} -->` }));
+    const up = updater();
+    const r = await apply({ owner: OWNER, plan: fan(two), gh: m.gh, updater: up, dryRun: false, maxPushes: 1, now: slot(0) });
+    expect(up.seen.map((u) => u.repo)).toEqual(["a-repo"]);
+    expect(stateOf(r)).toEqual({ "a-repo": "updated", "b-repo": "waiting" });
+  });
+
+  it("gives each repository a turn when the first repositories need a push in each run", async () => {
+    const m = memory(names);
+    const p = fan(names);
+    const up = updater();
+    for (let n = 0; n < names.length; n++) {
+      m.prs.clear();
+      await apply({ owner: OWNER, plan: p, gh: m.gh, updater: up, dryRun: false, maxPushes: 1, now: slot(n) });
+    }
+    expect(up.seen.map((u) => u.repo).sort()).toEqual(names);
+    expect(rotate(["a", "b", "c"], 4)).toEqual(["b", "c", "a"]);
+    expect(rotate([], 4)).toEqual([]);
+  });
+
+  describe("and the waves", () => {
+    /** mid-repo adopts @ex/base and then releases. top-repo waits for that release. The other repositories only adopt. */
+    const waves = () => {
+      const repos = [
+        repo("base-repo", { "": { name: "@ex/base", version: "2.0.0" } }),
+        repo("mid-repo", { "": { name: "@ex/mid", version: "1.0.0", dependencies: { "@ex/base": "^1.0.0" } } }, { resolved: { "": { "@ex/base": "1.0.0" } } }),
+        repo("top-repo", { "": { name: "top", private: true, dependencies: { "@ex/mid": "^1.0.0" } } }, { resolved: { "": { "@ex/mid": "1.0.0" } } }),
+        ...["a-repo", "b-repo", "z-repo"].map((n) => repo(n, { "": { name: n, private: true, devDependencies: { "@ex/base": "^1.0.0" } } }, { resolved: { "": { "@ex/base": "1.0.0" } } })),
+      ];
+      return plan(buildGraph({ owner: OWNER, repos, npm: { "@ex/base": npm("2.0.0"), "@ex/mid": npm("1.0.0") }, now: new Date("2026-01-01T00:00:00Z") }));
+    };
+    const all = ["mid-repo", "top-repo", "a-repo", "b-repo", "z-repo"];
+
+    it("keeps a later wave behind the earlier wave, and pushes first the update that a later wave waits for", async () => {
+      const p = waves();
+      const later = selectUpdates(p).waiting.find((w) => w.repo === "top-repo");
+      expect(later?.dependsOn).toContain("release:mid-repo");
+      expect(selectUpdates(p).ready.every((u) => u.wave === 0)).toBe(true);
+      for (let n = 0; n < 8; n++) {
+        const up = once();
+        const r = await apply({ owner: OWNER, plan: p, gh: memory(all).gh, updater: up, dryRun: false, maxPushes: 1, now: slot(n) });
+        expect(up.pushed).toEqual(["mid-repo"]);
+        const top = r.results.find((x) => x.repo === "top-repo");
+        expect(top).toMatchObject({ state: "waiting" });
+        expect(top).not.toHaveProperty("paced");
+      }
+    });
+
+    it("does not deadlock: the limit stops no wave for good, and the later wave stays out of the count", async () => {
+      const m = memory(all);
+      const p = waves();
+      const up = once();
+      for (let n = 0; n < 4; n++) await apply({ owner: OWNER, plan: p, gh: m.gh, updater: up, dryRun: false, maxPushes: 1, now: slot(2 * n) });
+      expect([...up.pushed].sort()).toEqual(["a-repo", "b-repo", "mid-repo", "z-repo"]);
+    });
+  });
+
+  it("reports the same plan in a dry run, and pushes nothing", async () => {
+    const two = ["a-repo", "b-repo"];
+    const fp = selectUpdates(fan(names), ["a-repo"]).ready[0]?.fingerprint;
+    const seed = (m: ReturnType<typeof memory>) => m.prs.set("a-repo", pull(10, "a-repo", { body: `x <!-- release-train:fingerprint=${fp} -->` }));
+    const options = { owner: OWNER, plan: fan(names), maxPushes: 2, now: slot(0) };
+    const dry = memory(names);
+    seed(dry);
+    const dryUp = once();
+    const planned = await apply({ ...options, gh: dry.gh, updater: dryUp, dryRun: true });
+    expect(dry.calls.every((c) => c.method === "GET")).toBe(true);
+    expect(dryUp.cloned).toEqual([]);
+    expect(planned.results.find((x) => x.repo === "a-repo")?.detail).toContain("keeps PR #10");
+    const real = memory(names);
+    seed(real);
+    // The branch of a-repo has its changes, so its update pushes nothing.
+    const realUp = once();
+    realUp.pushed.push("a-repo");
+    const done = await apply({ ...options, gh: real.gh, updater: realUp, dryRun: false });
+    const asPlanned = (s: string): string => (s === "waiting" ? "waiting" : "planned");
+    expect(Object.fromEntries(planned.results.map((x) => [x.repo, x.state]))).toEqual(Object.fromEntries(done.results.map((x) => [x.repo, asPlanned(x.state)])));
+    expect(planned.results.filter((x) => x.state === "waiting").map((x) => x.repo)).toEqual(names.filter((n) => !two.includes(n) && n !== "c-repo"));
+  });
+
+  it("keeps each private name out of the report of a repository that waits", async () => {
+    const lines: string[] = [];
+    const list = ["a-repo", "secret-repo"];
+    const r = await apply({ owner: OWNER, plan: fan(list, ["secret-repo"]), gh: memory(list).gh, updater: once(), dryRun: false, maxPushes: 0, now: slot(0), log: (l) => lines.push(l) });
+    const pub = publicReport(r, "key");
+    const text = `${lines.join("\n")}\n${applySummary(pub)}\n${JSON.stringify(pub)}`;
+    expect(text).not.toContain("secret");
+    expect(applySummary(pub)).toContain("Waiting for a later run: 2. Public: a-repo. Count of private repositories: 1.");
+  });
+});
+
+describe("an urgent update", () => {
+  /** y-repo and z-repo adopt the fix of @ex/fix. They are the last of the plan. a-repo and b-repo adopt another package. */
+  const mixed = (priv: readonly string[] = []) => {
+    const dev = (n: string, dep: string) => repo(n, { "": { name: n, private: true, devDependencies: { [dep]: "^1.0.0" } } }, { private: priv.includes(n), resolved: { "": { [dep]: "1.0.0" } } });
+    const repos = [
+      repo("fix-repo", { "": { name: "@ex/fix", version: "1.0.1" } }),
+      repo("other-repo", { "": { name: "@ex/other", version: "1.1.0" } }),
+      dev("a-repo", "@ex/other"),
+      dev("b-repo", "@ex/other"),
+      dev("y-repo", "@ex/fix"),
+      dev("z-repo", "@ex/fix"),
+    ];
+    return plan(buildGraph({ owner: OWNER, repos, npm: { "@ex/fix": npm("1.0.1"), "@ex/other": npm("1.1.0") }, now: new Date("2026-01-01T00:00:00Z") }));
+  };
+  const all = ["a-repo", "b-repo", "y-repo", "z-repo"];
+  const urgent = ["@ex/fix"];
+
+  it("passes the limit of pushes, and does not use the count", async () => {
+    const up = once();
+    const r = await apply({ owner: OWNER, plan: mixed(), gh: memory(all).gh, updater: up, dryRun: false, maxPushes: 1, urgent, now: slot(0) });
+    expect(up.pushed).toEqual(["y-repo", "z-repo", "a-repo"]);
+    expect(stateOf(r)).toEqual({ "y-repo": "opened", "z-repo": "opened", "a-repo": "opened", "b-repo": "waiting" });
+  });
+
+  it("lets an update of another package wait, even with no room in the limit", async () => {
+    const up = once();
+    const r = await apply({ owner: OWNER, plan: mixed(), gh: memory(all).gh, updater: up, dryRun: false, maxPushes: 0, urgent, now: slot(0) });
+    expect(up.pushed).toEqual(["y-repo", "z-repo"]);
+    expect(r.results.find((x) => x.repo === "a-repo")).toMatchObject({ state: "waiting", paced: true });
+    expect(r.results.find((x) => x.repo === "a-repo")).not.toHaveProperty("urgent");
+    expect(r.results.find((x) => x.repo === "y-repo")).toMatchObject({ urgent: true });
+    expect(r.results.find((x) => x.repo === "y-repo")).not.toHaveProperty("paced");
+    expect(applySummary(r)).toContain("Urgent: 2 (opened 2). Public: y-repo, z-repo. Count of private repositories: 0.");
+    expect(applySummary(r)).toContain("Waiting for a later run: 2. Public: a-repo, b-repo.");
+  });
+
+  it("goes first in each slot of the rotation", async () => {
+    for (let n = 0; n < 8; n++) {
+      const up = once();
+      await apply({ owner: OWNER, plan: mixed(), gh: memory(all).gh, updater: up, dryRun: false, maxPushes: 0, urgent, now: slot(n) });
+      expect([...up.cloned].sort()).toEqual(["y-repo", "z-repo"]);
+      const order = once();
+      await apply({ owner: OWNER, plan: mixed(), gh: memory(all).gh, updater: order, dryRun: false, maxPushes: 9, urgent, now: slot(n) });
+      expect([...order.cloned.slice(0, 2)].sort()).toEqual(["y-repo", "z-repo"]);
+    }
+  });
+
+  it("keeps the age rule: a young version waits, and the run reports it", async () => {
+    const up = updater({ status: "young", sha: null, young: [{ dep: "@ex/fix", version: "1.0.1", readyAt: "2026-01-02T00:00:00.000Z" }] });
+    const r = await apply({ owner: OWNER, plan: mixed(), gh: memory(all).gh, updater: up, dryRun: false, maxPushes: 0, urgent, now: slot(0) });
+    const y = r.results.find((x) => x.repo === "y-repo");
+    expect(y).toMatchObject({ state: "waiting", urgent: true });
+    expect(y?.detail).toContain("minimumReleaseAge");
+    expect(y?.detail).toContain("2026-01-02T00:00:00.000Z");
+    expect(applySummary(r)).toContain("Urgent: 2 (waiting 2).");
+  });
+
+  it("keeps the closed pull request of a person", async () => {
+    const fp = selectUpdates(mixed(), ["y-repo"]).ready[0]?.fingerprint;
+    const body = `x <!-- release-train:fingerprint=${fp} -->`;
+    const { gh } = server({
+      [`GET ${base}/y-repo`]: meta,
+      [`GET ${base}/y-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [] : [pull(4, "y-repo", { state: "closed", merged_at: null, body })]],
+    });
+    const up = once();
+    const r = await apply({ owner: OWNER, plan: mixed(), gh, updater: up, dryRun: false, only: ["y-repo"], urgent, maxPushes: 0, now: slot(0) });
+    expect(r.results[0]).toMatchObject({ state: "declined", urgent: true });
+    expect(up.cloned).toEqual([]);
+  });
+
+  it("keeps the wave order: an update that waits for a release stays out, and the run counts the name", async () => {
+    const repos = [
+      repo("base-repo", { "": { name: "@ex/base", version: "2.0.0" } }),
+      repo("mid-repo", { "": { name: "@ex/mid", version: "1.0.0", dependencies: { "@ex/base": "^1.0.0" } } }, { resolved: { "": { "@ex/base": "1.0.0" } } }),
+      repo("top-repo", { "": { name: "top", private: true, dependencies: { "@ex/mid": "^1.0.0" } } }, { resolved: { "": { "@ex/mid": "1.0.0" } } }),
+    ];
+    const p = plan(buildGraph({ owner: OWNER, repos, npm: { "@ex/base": npm("2.0.0"), "@ex/mid": npm("1.0.0") }, now: new Date("2026-01-01T00:00:00Z") }));
+    const up = once();
+    const r = await apply({ owner: OWNER, plan: p, gh: memory(["mid-repo", "top-repo"]).gh, updater: up, dryRun: false, maxPushes: 0, urgent: ["@ex/mid"], now: slot(0) });
+    expect(up.cloned).toEqual([]);
+    expect(r.results.find((x) => x.repo === "top-repo")).toMatchObject({ state: "waiting" });
+    expect(r.urgentUnused).toBe(1);
+    expect(applySummary(r)).toContain("Urgent names with no ready update: 1.");
+  });
+
+  it("pushes nothing in a dry run, and reports the same plan", async () => {
+    const m = memory(all);
+    const up = once();
+    const r = await apply({ owner: OWNER, plan: mixed(), gh: m.gh, updater: up, dryRun: true, maxPushes: 1, urgent, now: slot(0) });
+    expect(m.calls.every((c) => c.method === "GET")).toBe(true);
+    expect(up.cloned).toEqual([]);
+    expect(stateOf(r)).toEqual({ "y-repo": "planned", "z-repo": "planned", "a-repo": "planned", "b-repo": "waiting" });
+    expect(r.results.find((x) => x.repo === "y-repo")).toMatchObject({ urgent: true });
+  });
+
+  it("gives a private repository only as a count", async () => {
+    const lines: string[] = [];
+    const list = ["a-repo", "b-repo", "secret-repo", "z-repo"];
+    const repos = mixed(["y-repo"]);
+    const text = JSON.stringify(repos).replaceAll("y-repo", "secret-repo");
+    const r = await apply({ owner: OWNER, plan: JSON.parse(text) as typeof repos, gh: memory(list).gh, updater: once(), dryRun: false, maxPushes: 0, urgent, now: slot(0), log: (l) => lines.push(l) });
+    const pub = publicReport(r, "key");
+    const out = `${lines.join("\n")}\n${applySummary(pub)}\n${JSON.stringify(pub)}`;
+    expect(out).not.toContain("secret");
+    expect(applySummary(pub)).toContain("Urgent: 2 (opened 2). Public: z-repo. Count of private repositories: 1.");
+  });
+
+  it("ignores the name of a private package, and the report has only a count", async () => {
+    const repos = [
+      repo("hidden-repo", { "": { name: "@ex/hidden", version: "1.1.0" } }, { private: true }),
+      repo("a-repo", { "": { name: "a-repo", private: true, devDependencies: { "@ex/hidden": "^1.0.0" } } }, { resolved: { "": { "@ex/hidden": "1.0.0" } } }),
+    ];
+    const p = plan(buildGraph({ owner: OWNER, repos, npm: { "@ex/hidden": npm("1.1.0") }, now: new Date("2026-01-01T00:00:00Z") }));
+    const up = once();
+    const r = await apply({ owner: OWNER, plan: p, gh: memory(["a-repo"]).gh, updater: up, dryRun: false, maxPushes: 0, urgent: ["@ex/hidden"], now: slot(0) });
+    expect(up.cloned).toEqual([]);
+    expect(r.results.find((x) => x.repo === "a-repo")).toMatchObject({ state: "waiting", paced: true });
+    expect(r.urgentUnused).toBe(1);
+    expect(`${applySummary(publicReport(r, "key"))}\n${JSON.stringify(publicReport(r, "key"))}`).not.toContain("hidden");
   });
 });
 

@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { BUSY_LIMIT, TRAIN_LABEL, apply, applySummary, bodyFingerprint, busyRunners, publicReport, syncPrBody } from "./apply.ts";
+import { BUSY_LIMIT, RUN_MS, TRAIN_LABEL, apply, applySummary, bodyFingerprint, busyRunners, publicReport, syncPrBody } from "./apply.ts";
 import type { Updater } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
@@ -407,15 +407,15 @@ describe("apply with the template sync", () => {
   });
 
   it("waits for the next run after maxPushes pushes, and while the runners are busy", async () => {
-    const run = async (sync: { maxPushes?: number; runnersBusy?: () => Promise<number | null> }) => {
+    const run = async (pace: { maxPushes?: number; runnersBusy?: () => Promise<number | null> }) => {
       const { gh } = server(repoRoutes("demo-repo"));
       const up = syncer([]);
-      const r = await apply({ owner: OWNER, plan: onePlan("demo-repo"), gh, updater: noUpdates, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no", ...sync } });
+      const r = await apply({ owner: OWNER, plan: onePlan("demo-repo"), gh, updater: noUpdates, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, ...pace });
       return { up, r };
     };
     const capped = await run({ maxPushes: 0 });
     expect(capped.up.jobs).toEqual([]);
-    expect(capped.r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "waiting" });
+    expect(capped.r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "waiting", paced: true });
     expect(capped.r.results[0]?.detail).toContain("the most of one run");
     const busy = await run({ runnersBusy: async () => BUSY_LIMIT });
     expect(busy.up.jobs).toEqual([]);
@@ -425,6 +425,64 @@ describe("apply with the template sync", () => {
       expect(free.up.jobs).toHaveLength(1);
       expect(free.r.results[0]).toMatchObject({ state: "opened" });
     }
+  });
+
+  it("shares one limit with the update pushes, and each kind goes first in turn", async () => {
+    const snap: RepoSnapshot = { name: "demo-repo", private: false, defaultBranch: "main", manifests: [{ path: "", manifest: { name: "demo", private: true, devDependencies: { "@ex/tool": "^1.0.0" } } }], lockKind: "pnpm", resolved: { "": { "@ex/tool": "1.0.0" } }, warnings: [] };
+    const tool: RepoSnapshot = { name: "tool-repo", private: false, defaultBranch: "main", manifests: [{ path: "", manifest: { name: "@ex/tool", version: "1.1.0" } }], lockKind: "pnpm", resolved: {}, warnings: [] };
+    const p = plan(buildGraph({ owner: OWNER, repos: [snap, tool], npm: { "@ex/tool": { exists: true, latest: "1.1.0" } }, now: new Date("2026-01-01T00:00:00Z") }));
+    const run = async (slot: number, maxPushes: number) => {
+      const { gh } = server(repoRoutes("demo-repo"));
+      const up = syncer([]);
+      const seen: string[] = [];
+      const updater: Updater = { async update(u) { seen.push(u.repo); return { status: "pushed", sha: "s8", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
+      const r = await apply({ owner: OWNER, plan: p, gh, updater, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes, now: new Date(slot * RUN_MS) });
+      return { updates: seen.length, syncs: up.jobs.length, states: r.results.map((x) => `${x.kind === SYNC_KIND ? "sync" : "update"} ${x.state}`).sort() };
+    };
+    expect(await run(0, 1)).toEqual({ updates: 1, syncs: 0, states: ["sync waiting", "update opened"] });
+    expect(await run(1, 1)).toEqual({ updates: 0, syncs: 1, states: ["sync opened", "update waiting"] });
+    expect(await run(1, 2)).toEqual({ updates: 1, syncs: 1, states: ["sync opened", "update opened"] });
+  });
+
+  describe("on a busy account", () => {
+    const pkg = (name: string, dep: boolean): RepoSnapshot => ({ name, private: false, defaultBranch: "main", manifests: [{ path: "", manifest: dep ? { name: "demo", private: true, devDependencies: { "@ex/tool": "^1.0.0" } } : { name: "@ex/tool", version: "1.1.0" } }], lockKind: "pnpm", resolved: dep ? { "": { "@ex/tool": "1.0.0" } } : {}, warnings: [] });
+    const p = () => plan(buildGraph({ owner: OWNER, repos: [pkg("demo-repo", true), pkg("tool-repo", false)], npm: { "@ex/tool": { exists: true, latest: "1.1.0" } }, now: new Date("2026-01-01T00:00:00Z") }));
+    const run = async (o: { slot: number; busy: number; urgent?: string[] }) => {
+      const { gh } = server(repoRoutes("demo-repo"));
+      const order: string[] = [];
+      const inner = syncer([]);
+      const up: SyncUpdater = { sync: async (job, ctx) => { order.push("sync"); return inner.sync(job, ctx); } };
+      const updater: Updater = { async update() { order.push("update"); return { status: "pushed", sha: "s8", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
+      const r = await apply({ owner: OWNER, plan: p(), gh, updater, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes: 5, runnersBusy: async () => o.busy, urgent: o.urgent ?? null, now: new Date(o.slot * RUN_MS) });
+      return { order, sync: r.results.find((x) => x.kind === SYNC_KIND) };
+    };
+
+    it("stops a sync push and not an update push", async () => {
+      for (const slot of [0, 1]) {
+        const busy = await run({ slot, busy: BUSY_LIMIT });
+        expect(busy.order).toEqual(["update"]);
+        expect(busy.sync).toMatchObject({ state: "waiting", paced: true });
+        expect(busy.sync?.detail).toContain("a sync push waits at 30 or more");
+      }
+    });
+
+    it("gives the sync its turn when the account is not busy", async () => {
+      expect((await run({ slot: 1, busy: BUSY_LIMIT - 1 })).order).toEqual(["sync", "update"]);
+      expect((await run({ slot: 0, busy: BUSY_LIMIT - 1 })).order).toEqual(["update", "sync"]);
+    });
+
+    it("puts an urgent update before the sync, also in the turn of the sync", async () => {
+      expect((await run({ slot: 1, busy: 0, urgent: ["@ex/tool"] })).order).toEqual(["update", "sync"]);
+    });
+  });
+
+  it("gives the same waiting state in a dry run, and pushes nothing", async () => {
+    const { gh, calls } = server(repoRoutes("demo-repo"));
+    const up = syncer([]);
+    const r = await apply({ owner: OWNER, plan: onePlan("demo-repo"), gh, updater: noUpdates, dryRun: true, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes: 0 });
+    expect(r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "waiting", paced: true });
+    expect(up.jobs).toEqual([]);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
   it("counts the jobs in progress of the runs in progress, and keeps the count for the time to live", async () => {

@@ -15,3 +15,4 @@ This file gives the items of the release train and their status. The Status page
 | RT7 | The train moves a repository only to a version that its own `release.yml` built | Done | #49 |
 | RT8 | The site: the README, the Releases page and the Status page on GitHub Pages | Done | #74 |
 | RT9 | The site: a plan explorer that runs the planner of the library in the browser | Done | #79 |
+| RT10 | The update pushes obey the limit of pushes, and an urgent update passes it | Done | #93 |
