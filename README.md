@@ -136,7 +136,9 @@ You can also start the workflow `Train` on the Actions page of this repository. 
 - The age rule stays for each package that you do not name. The scopes `@<owner>/*` and `@procedures/*` have no wait in a repository whose settings exclude them.
 - A named package outside these scopes gets one entry in `minimumReleaseAgeExclude` of each repository with an age rule. The entry has the exact version, for example `fix@1.0.1`, so a newer version waits again. The pull request tells it.
 - A later run with no urgent names merges the pull requests, and it paces each push that is still due.
-- One run can wait while another run operates. A newer run replaces the run that waits, so check that your run starts.
+- One run can wait while another run operates. A newer run replaces the run that waits. The newer run then takes the urgent names from the title of the replaced run, and the step summary tells it.
+- The newer run gives the names to all repositories, also when the replaced run had `only`.
+- A person who cancels a run that waits gets the same result as a replacement: the next run takes its names.
 - The summary has a line `Urgent` with the count and the states. Another line gives the count of the names that change no ready update.
 
 ## Releases

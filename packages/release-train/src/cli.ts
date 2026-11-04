@@ -6,10 +6,11 @@ import { writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
 import { plan } from "./plan.ts";
 import type { Plan } from "./plan.ts";
-import { gitHub } from "./github.ts";
+import { type GitHub, gitHub } from "./github.ts";
 import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
 import { awaitRelease } from "./release.ts";
+import { takeReplaced } from "./urgent.ts";
 import { SYNC_RULES, apiFiles, syncFacts, syncRepo, syncSummary } from "./sync.ts";
 import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
 import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tagsSummary, validDate } from "./tags.ts";
@@ -48,6 +49,8 @@ export interface CliOptions {
   maxPushes: number;
   /** `apply`: the public packages with a security fix. Their updates go first and pass the limit of pushes. */
   urgent: string[] | null;
+  /** `apply`: the run takes the urgent names of each run that it replaced. Only a live run sets this option. */
+  takeReplaced: boolean;
   /** `tags`: the start date, as `YYYY-MM-DD`. The command does not examine a version from before it. */
   since: string;
   /** `tags`: this option makes the missing releases. Without it, the command makes no write. */
@@ -76,6 +79,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     workflows: "auto",
     maxPushes: MAX_PUSHES,
     urgent: null,
+    takeReplaced: false,
     since: defaultSince(),
     write: false,
   };
@@ -101,6 +105,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--release-dispatch") o.releaseDispatch = true;
     else if (a === "--minutes") o.minutes = Number(value());
     else if (a === "--no-sync") o.sync = false;
+    else if (a === "--take-replaced") o.takeReplaced = true;
     else if (a === "--write") o.write = true;
     else if (a === "--since") {
       const v = value().trim();
@@ -126,6 +131,28 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   }
   if (o.write) checkWriteWindow(o.since);
   return o;
+}
+
+/**
+ * This function gives the urgent names of a run: its own names, and the names of each run that it replaced. A failed read
+ * does not stop the run. The function writes a warning, so a person sees that a replaced run can have urgent names.
+ */
+async function urgentNames(o: CliOptions, gh: GitHub, log: (l: string) => void): Promise<string[] | null> {
+  const repo = process.env["GITHUB_REPOSITORY"];
+  const self = Number(process.env["GITHUB_RUN_ID"]);
+  if (!o.takeReplaced || repo === undefined || !Number.isInteger(self)) return o.urgent;
+  try {
+    const taken = await takeReplaced(gh, repo, self);
+    if (taken.names.length === 0) return o.urgent;
+    const line = `Urgent names from the replaced runs ${taken.runs.join(", ")}: ${taken.names.join(", ")}.`;
+    log(line);
+    const summaryFile = process.env["GITHUB_STEP_SUMMARY"];
+    if (summaryFile) appendFileSync(summaryFile, `\n${line}\n`);
+    return [...new Set([...(o.urgent ?? []), ...taken.names])];
+  } catch (e) {
+    log(`::warning::The run cannot read the replaced runs, so it takes no urgent names from them: ${e instanceof Error ? e.message : String(e)}`);
+    return o.urgent;
+  }
 }
 
 /** This function gives the options of `apply` for the pace of the pushes. */
@@ -288,7 +315,7 @@ async function runApply(o: CliOptions): Promise<number> {
             workflows: o.workflows,
           }
         : null,
-      ...paceOptions(o),
+      ...paceOptions({ ...o, urgent: await urgentNames(o, gh, log) }),
       runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
       dryRun: o.dryRun,
       only: o.only,
