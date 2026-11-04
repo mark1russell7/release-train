@@ -300,7 +300,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    *
    * A fix can add the script `check:api`. That script fails until the repository has its reports, so the function writes
    * the first reports in the same commit: it updates the lockfile, builds and starts `api-report update`. When a step
-   * fails, the root `package.json` and the lockfile go back, so no update turns a repository red with no report beside it.
+   * fails, the root `package.json` and the lockfile go back. Thus an update cannot add the script without its reports.
    */
   const conventionsFix = async (dir: string, u: RepoUpdate, fixEnv: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<FixOutcome> => {
     const none: FixOutcome = { fixed: [], reverted: [], error: null };
@@ -341,7 +341,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
       return error === "" ? tail(result.stdout || result.stderr, 500) : error;
     };
     const scripts = readScripts(manifest);
-    /** This function keeps the fix when the typecheck allows it. */
+    /** This function keeps the fix when the typecheck passes, or when the fix is not the cause. */
     const typechecked = async (): Promise<FixOutcome> => {
       if (fixed.length === 0 || before === null || typeof scripts?.["typecheck"] !== "string") return { ...none, fixed };
       const typecheck = (): Promise<RunResult> => run(u.lockKind === "npm" ? "npm" : "pnpm", ["run", "typecheck"], { cwd: dir, env: fixEnv });

@@ -1063,7 +1063,7 @@ describe("gitUpdater and the first API report", () => {
   /** The clone has the script `start`. The fix adds `check:api` and writes LICENSE. The step `broken` fails. */
   const start = async (options: { had?: boolean; broken?: string; config?: string } = {}) => {
     const cmds: string[] = [];
-    const trees: string[] = [];
+    const trees: { manifest: string; lock: string }[] = [];
     let message = "";
     let manifest = "";
     let reportStayed = false;
@@ -1077,13 +1077,14 @@ describe("gitUpdater and the first API report", () => {
         writeFileSync(file, `${JSON.stringify({ name: "x", scripts, ...apiReport, devDependencies: { [CONVENTIONS]: "^0.8.0" } }, null, 2)}\n`);
       }
       if (cmd === "git" && args[0] === "write-tree") {
-        trees.push(readFileSync(file, "utf8"));
+        trees.push({ manifest: readFileSync(file, "utf8"), lock: readFileSync(join(opts.cwd, "pnpm-lock.yaml"), "utf8") });
         return { code: 0, stdout: `tree${String(trees.length)}\n`, stderr: "" };
       }
       if (cmd === "git" && args[0] === "show") {
         const [tree, name] = (args[1] ?? "").split(":");
-        const text = trees[Number((tree ?? "").slice(4)) - 1];
-        return name === "package.json" && text !== undefined ? { code: 0, stdout: text, stderr: "" } : { code: 128, stdout: "", stderr: "no such path" };
+        const saved = trees[Number((tree ?? "").slice(4)) - 1];
+        const text = name === "package.json" ? saved?.manifest : name === "pnpm-lock.yaml" ? saved?.lock : undefined;
+        return text !== undefined ? { code: 0, stdout: text, stderr: "" } : { code: 128, stdout: "", stderr: "no such path" };
       }
       if (cmd === "git" && args[0] === "ls-files") {
         const made = [REPORT, "packages/a/api.md", "LICENSE"].filter((name) => existsSync(join(opts.cwd, name)));
