@@ -36,4 +36,4 @@ Write all prose of this repository in the style of ASD-STE100 Simplified Technic
 - Use made-up names in test fixtures.
 - `plan.yml` uses only the default token and `--public-only`. Keep it so.
 - `train.yml` uses the token of the GitHub App, so it sees the private repositories. Its log, summary and artifact give each private repository only as a count or a hash. Keep it so.
-- A local run with the token of the owner writes only to a private repository.
+- A local run with the token of the owner writes only to a private repository. The one exception is `tags --write`, which makes only the release of a version that is on npm, in the last 14 days.

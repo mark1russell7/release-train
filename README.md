@@ -137,6 +137,39 @@ The report of `apply` lists the versions in flight. Such a version is on `main` 
 
 When CI of a train pull request fails, the pull request gets the label `release-train:blocked`. `plan --write-db` then writes an alert into the collection `alerts` of the tracker. The strategist tells the role that owns the repository.
 
+## Tag backfill
+
+The job `tag` of a release run uses the workflow token. GitHub refuses that token (HTTP 403) when the workflow files of the commit differ from the workflow files of each branch. A published version then has no git tag and no GitHub release. The token of the owner has the `workflow` scope, so a local run can do this step. The workflow files of the repositories do not change.
+
+```sh
+node packages/release-train/src/bin.ts tags
+node packages/release-train/src/bin.ts tags --since 2026-11-01 --only <repo>
+node packages/release-train/src/bin.ts tags --write
+```
+
+The command reads the packages of the plan, their versions on npm and the tags of each repository. It starts `gh` with an argument list and no shell. A default run makes no write. It shows each version with no tag and its state.
+
+`--write` refuses a start date that is older than 14 days. A dry run reads older dates. The rule for a local run with the token of the owner is in `CLAUDE.md`.
+
+| State | Meaning |
+|---|---|
+| `missing` | The commit of the version is on the default branch. `--write` makes the release. |
+| `created` | The run made the release. |
+| `failed` | The run did not make the release. The line tells the reason. |
+| `no-commit` | npm names no commit, or npm names two different commits. The version gets no tag. |
+| `off-branch` | The commit is not on the default branch. The version gets no tag. |
+| `young` | The version is younger than one hour, so its release run can still make the tag. |
+| `no-tag-job` | The `release.yml` of the repository has no tag job. Such a repository makes no tags on purpose. |
+| `error` | A read failed, so the version has no decision. The exit code is 1. |
+
+- The name of the tag follows the rule of `RELEASING.md`: `v<version>` in a repository with one published package, else `<name>@<version>`. A tag of the other form also counts, because a repository can get a second package later. This hides five versions. `polite-crawler-mcp` 0.2.0 to 0.2.4 have no tag of their own. The tags `v0.2.0` to `v0.2.4` of the repository `crawler` count for them.
+- The commit comes only from npm: the field `gitHead` of the version, or the commit of its provenance. The provenance must name the repository by its ID. Without one of these two, the version gets no tag.
+- The text of the release is the section of the version in the `CHANGELOG.md` at that commit. Without a section, the text is one line with a link to npm. This is the rule of `scripts/release/tags.ts` of the template.
+- Each release gets `--latest=false`, so an old version does not become the latest release. A version with a hyphen gets `--prerelease`.
+- `--since <YYYY-MM-DD>` sets the start date. The default is 14 days before today, in UTC. An older date also works. `--dry-run` wins over `--write`.
+- npm data decides the window first, so a package with no version in the window starts no `gh` process. Each repository gets one read of its tags. The output gives the count of `gh` processes.
+- `--only`, `--public-only`, `--show-private`, `--json` and `--out <file>` work as in the other commands. The output gives each private name only as a hash.
+
 ## Stage 3: template sync
 
 The template sync keeps the files from the repository `template` current in each other repository. Each rule is data in `SYNC_RULES` (`src/sync.ts`): an id, a reason and a check that gives the edits. To add a rule, add an object to this list.
