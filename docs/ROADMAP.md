@@ -19,3 +19,4 @@ This file gives the items of the release train and their status. The Status page
 | RT11 | An urgent package passes the age rule with its exact version | Done | #95 |
 | RT12 | The tag backfill: a published version with no tag gets its release from a local run | Done | #97 |
 | RT13 | A run sends the ready items of a repository, and only the other items wait | Done | #98 |
+| RT14 | The first API report builds each package when the root has no script `build`, and a failure keeps its reason | Done | #101 |
