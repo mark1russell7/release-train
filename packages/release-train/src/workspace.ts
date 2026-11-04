@@ -179,6 +179,21 @@ function tail(s: string, n = 800): string {
   return t.length > n ? `...${t.slice(-n)}` : t;
 }
 
+/**
+ * This function gives the lines of a tool output that tell a failure. A line that names an error stays. When that
+ * line ends with a colon, the indented lines below it stay too, because they hold the reason (`api-report` prints so).
+ */
+function errorLines(text: string): string[] {
+  const kept: string[] = [];
+  let heading = false;
+  for (const line of text.split("\n")) {
+    const named = /error/i.test(line);
+    heading = (heading && /^\s+\S/.test(line)) || (named && line.trimEnd().endsWith(":"));
+    if (named || heading) kept.push(line);
+  }
+  return kept;
+}
+
 /** This function reads the scripts of a package.json. It gives undefined when the file has none or does not parse. */
 function readScripts(file: string): Record<string, unknown> | undefined {
   try {
@@ -301,6 +316,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    * A fix can add the script `check:api`. That script fails until the repository has its reports.
    * So the function writes the first reports in the same commit. It updates the lockfile, builds and starts `api-report update`. When a step
    * fails, the root `package.json` and the lockfile go back. Thus an update cannot add the script without its reports.
+   * The build follows CI: the root script when the repository has one, else the script of each package.
    */
   const conventionsFix = async (dir: string, u: RepoUpdate, fixEnv: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<FixOutcome> => {
     const none: FixOutcome = { fixed: [], reverted: [], error: null };
@@ -337,7 +353,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
       return none;
     }
     const firstLines = (result: RunResult): string => {
-      const error = `${result.stdout}\n${result.stderr}`.split("\n").filter((line) => /error/i.test(line)).slice(0, 5).join("\n");
+      const error = errorLines(`${result.stdout}\n${result.stderr}`).slice(0, 5).join("\n");
       return error === "" ? tail(result.stdout || result.stderr, 500) : error;
     };
     const scripts = readScripts(manifest);
@@ -359,10 +375,12 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     if (hadApiCheck || before === null || typeof readScripts(manifest)?.[API_SCRIPT] !== "string") return outcome;
     const npm = u.lockKind === "npm";
     const quiet = ["--ignore-scripts", "--no-audit", "--no-fund"];
+    const workspaces = (JSON.parse(readFileSync(manifest, "utf8")) as { workspaces?: unknown }).workspaces !== undefined;
+    const eachBuild: readonly (readonly [string, readonly string[]])[] = npm ? (workspaces ? [["npm", ["run", "build", "--workspaces", "--if-present"]]] : []) : [["pnpm", ["-r", "--if-present", "run", "build"]]];
     const steps: readonly (readonly [string, readonly string[]])[] = [
       npm ? ["npm", ["install", "--package-lock-only", ...quiet]] : ["pnpm", ["install", "--lockfile-only"]],
       npm ? ["npm", ["ci", ...quiet]] : ["pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"]],
-      ...(typeof scripts?.["build"] === "string" ? [[npm ? "npm" : "pnpm", ["run", "build"]] as const] : []),
+      ...(typeof scripts?.["build"] === "string" ? [[npm ? "npm" : "pnpm", ["run", "build"]] as const] : eachBuild),
       npm ? ["npm", ["exec", "--", "api-report", "update"]] : ["pnpm", ["exec", "api-report", "update"]],
     ];
     const untracked = async (): Promise<string[]> => {

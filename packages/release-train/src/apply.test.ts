@@ -1061,7 +1061,7 @@ describe("gitUpdater and the first API report", () => {
   const REPORT = "packages/a/test/api/public-api.txt";
 
   /** The clone has the script `start`. The fix adds `check:api` and writes LICENSE. The step `broken` fails. */
-  const start = async (options: { had?: boolean; broken?: string; config?: string } = {}) => {
+  const start = async (options: { had?: boolean; broken?: string; config?: string; noBuild?: boolean; noReport?: string } = {}) => {
     const cmds: string[] = [];
     const trees: { manifest: string; lock: string }[] = [];
     let message = "";
@@ -1073,7 +1073,7 @@ describe("gitUpdater and the first API report", () => {
       const file = join(opts.cwd, "package.json");
       if (cmd === "git" && args[0] === "clone") {
         const apiReport = options.config === undefined ? {} : { apiReport: { report: options.config } };
-        const scripts = { build: "tsc", ...(options.had === true ? { "check:api": "api-report check" } : {}) };
+        const scripts = { ...(options.noBuild === true ? {} : { build: "tsc" }), ...(options.had === true ? { "check:api": "api-report check" } : {}) };
         writeFileSync(file, `${JSON.stringify({ name: "x", scripts, ...apiReport, devDependencies: { [CONVENTIONS]: "^0.8.0" } }, null, 2)}\n`);
       }
       if (cmd === "git" && args[0] === "write-tree") {
@@ -1104,6 +1104,7 @@ describe("gitUpdater and the first API report", () => {
         return { code: 0, stdout: JSON.stringify({ changed: ["package.json", "LICENSE"], passes: 2, failed: false }), stderr: "" };
       }
       if (options.broken !== undefined && line.startsWith(options.broken)) return { code: 1, stdout: "", stderr: "src/a.ts(1,1): error TS2307: Cannot find module.\n" };
+      if (options.noReport !== undefined && line === "pnpm exec api-report update") return { code: 1, stdout: `Errors:\n  packages/a: ${options.noReport}\n\nNext line.\n`, stderr: "" };
       if (cmd === "pnpm" && args[0] === "exec" && args[1] === "api-report") {
         mkdirSync(join(opts.cwd, "packages/a/test/api"), { recursive: true });
         writeFileSync(join(opts.cwd, REPORT), "report\n");
@@ -1132,6 +1133,21 @@ describe("gitUpdater and the first API report", () => {
     expect(message).toContain(`- conventions fix: package.json, LICENSE, ${REPORT}`);
     expect(cmds.slice(0, cmds.findIndex((c) => c.includes(" commit ")))).toContain(`git add -A -- package.json LICENSE ${REPORT}`);
     expect(manifest).toContain("check:api");
+  });
+
+  it("builds each package when the root has no script build, as CI does", async () => {
+    const { cmds, result } = await start({ noBuild: true });
+    const built = cmds.indexOf("pnpm -r --if-present run build");
+    expect(built).toBeGreaterThan(-1);
+    expect(cmds).not.toContain("pnpm run build");
+    expect(built).toBeLessThan(cmds.indexOf("pnpm exec api-report update"));
+    expect(result).toMatchObject({ status: "pushed", fixed: ["package.json", "LICENSE", REPORT] });
+  });
+
+  it("gives the reason of the report in the indented lines below the heading", async () => {
+    const { result } = await start({ noReport: ".: build/index.d.ts is missing. Build the package first." });
+    expect(result.fixError).toBe("Errors:\n  packages/a: .: build/index.d.ts is missing. Build the package first.");
+    expect(prBody(update(), result)).toContain("is missing. Build the package first.");
   });
 
   it("uses the report file that the repository names", async () => {
