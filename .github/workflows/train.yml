@@ -4,6 +4,8 @@
 # Privacy: the log, the step summary and the artifact give each private repository only as a count or a hash.
 # The apply command also masks each private name in the log.
 name: Train
+# The title holds the urgent names, because a replaced run has no other record of them (packages/release-train/src/urgent.ts).
+run-name: ${{ inputs.dry-run && 'Train dry run' || inputs.urgent != '' && format('Train urgent {0}', inputs.urgent) || inputs.only != '' && format('Train only {0}', inputs.only) || 'Train' }}
 
 on:
   workflow_dispatch:
@@ -104,7 +106,7 @@ jobs:
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ]; then dry=false; else dry=true; fi
           args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR")
-          if [ "$dry" != "false" ]; then args+=(--dry-run); fi
+          if [ "$dry" != "false" ]; then args+=(--dry-run); else args+=(--take-replaced); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
           if [ -n "$URGENT" ]; then args+=(--urgent "$URGENT"); fi
           if [ "$RELEASE_DISPATCH" = "true" ]; then args+=(--release-dispatch); fi

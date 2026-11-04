@@ -43,6 +43,18 @@ describe("the urgent input of train.yml", () => {
     expect(parseArgs(argsOfStep({ EVENT: "workflow_dispatch", INPUT_DRY: "true", URGENT: "@ex/a" })).dryRun).toBe(true);
   });
 
+  it("writes the names in the title of the run, because a replaced run has no other record of them", () => {
+    expect(workflow).toContain("format('Train urgent {0}', inputs.urgent)");
+    expect(workflow).toContain("inputs.dry-run && 'Train dry run'");
+  });
+
+  it("takes the names of a replaced run only in a live run", () => {
+    expect(parseArgs(argsOfStep({ EVENT: "schedule" })).takeReplaced).toBe(true);
+    expect(parseArgs(argsOfStep({ EVENT: "repository_dispatch" })).takeReplaced).toBe(true);
+    expect(parseArgs(argsOfStep({ EVENT: "workflow_dispatch", INPUT_DRY: "false" })).takeReplaced).toBe(true);
+    expect(parseArgs(argsOfStep({ EVENT: "workflow_dispatch", INPUT_DRY: "true" })).takeReplaced).toBe(false);
+  });
+
   it("gives a run from the schedule or a released event no urgent names", () => {
     for (const EVENT of ["schedule", "repository_dispatch"]) expect(parseArgs(argsOfStep({ EVENT })).urgent).toBeNull();
   });

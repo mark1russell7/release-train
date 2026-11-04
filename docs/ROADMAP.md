@@ -20,3 +20,4 @@ This file gives the items of the release train and their status. The Status page
 | RT12 | The tag backfill: a published version with no tag gets its release from a local run | Done | #97 |
 | RT13 | A run sends the ready items of a repository, and only the other items wait | Done | #98 |
 | RT14 | The first API report builds each package when the root has no script `build`, and a failure keeps its reason | Done | #101 |
+| RT15 | A run takes the urgent names of each run that it replaced, so an urgent dispatch is not lost | Done | #102 |
