@@ -193,6 +193,9 @@ importers:
 
   packages/release-train:
     dependencies:
+      '@mark1russell7/conventions':
+        specifier: ^0.29.1
+        version: 0.29.1
       '@mark1russell7/service':
         specifier: ^0.6.5
         version: 0.6.5(ws@8.22.1)(zod@4.6.7)
@@ -439,6 +442,11 @@ packages:
 
   '@mark1russell7/conventions@0.25.0':
     resolution: {integrity: sha512-p49TqkjzhugGqhKdWjKq5bXOd2ljkwEHdbkEUVzmHSz8b805t2NhGLvbq63oBHMHMv0lKfJDgU0LMIXmpEgqhA==}
+    engines: {node: '>=22'}
+    hasBin: true
+
+  '@mark1russell7/conventions@0.29.1':
+    resolution: {integrity: sha512-Bc8t41QH7H9SiSVmdjepJVD7iHYe35kffZKpkmeQk5oMz8h05o5kY3xUYR/bilVCaXX+hoocKmlbr3PGQjL0lg==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -1217,6 +1225,8 @@ snapshots:
   '@mark1russell7/coeval@0.18.0': {}
 
   '@mark1russell7/conventions@0.25.0': {}
+
+  '@mark1russell7/conventions@0.29.1': {}
 
   '@mark1russell7/cue@https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8': {}
 
