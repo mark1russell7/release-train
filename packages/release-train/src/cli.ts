@@ -43,7 +43,7 @@ export interface CliOptions {
   sync: boolean;
   /** `plan` and `apply`: can the GitHub App change workflow files? `auto`: the first push that GitHub refuses tells. */
   workflows: WorkflowsMode;
-  /** `apply`: the most sync branches that one run pushes. */
+  /** `apply`: the most branches that one run pushes, for the update pushes and the sync pushes together. */
   maxPushes: number;
 }
 
@@ -258,10 +258,10 @@ async function runApply(o: CliOptions): Promise<number> {
             updater,
             facts: await syncFacts({ gh, owner: o.owner }),
             workflows: o.workflows,
-            maxPushes: o.maxPushes,
-            runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
           }
         : null,
+      maxPushes: o.maxPushes,
+      runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
       dryRun: o.dryRun,
       only: o.only,
       releaseDispatch: o.releaseDispatch,

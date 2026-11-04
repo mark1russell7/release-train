@@ -70,14 +70,25 @@ GH_TOKEN=<token> node packages/release-train/src/bin.ts apply --dry-run
 node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 ```
 
-- `--dry-run` shows the pull requests and changes nothing.
+- `--dry-run` shows the pull requests and changes nothing. It counts the pushes as a real run does, so it shows the same repositories as `waiting`. Only a clone tells that an update changes no file, so such a repository counts as a push in a dry run.
 - `--only <repo>` changes only the given repositories (comma-separated).
 - `--report <file>` writes the report without private names.
 - `--author "Name <email>"` sets the author of the commits.
 - `--show-private` shows the private names in the output. Do not use it in CI.
 - `--cascade <repos>` sets the repositories (comma-separated) whose breaking adoptions carry a release, or `all` (the default). The adoptions of other repositories with a release wait.
 - `--release-dispatch` starts the release workflows that start only by hand. Refer to "Releases".
-- `--max-pushes <n>` is the most sync branches that one run pushes (default 5). Each push starts approximately 6 jobs in its repository, and all repositories of the account share 40 runners. A sync push also waits while 30 or more jobs run on the account. The other repositories get `waiting`, and the next run pushes them. When the list of runs is not readable, only the limit of pushes applies.
+- `--max-pushes <n>` is the most branches that one run pushes (default 5). The update branches and the sync branches share this limit. Each push starts approximately 6 jobs in its repository, and all repositories of the account share 40 runners. A push also waits while 30 or more jobs run on the account. The other repositories get `waiting`, and a later run pushes them. When the list of runs is not readable, only the limit of pushes applies.
+
+### The pace of the pushes
+
+One new version of a package that most repositories use changes approximately 35 repositories. The pace stops such a version from starting CI in all of them in one run.
+
+- Five pushes start approximately 30 jobs, so the default limit keeps one run under the busy limit. At the default, 35 repositories need 7 runs, approximately 3.5 hours. A `released` event adds a run, and a busy account stops a run.
+- A branch that gets a new commit counts. A branch that has its changes on the current default branch needs no push. It does not wait, and the train merges or blocks its pull request.
+- At the limit, the train does not clone. A repository that waits has no cost, and an open pull request still merges on green or gets the blocked label. The next run reads the plan again, so it pushes the newest versions and skips the versions between.
+- An update is ready only when it waits for no action, so the pace cannot put a later wave first. An update that another action waits for goes first.
+- The other updates move one place in the order every 30 minutes, so no repository stays at the end. The sync order moves too. The update pushes and the sync pushes go first in turn.
+- `--max-pushes 0` lets a run only merge or block.
 
 ## Releases
 
