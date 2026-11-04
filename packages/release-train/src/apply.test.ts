@@ -1,5 +1,5 @@
 // All repository and package names in these tests are made up.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -1050,6 +1050,116 @@ describe("gitUpdater and conventions fix", () => {
     expect(cmds.some((c) => c.startsWith("pnpm dlx"))).toBe(false);
     expect(result).not.toHaveProperty("fixed");
     expect(prBody(update("0.8.1"), result)).not.toContain("## Conventions fix");
+  });
+});
+
+describe("gitUpdater and the first API report", () => {
+  const update = (): RepoUpdate => {
+    const u = selectUpdates(fixture(), ["lib-repo"]).ready[0] as RepoUpdate;
+    return { ...u, lockKind: "pnpm" as const, items: u.items.filter((i) => i.dep === "@ex/util").map((i) => ({ ...i, dep: CONVENTIONS, to: "0.29.0" })) };
+  };
+  const REPORT = "packages/a/test/api/public-api.txt";
+
+  /** The clone has the script `start`. The fix adds `check:api` and writes LICENSE. The step `broken` fails. */
+  const start = async (options: { had?: boolean; broken?: string; config?: string } = {}) => {
+    const cmds: string[] = [];
+    const trees: { manifest: string; lock: string }[] = [];
+    let message = "";
+    let manifest = "";
+    let reportStayed = false;
+    const run: RunFn = async (cmd, args, opts) => {
+      const line = `${cmd} ${args.join(" ")}`;
+      cmds.push(line);
+      const file = join(opts.cwd, "package.json");
+      if (cmd === "git" && args[0] === "clone") {
+        const apiReport = options.config === undefined ? {} : { apiReport: { report: options.config } };
+        const scripts = { build: "tsc", ...(options.had === true ? { "check:api": "api-report check" } : {}) };
+        writeFileSync(file, `${JSON.stringify({ name: "x", scripts, ...apiReport, devDependencies: { [CONVENTIONS]: "^0.8.0" } }, null, 2)}\n`);
+      }
+      if (cmd === "git" && args[0] === "write-tree") {
+        trees.push({ manifest: readFileSync(file, "utf8"), lock: readFileSync(join(opts.cwd, "pnpm-lock.yaml"), "utf8") });
+        return { code: 0, stdout: `tree${String(trees.length)}\n`, stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "show") {
+        const [tree, name] = (args[1] ?? "").split(":");
+        const saved = trees[Number((tree ?? "").slice(4)) - 1];
+        const text = name === "package.json" ? saved?.manifest : name === "pnpm-lock.yaml" ? saved?.lock : undefined;
+        return text !== undefined ? { code: 0, stdout: text, stderr: "" } : { code: 128, stdout: "", stderr: "no such path" };
+      }
+      if (cmd === "git" && args[0] === "ls-files") {
+        const made = [REPORT, "packages/a/api.md", "LICENSE"].filter((name) => existsSync(join(opts.cwd, name)));
+        return { code: 0, stdout: made.map((name) => `${name}\n`).join(""), stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "fetch") return { code: 128, stdout: "", stderr: "no such ref" };
+      if (cmd === "git" && args.includes("commit")) {
+        message = args[args.indexOf("-m") + 1] ?? "";
+        manifest = readFileSync(file, "utf8");
+        reportStayed = existsSync(join(opts.cwd, REPORT));
+      }
+      if (cmd === "pnpm" && args[0] === "dlx") {
+        const parsed = JSON.parse(readFileSync(file, "utf8")) as { scripts: Record<string, string> };
+        parsed.scripts["check:api"] = "api-report check";
+        writeFileSync(file, `${JSON.stringify(parsed, null, 2)}\n`);
+        writeFileSync(join(opts.cwd, "LICENSE"), "MIT\n");
+        return { code: 0, stdout: JSON.stringify({ changed: ["package.json", "LICENSE"], passes: 2, failed: false }), stderr: "" };
+      }
+      if (options.broken !== undefined && line.startsWith(options.broken)) return { code: 1, stdout: "", stderr: "src/a.ts(1,1): error TS2307: Cannot find module.\n" };
+      if (cmd === "pnpm" && args[0] === "exec" && args[1] === "api-report") {
+        mkdirSync(join(opts.cwd, "packages/a/test/api"), { recursive: true });
+        writeFileSync(join(opts.cwd, REPORT), "report\n");
+        writeFileSync(join(opts.cwd, "packages/a/api.md"), "report\n");
+      }
+      if (cmd === "pnpm" && args[0] === "install") {
+        const to = update().items[0]?.to ?? "";
+        writeFileSync(join(opts.cwd, "pnpm-lock.yaml"), `lockfileVersion: '9.0'\nimporters:\n  .:\n    devDependencies:\n      '${CONVENTIONS}':\n        specifier: ^0.8.0\n        version: ${to}\n`);
+      }
+      const stdout = cmd === "pnpm" && args[0] === "--version" ? "12.10.1\n" : cmd === "git" && args[0] === "status" ? " M package.json\n" : "";
+      return { code: 0, stdout, stderr: "" };
+    };
+    const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: async () => new Response("{}", { status: 200 }) });
+    const result = await up.update(update(), { defaultBranch: "main", rebuild: false });
+    return { cmds, message, result, manifest, reportStayed };
+  };
+
+  it("builds and writes the report in the commit of the fix that adds the script", async () => {
+    const { cmds, message, result, manifest } = await start();
+    const fix = cmds.indexOf(`pnpm dlx ${CONVENTIONS}@0.29.0 fix --json`);
+    const after = cmds.slice(fix + 1);
+    const order = ["pnpm install --lockfile-only", "pnpm install --frozen-lockfile --ignore-scripts", "pnpm run build", "pnpm exec api-report update"].map((c) => after.indexOf(c));
+    expect(order.every((at) => at >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(result).toMatchObject({ status: "pushed", fixed: ["package.json", "LICENSE", REPORT] });
+    expect(message).toContain(`- conventions fix: package.json, LICENSE, ${REPORT}`);
+    expect(cmds.slice(0, cmds.findIndex((c) => c.includes(" commit ")))).toContain(`git add -A -- package.json LICENSE ${REPORT}`);
+    expect(manifest).toContain("check:api");
+  });
+
+  it("uses the report file that the repository names", async () => {
+    const { result } = await start({ config: "./api.md" });
+    expect(result).toMatchObject({ fixed: ["package.json", "LICENSE", "packages/a/api.md"] });
+  });
+
+  it("writes no report for a repository that already has the script", async () => {
+    const { cmds, result } = await start({ had: true });
+    expect(cmds).not.toContain("pnpm exec api-report update");
+    expect(cmds).not.toContain("pnpm run build");
+    expect(result).toMatchObject({ fixed: ["package.json", "LICENSE"] });
+  });
+
+  it("removes the script and keeps the other fixes when a step of the report fails", async () => {
+    for (const broken of ["pnpm run build", "pnpm exec api-report update"]) {
+      const { cmds, message, result, manifest, reportStayed } = await start({ broken });
+      expect(cmds).toContain(broken);
+      expect(result).toMatchObject({ status: "pushed", fixed: ["LICENSE"], reverted: ["package.json"] });
+      expect(result.fixStep).toContain(broken);
+      expect(result.fixError).toContain("TS2307");
+      expect(message).toContain(`- conventions fix removed, it broke the first API report (${broken}): package.json`);
+      expect(manifest).not.toContain("check:api");
+      expect(reportStayed).toBe(false);
+      const body = prBody(update(), result);
+      expect(body).toContain("## Conventions fix removed");
+      expect(body).toContain("until a person adds the script");
+    }
   });
 });
 
