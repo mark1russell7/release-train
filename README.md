@@ -105,15 +105,15 @@ gh workflow run train.yml -R <owner>/release-train -f dry-run=false -f urgent=<p
 You can also start the workflow `Train` on the Actions page of this repository. Set `dry-run` to false, because its default is true. Give only public names, because GitHub shows the inputs. The name of a private package has no effect.
 
 - The update goes first in the run, and it goes before the sync.
-- The update does not wait for `--max-pushes`, and it does not use the count of the run. The train has no other limit for such a push, so a popular package starts CI in all its repositories at once.
+- The update does not wait for `--max-pushes`, and it does not use the count of the run. The train has no other limit here, so a popular package starts CI in all its repositories at once.
 - The push carries each other change of the update branch of that repository.
-- All other checks stay. They are the wave order, `--only`, `--cascade`, the provenance check, the age rule, the closed pull request of a person, and the Yarn and submodule skips.
+- All other checks stay: the wave order, `--only`, `--cascade`, the provenance check and the age rule. A closed pull request of a person and the Yarn and submodule skips also stay.
 - CI and the checks of each repository stay too. The train still merges only on green, in a later run.
 - The wave order stays, so an update in a later wave waits for its release. Give each package of the chain to go fast, and start a new run after each release.
-- The age rule stays. The scopes `@<owner>/*` and `@procedures/*` have no wait, because the train excludes them from the rule. Each other package waits for `minimumReleaseAge` of the repository, 1 day by default. After that time, a person starts the run again. Else the update waits for the limit.
+- The age rule stays. The scopes `@<owner>/*` and `@procedures/*` have no wait in a repository whose settings exclude them. Each other package waits for `minimumReleaseAge` of the repository, 1 day by default. After that time, a person starts the run again. Else the update waits for the limit.
 - A later run with no urgent names merges the pull requests, and it paces each push that is still due.
 - One run can wait while another run operates. A newer run replaces the run that waits, so check that your run starts.
-- The summary has a line `Urgent` with the count and the states, and a line with the count of the names that change no ready update.
+- The summary has a line `Urgent` with the count and the states. Another line gives the count of the names that change no ready update.
 
 ## Releases
 
