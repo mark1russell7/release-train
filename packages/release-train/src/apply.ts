@@ -250,6 +250,8 @@ export interface UpdateResult {
   reverted?: string[];
   /** The first error lines of the typecheck with the removed fix. */
   fixError?: string | null;
+  /** The step that failed with the fix, when it is not `typecheck`. */
+  fixStep?: string;
 }
 
 /** The part of the train that changes the files: a clone, the range changes, the lockfile update and the push. */
@@ -505,7 +507,9 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
     lines.push(
       "## Conventions fix removed",
       "",
-      "`conventions fix` changed these files, but then `typecheck` failed. Without the fix it passed, so the train removed the fix. The rule stays broken here until the fix of conventions is correct: this is a bug of conventions, not of this repository.",
+      r?.fixStep !== undefined
+        ? `\`conventions fix\` changed these files, but then ${r.fixStep} failed, so the train removed the fix. The rule stays broken here until a person adds the script and the first report.`
+        : "`conventions fix` changed these files, but then `typecheck` failed. Without the fix it passed, so the train removed the fix. The rule stays broken here until the fix of conventions is correct: this is a bug of conventions, not of this repository.",
       "",
       ...reverted.map((file) => `- \`${file}\``),
       "",

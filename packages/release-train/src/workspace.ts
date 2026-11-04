@@ -170,6 +170,10 @@ function readText(file: string): string {
 export const CONVENTIONS = "@mark1russell7/conventions";
 export const FIX_SINCE = "0.8.2";
 
+/** The root script that checks the API reports, and the report of a package when the repository names no other file. */
+export const API_SCRIPT = "check:api";
+export const API_REPORT = "test/api/public-api.txt";
+
 function tail(s: string, n = 800): string {
   const t = s.trim();
   return t.length > n ? `...${t.slice(-n)}` : t;
@@ -192,6 +196,8 @@ interface FixOutcome {
   fixed: string[];
   reverted: string[];
   error: string | null;
+  /** The step that failed with the fix, when it is not `typecheck`. */
+  step?: string;
 }
 
 /**
@@ -291,11 +297,17 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    * when the repository has a `typecheck` script, the function starts it after the fix. When it fails, the function
    * starts it again without the fix. When it then passes, the fix caused the failure: the function removes the fix and
    * gives the files in `reverted`, with the first error lines. Else the failure is not from the fix, and the fix stays.
+   *
+   * A fix can add the script `check:api`. That script fails until the repository has its reports, so the function writes
+   * the first reports in the same commit: it updates the lockfile, builds and starts `api-report update`. When a step
+   * fails, the root `package.json` and the lockfile go back, so no update turns a repository red with no report beside it.
    */
   const conventionsFix = async (dir: string, u: RepoUpdate, fixEnv: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<FixOutcome> => {
     const none: FixOutcome = { fixed: [], reverted: [], error: null };
     const to = u.items.find((i) => i.dep === CONVENTIONS)?.to;
     if (to === undefined || semver.valid(to) === null || semver.lt(to, FIX_SINCE)) return none;
+    const manifest = join(dir, "package.json");
+    const hadApiCheck = typeof readScripts(manifest)?.[API_SCRIPT] === "string";
     await install();
     // The tree of the files before the fix, from a separate index, so the index of the clone does not change
     const snapshot = async (): Promise<string | null> => {
@@ -324,20 +336,54 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     } catch {
       return none;
     }
-    const scripts = readScripts(join(dir, "package.json"));
-    if (fixed.length === 0 || before === null || typeof scripts?.["typecheck"] !== "string") return { ...none, fixed };
-    const typecheck = (): Promise<RunResult> => run(u.lockKind === "npm" ? "npm" : "pnpm", ["run", "typecheck"], { cwd: dir, env: fixEnv });
-    const withFix = await typecheck();
-    if (withFix.code === 0) return { ...none, fixed };
-    const after = await snapshot();
-    await restore(before, fixed);
-    if ((await typecheck()).code !== 0 && after !== null) {
-      await restore(after, fixed);
-      return { ...none, fixed };
+    const firstLines = (result: RunResult): string => {
+      const error = `${result.stdout}\n${result.stderr}`.split("\n").filter((line) => /error/i.test(line)).slice(0, 5).join("\n");
+      return error === "" ? tail(result.stdout || result.stderr, 500) : error;
+    };
+    const scripts = readScripts(manifest);
+    /** This function keeps the fix when the typecheck allows it. */
+    const typechecked = async (): Promise<FixOutcome> => {
+      if (fixed.length === 0 || before === null || typeof scripts?.["typecheck"] !== "string") return { ...none, fixed };
+      const typecheck = (): Promise<RunResult> => run(u.lockKind === "npm" ? "npm" : "pnpm", ["run", "typecheck"], { cwd: dir, env: fixEnv });
+      const withFix = await typecheck();
+      if (withFix.code === 0) return { ...none, fixed };
+      const after = await snapshot();
+      await restore(before, fixed);
+      if ((await typecheck()).code !== 0 && after !== null) {
+        await restore(after, fixed);
+        return { ...none, fixed };
+      }
+      return { fixed: [], reverted: fixed, error: firstLines(withFix) };
+    };
+    const outcome = await typechecked();
+    if (hadApiCheck || before === null || typeof readScripts(manifest)?.[API_SCRIPT] !== "string") return outcome;
+    const npm = u.lockKind === "npm";
+    const quiet = ["--ignore-scripts", "--no-audit", "--no-fund"];
+    const steps: readonly (readonly [string, readonly string[]])[] = [
+      npm ? ["npm", ["install", "--package-lock-only", ...quiet]] : ["pnpm", ["install", "--lockfile-only"]],
+      npm ? ["npm", ["ci", ...quiet]] : ["pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+      ...(typeof scripts?.["build"] === "string" ? [[npm ? "npm" : "pnpm", ["run", "build"]] as const] : []),
+      npm ? ["npm", ["exec", "--", "api-report", "update"]] : ["pnpm", ["exec", "api-report", "update"]],
+    ];
+    const untracked = async (): Promise<string[]> => {
+      const listed = await run("git", ["ls-files", "--others", "--exclude-standard"], { cwd: dir, env: fixEnv });
+      return listed.stdout.split("\n").filter((file) => file !== "");
+    };
+    const known = new Set(await untracked());
+    const failed = async (name: string, result: RunResult): Promise<FixOutcome> => {
+      const lockfile = npm ? "package-lock.json" : "pnpm-lock.yaml";
+      await restore(before, ["package.json", lockfile]);
+      for (const file of await untracked()) if (!known.has(file)) rmSync(join(dir, file), { force: true });
+      return { fixed: outcome.fixed.filter((file) => file !== "package.json"), reverted: ["package.json"], error: firstLines(result), step: name };
+    };
+    for (const [cmd, args] of steps) {
+      const result = await run(cmd, [...args], { cwd: dir, env: fixEnv });
+      if (result.code !== 0) return failed(`the first API report (${cmd} ${args.join(" ")})`, result);
     }
-    const output = `${withFix.stdout}\n${withFix.stderr}`;
-    const error = output.split("\n").filter((line) => /error/i.test(line)).slice(0, 5).join("\n");
-    return { fixed: [], reverted: fixed, error: error === "" ? tail(withFix.stdout || withFix.stderr, 500) : error };
+    const config = (JSON.parse(readFileSync(manifest, "utf8")) as { apiReport?: { report?: unknown } }).apiReport?.report;
+    const report = typeof config === "string" ? config.replace(/^\.\//, "") : API_REPORT;
+    const reports = (await untracked()).filter((file) => !known.has(file) && (file === report || file.endsWith(`/${report}`)));
+    return { ...outcome, fixed: [...new Set([...outcome.fixed, ...reports])] };
   };
 
   /** The environment of a script of the repository: no git credentials, no step summary, and the repository of the clone in GITHUB_REPOSITORY. */
@@ -550,7 +596,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
 
         // 3. A new version of conventions brings the fixes of its rules. The train writes them in the same commit, so a new
         // rule does not block the update for a break that a script can fix. CI of the pull request checks the result.
-        const { fixed, reverted, error: fixError } = await conventionsFix(dir, u, fixEnv, install);
+        const { fixed, reverted, error: fixError, step: fixStep } = await conventionsFix(dir, u, fixEnv, install);
         // 4. The files that the train wrote get the format of the repository.
         await formatChanged(dir, u, added, fixEnv, install);
         const after = read();
@@ -579,7 +625,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           ...(hooks.ran.length > 0 ? [`- version script: ${hooks.ran.map((p) => `${p}/package.json`).join(", ")}`] : []),
           ...(settingsChanged ? [`- pnpm-workspace.yaml: ${[...(u.ageScopes ?? []), ...urgentAge].join(", ")} in minimumReleaseAgeExclude`] : []),
           ...(fixed.length > 0 ? [`- conventions fix: ${fixed.join(", ")}`] : []),
-          ...(reverted.length > 0 ? [`- conventions fix removed, it broke typecheck: ${reverted.join(", ")}`] : []),
+          ...(reverted.length > 0 ? [`- conventions fix removed, it broke ${fixStep ?? "typecheck"}: ${reverted.join(", ")}`] : []),
         ].join("\n");
         await sh("git", ["add", "-u"], "git add");
         if (added.length > 0) await sh("git", ["add", "--", ...added], "git add");
@@ -590,7 +636,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
 
         // 7. No push when the branch already has the same content in the files of the train.
         const pushed = await pushHead(dir, sh, TRAIN_BRANCH, remote, ctx.rebuild);
-        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(urgentAge.size > 0 ? { urgentAge: [...urgentAge].sort() } : {}), ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError } : {}) };
+        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(urgentAge.size > 0 ? { urgentAge: [...urgentAge].sort() } : {}), ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError, ...(fixStep === undefined ? {} : { fixStep }) } : {}) };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       } finally {
