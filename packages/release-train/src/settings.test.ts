@@ -212,6 +212,7 @@ describe("gitUpdater with the settings", () => {
         writeFileSync(join(opts.cwd, "package.json"), `${JSON.stringify({ name: "x", dependencies: { fix: "^1.0.0", other: "^1.0.0" } })}\n`);
         writeFileSync(join(opts.cwd, "pnpm-workspace.yaml"), 'minimumReleaseAgeExclude:\n  - "@ex/*"\n  - "@procedures/*"\n');
       }
+      if (cmd === "pnpm" && args[0] === "install") writeFileSync(join(opts.cwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      fix:\n        specifier: ^2.0.0\n        version: 2.0.0\n");
       if (cmd === "git" && args[0] === "add") written = readFileSync(join(opts.cwd, "pnpm-workspace.yaml"), "utf8");
       if (cmd === "git" && args[0] === "-c") commit = args.join(" ");
       const out = cmd === "pnpm" && args[0] === "--version" ? "12.0.0\n" : cmd === "git" && args[0] === "status" ? " M pnpm-workspace.yaml\n" : "";
