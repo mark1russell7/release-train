@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { lagOver, lagReport, lagSummary } from "./lag.ts";
 import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, pendingVersions, publicReport } from "./apply.ts";
 import { collect, pool } from "./collect.ts";
 import { writeDb } from "./db.ts";
@@ -55,6 +56,8 @@ export interface CliOptions {
   since: string;
   /** `tags`: this option makes the missing releases. Without it, the command makes no write. */
   write: boolean;
+  /** `lag`: the command exits with 1 when a row is over its limit. */
+  gate: boolean;
 }
 
 /** This function reads the arguments of the command line. */
@@ -82,6 +85,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     takeReplaced: false,
     since: defaultSince(),
     write: false,
+    gate: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -107,6 +111,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--no-sync") o.sync = false;
     else if (a === "--take-replaced") o.takeReplaced = true;
     else if (a === "--write") o.write = true;
+    else if (a === "--gate") o.gate = true;
     else if (a === "--since") {
       const v = value().trim();
       if (!validDate(v)) throw new Error(`--since needs a date of the form YYYY-MM-DD, not ${v}.`);
@@ -224,8 +229,9 @@ export async function main(argv: readonly string[]): Promise<number> {
   const o = parseArgs(argv);
   if (o.command === "await-release") return runAwait(o);
   if (o.command === "tags") return runTags(o);
+  if (o.command === "lag") return runLag(o);
   if (o.command !== "plan" && o.command !== "apply") {
-    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply", "await-release" and "tags".\n`);
+    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply", "await-release", "tags" and "lag".\n`);
     return 2;
   }
   return o.command === "apply" ? runApply(o) : runPlan(o);
@@ -341,6 +347,28 @@ async function runApply(o: CliOptions): Promise<number> {
  * The tags command: it finds each published version with no git tag, and with `--write` it makes each missing release.
  * Its output gives each private repository and package only as a hash. `--dry-run` wins over `--write`.
  */
+/**
+ * The lag command: it reports each change with no release, and each red pull request of the train. It makes no write.
+ * With `--gate`, a row over its limit gives the exit code 1.
+ */
+async function runLag(o: CliOptions): Promise<number> {
+  const tok = token();
+  const log = (l: string): void => void process.stderr.write(`${l}\n`);
+  const data = await collect({ owner: o.owner, token: tok, publicOnly: o.publicOnly, log });
+  const graph = buildGraph({ owner: o.owner, repos: data.repos, npm: data.npm, warnings: data.warnings });
+  const report = await lagReport({
+    owner: o.owner,
+    gh: gitHub({ token: tok }),
+    packages: graph.packages,
+    branches: new Map(data.repos.map((r) => [r.name, r.defaultBranch])),
+    publicOnly: o.publicOnly,
+    log,
+  });
+  if (o.out) writeFileSync(o.out, `${JSON.stringify(report, null, 2)}\n`);
+  process.stdout.write(o.json ? `${JSON.stringify(report, null, 2)}\n` : `${lagSummary(report)}\n`);
+  return o.gate && lagOver(report) ? 1 : 0;
+}
+
 async function runTags(o: CliOptions): Promise<number> {
   const key = process.env["RELEASE_TRAIN_HASH_KEY"] ?? "";
   const secrets = new Set<string>();

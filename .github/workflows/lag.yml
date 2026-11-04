@@ -1,0 +1,49 @@
+# The release lag. This workflow compares the source on the default branch of each public package with its latest version on
+# npm, and it reads the red pull requests of the train. It changes no repository. The run fails when a row is over its limit.
+# It uses only the default token, so it sees only public repositories. --public-only also removes each private one.
+name: Lag
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lag
+  cancel-in-progress: false
+
+jobs:
+  lag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Read the lag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set +e
+          node packages/release-train/src/bin.ts lag --owner "$OWNER" --public-only --gate --out lag.json > lag.md
+          code=$?
+          cat lag.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: lag
+          path: |
+            lag.json
+            lag.md
+          retention-days: 30

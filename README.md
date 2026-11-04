@@ -195,6 +195,32 @@ The command reads the packages of the plan, their versions on npm and the tags o
 - npm data decides the window first, so a package with no version in the window starts no `gh` process. Each repository gets one read of its tags. The output gives the count of `gh` processes.
 - `--only`, `--public-only`, `--show-private`, `--json` and `--out <file>` work as in the other commands. The output gives each private name only as a hash.
 
+## Release lag
+
+A change on the default branch helps a user only after a release. The command `lag` finds each change with no release.
+
+```sh
+node packages/release-train/src/bin.ts lag
+node packages/release-train/src/bin.ts lag --public-only --gate --out lag.json
+```
+
+The command makes no write. It reports these items:
+
+| Item | Limit | Meaning |
+|---|---|---|
+| A kept version | 2 days | The source differs from the latest version, and the version number on the default branch is the same. No release starts. |
+| A missing release | 2 days | The default branch has a new version, and npm does not have it. |
+| A red train pull request | 1 day | An open pull request of the train has a failed check. |
+
+- The published commit comes from npm: the provenance of the version, or its `gitHead`. A package with neither goes to the list "Not read".
+- A file counts when its name is in the package. Tests, texts, sites and the settings of tools do not count. The command reads names only, so a file that the package does not publish can count.
+- A `package.json` counts when a field that a user gets changes, as `dependencies` or `exports`. A change of `devDependencies` or `scripts` does not count.
+- The age of a red pull request starts at its first block. A merge closes a train pull request, so a new head does not reset this age.
+- The age starts at the first commit after the release that changes such a file. The command reads at most 60 commits of each package. Then the age shows "over".
+- A row under its limit is in the report too, so a kept version shows on its first day.
+- `--gate` gives the exit code 1 when a row is over its limit. The workflow `lag.yml` uses this option once each day, so a lag makes the workflow red.
+- `--public-only`, `--json` and `--out <file>` work as in the other commands. Without `--public-only`, the output has private names. So a run without it stays on a local computer.
+
 ## Stage 3: template sync
 
 The template sync keeps the files from the repository `template` current in each other repository. Each rule is data in `SYNC_RULES` (`src/sync.ts`): an id, a reason and a check that gives the edits. To add a rule, add an object to this list.
