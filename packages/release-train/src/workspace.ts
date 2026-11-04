@@ -298,8 +298,8 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    * starts it again without the fix. When it then passes, the fix caused the failure: the function removes the fix and
    * gives the files in `reverted`, with the first error lines. Else the failure is not from the fix, and the fix stays.
    *
-   * A fix can add the script `check:api`. That script fails until the repository has its reports, so the function writes
-   * the first reports in the same commit: it updates the lockfile, builds and starts `api-report update`. When a step
+   * A fix can add the script `check:api`. That script fails until the repository has its reports.
+   * So the function writes the first reports in the same commit. It updates the lockfile, builds and starts `api-report update`. When a step
    * fails, the root `package.json` and the lockfile go back. Thus an update cannot add the script without its reports.
    */
   const conventionsFix = async (dir: string, u: RepoUpdate, fixEnv: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<FixOutcome> => {
