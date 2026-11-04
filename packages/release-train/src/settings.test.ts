@@ -225,7 +225,7 @@ describe("gitUpdater with the settings", () => {
     expect(r.young.map((y) => y.dep)).toEqual(["other"]);
     expect(r.urgentAge).toEqual(["fix@2.0.0"]);
     expect(r.status).not.toBe("young");
-    expect(releaseAgePolicy(written, "", "12.0.0").exclude).toEqual([...ownScopes("ex"), "fix@2.0.0"]);
+    expect(releaseAgePolicy(written, "", "12.0.0").exclude).toEqual(["@ex/*", "@tools/*", "@procedures/*", "fix@2.0.0"]);
     expect(commit).toContain("fix@2.0.0 in minimumReleaseAgeExclude");
   });
 
