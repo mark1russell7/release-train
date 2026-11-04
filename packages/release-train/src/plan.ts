@@ -212,6 +212,33 @@ export function assignLevels(nodes: NodeState[]): void {
   for (const n of nodes) n.level = level[compOf.get(n.id) as number] ?? 0;
 }
 
+/** This function gives the text of an adoption of the given items. */
+export function adoptWhy(repo: string, items: readonly Pick<ActionItem, "dep" | "newRange">[]): string {
+  const deps = [...new Set(items.map((i) => i.dep))];
+  const lead = items.some((i) => i.newRange) ? "Change the ranges" : "Update the lockfile";
+  return `${lead} of ${repo} for ${deps.length === 1 ? deps[0] : `${deps.length} packages`}, then merge when CI is green.`;
+}
+
+/**
+ * This function gives each package the number of its set. The packages of one set move together in a repository.
+ * A peer range joins two packages. A runtime `workspace:` range also joins them, because npm gets an exact version of it.
+ * So a user with two versions of the hub of a set gets two copies. Only published packages join a set.
+ */
+export function moveSets(packages: readonly string[], edges: readonly Pick<Edge, "fromName" | "to" | "type" | "kind">[]): Map<string, number> {
+  const near = new Map<string, string[]>(packages.map((n) => [n, []]));
+  for (const e of edges) {
+    const from = e.fromName === null ? undefined : near.get(e.fromName);
+    const to = near.get(e.to);
+    if (!from || !to || (e.type !== "peerDependencies" && !(e.kind === "workspace" && isRuntime(e.type)))) continue;
+    from.push(e.to);
+    to.push(e.fromName as string);
+  }
+  // Each edge goes in the two directions here, so a strongly connected component is a connected component.
+  const sets = new Map<string, number>();
+  stronglyConnected(packages, (n) => near.get(n) ?? []).forEach((c, i) => c.forEach((n) => sets.set(n, i)));
+  return sets;
+}
+
 /** This function computes the plan from the graph. It keeps no state between runs. */
 export function plan(g: Graph): Plan {
   const warnings = [...g.warnings];
@@ -420,9 +447,7 @@ export function plan(g: Graph): Plan {
   }
   for (const a of actions.values()) {
     if (a.kind !== "adopt-breaking" && a.kind !== "adopt-in-range") continue;
-    const deps = [...new Set(a.items.map((i) => i.dep))];
-    const lead = a.kind === "adopt-breaking" ? "Change the ranges" : "Update the lockfile";
-    a.why = `${lead} of ${a.repo} for ${deps.length === 1 ? deps[0] : `${deps.length} packages`}, then merge when CI is green.`;
+    a.why = adoptWhy(a.repo, a.items);
   }
 
   // A release or a new package waits for the adoption in its repository and for its runtime dependencies on npm.
