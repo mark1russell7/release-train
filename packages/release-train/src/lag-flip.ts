@@ -2,7 +2,7 @@
 // gives a hold list. The gate has to fail on the first two cases and pass on the third, in the same job. So a gate that
 // cannot fail makes this script fail.
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,7 +67,7 @@ export function runFlip(cases: readonly FlipCase[] = FLIP_CASES): string[] {
   }
 }
 
-if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   const faults = runFlip();
   for (const item of FLIP_CASES) process.stdout.write(`${faults.some((fault) => fault.startsWith(item.name)) ? "FAIL" : "ok"}: ${item.name}\n`);
   for (const fault of faults) process.stderr.write(`${fault}\n`);
