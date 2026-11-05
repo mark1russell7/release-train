@@ -77,10 +77,12 @@ describe("the files list of a package", () => {
     expect(isReleased("packages/x/cli/a.js", "packages/x", list)).toBe(true);
   });
 
-  it("leaves out a negated item, so a build config does not count and the source does", () => {
-    const list = publishedPaths({ files: ["build", "src", "!src/**/*.test.ts", "!src/fc-setup.ts"] });
-    expect(list).toEqual(["build", "src"]);
+  it("reads a list with negated items: a build config and a negated file do not count, and the source does", () => {
+    const list = publishedPaths({ files: ["build", "src", "!src/**/*.test.ts", "!src/fc-setup.ts", "!src/__golden__"] });
+    expect(list).toEqual(["build", "src", "!src/fc-setup.ts", "!src/__golden__"]);
     expect(isReleased("packages/x/tsdown.config.ts", "packages/x", list)).toBe(false);
+    expect(isReleased("packages/x/src/fc-setup.ts", "packages/x", list)).toBe(false);
+    expect(isReleased("packages/x/src/__golden__/a.json", "packages/x", list)).toBe(false);
     expect(isReleased("packages/x/src/a.ts", "packages/x", list)).toBe(true);
   });
 

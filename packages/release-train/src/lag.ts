@@ -163,14 +163,17 @@ function listedPath(item: string): string | null {
 /**
  * This function gives the `files` list of a manifest, as paths. It gives null if the manifest has no such list, or if the
  * list has a wildcard. The caller then reads the names of the files only, so a file can count that the package does not publish.
- * A negated item only takes files out, so the function leaves it out: a file can count, and no change goes unseen.
+ * A negated item only takes files out. A negated plain path stays in the list with its `!`, so that file does not count. A
+ * negated pattern goes out of the list: a file can count, and no change goes unseen.
  */
 export function publishedPaths(manifest: Readonly<Record<string, unknown>>): string[] | null {
   const files = manifest.files;
   if (!Array.isArray(files) || !files.every((x) => typeof x === "string")) return null;
   const always = [manifest.main, ...(typeof manifest.bin === "string" ? [manifest.bin] : Object.values((manifest.bin ?? {}) as object))].filter((x): x is string => typeof x === "string");
+  const negated = (files as string[]).filter((x) => x.startsWith("!")).map((x) => listedPath(x.slice(1)));
   const paths = [...(files as string[]).filter((x) => !x.startsWith("!")), ...always].map(listedPath);
-  return paths.includes(null) ? null : (paths as string[]);
+  if (paths.includes(null)) return null;
+  return [...(paths as string[]), ...negated.filter((x) => x !== null).map((x) => `!${x}`)];
 }
 
 /**
@@ -186,7 +189,9 @@ export function isReleased(file: string, path: string, published: readonly strin
   if (OUTSIDE_FILE.test(inside)) return false;
   const guess = !OUTSIDE_FOLDER.test(inside);
   if (published === null) return guess;
-  if (published.some((x) => inside === x || inside.startsWith(`${x}/`))) return true;
+  const under = (x: string): boolean => inside === x || inside.startsWith(`${x}/`);
+  if (published.some((x) => x.startsWith("!") && under(x.slice(1)))) return false;
+  if (published.some(under)) return true;
   return guess && inside.startsWith("src/") && published.some((x) => BUILD_OUTPUT.test(x));
 }
 
