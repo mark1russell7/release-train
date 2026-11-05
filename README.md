@@ -236,6 +236,8 @@ A release can wait on purpose. Without a hold, the gate then stays red, and a ne
 - A hold with no reason, no `https` link or no date gives a fault, and so does a date in the past. A fault fails the gate, and that hold holds nothing.
 - A hold with no row over the limit is in the report. It gives no fault.
 - A later date needs a new reason. `holds --holds <file> --before <file>` examines this, and the workflow `lag-holds.yml` starts it on each pull request.
+- A hold with the field `repo` names a dependent repository. While it stands, `apply --holds <file>` sends no update of that package to that repository, and each package that must move with it stays too. An open pull request of the train that has only held packages does not merge. The same package goes to each other repository.
+- A hold with `repo` says nothing about the release of the package, so it holds no row of the gate. A held update has no row, and the report lists the hold apart. A hold with a fault holds nothing, so its update goes, and the gate fails on the fault.
 - `lag-flip.ts` is the flip test. In one job, a new package over the limit fails while another is held. A date in the past fails, and a held row alone passes. The workflows `lag.yml` and `lag-holds.yml` start it.
 - `--from-report <file>` reads a saved report in place of the repositories, and `--now <time>` sets the time of the run. The flip test uses both.
 

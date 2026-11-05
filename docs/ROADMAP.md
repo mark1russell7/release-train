@@ -25,3 +25,4 @@ This file gives the items of the release train and their status. The Status page
 | RT17 | The command `lag` reads the `files` list of a package, and a `docs` or `style` commit does not start its clock | Done | #105 |
 | RT18 | A hold with a reason, a link and a date keeps the gate able to fail on another package, and a flip test holds this | Done | #111 |
 | RT19 | An update that moves `api-report` writes the reports in the same commit, so a new form of a report does not stop the update | Done | #114 |
+| RT20 | A hold can name a dependent repository, and the train then sends no update of that package to that repository | Done | #115 |

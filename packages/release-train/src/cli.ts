@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { extensionFaults, holdsOfFile, readHolds } from "./holds.ts";
-import type { HoldReading } from "./holds.ts";
+import type { HoldReading, LagHold } from "./holds.ts";
 import { applyHolds, lagOver, lagReport, lagSummary } from "./lag.ts";
 import type { LagReport } from "./lag.ts";
 import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, pendingVersions, publicReport } from "./apply.ts";
@@ -61,7 +61,7 @@ export interface CliOptions {
   write: boolean;
   /** `lag`: the command exits with 1 when a row is over its limit. */
   gate: boolean;
-  /** `lag` and `holds`: the file of the holds. */
+  /** `lag`, `holds` and `apply`: the file of the holds. */
   holds?: string;
   /** `lag`: a saved report. The command then reads no repository. */
   fromReport?: string;
@@ -347,6 +347,7 @@ async function runApply(o: CliOptions): Promise<number> {
       only: o.only,
       releaseDispatch: o.releaseDispatch,
       cascade: o.cascade,
+      holds: applyHolding(o, log),
       log,
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
     });
@@ -377,6 +378,17 @@ async function runLag(o: CliOptions): Promise<number> {
   if (o.out) writeFileSync(o.out, `${JSON.stringify(report, null, 2)}\n`);
   process.stdout.write(o.json ? `${JSON.stringify(report, null, 2)}\n` : `${lagSummary(report)}\n`);
   return o.gate && lagOver(report) ? 1 : 0;
+}
+
+/**
+ * This function gives the valid holds for the command `apply`. A hold with a fault holds nothing, so its update goes. The
+ * run writes the fault, and the lag gate fails on it.
+ */
+export function applyHolding(o: Pick<CliOptions, "holds" | "now">, log: (line: string) => void): readonly LagHold[] {
+  if (o.holds === undefined) return [];
+  const reading = holdsFromFile(o.holds, o.now ?? new Date());
+  for (const fault of reading.faults) log(`A fault of the holds: ${fault}`);
+  return reading.holds;
 }
 
 /** This function reads the file of the holds. A file that the command cannot read is a fault, so it does not hide a row. */

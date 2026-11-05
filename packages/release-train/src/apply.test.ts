@@ -23,6 +23,7 @@ import type { RepoUpdate, UpdateResult, Updater } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
 import { buildGraph } from "./graph.ts";
+import type { LagHold } from "./holds.ts";
 import { plan } from "./plan.ts";
 import type { Manifest, NpmInfo, RepoSnapshot, Resolved } from "./types.ts";
 import { API_REPORT_PACKAGE, CONVENTIONS, ageExcluded, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
@@ -137,6 +138,40 @@ describe("selection", () => {
     expect(s.ready.map((u) => u.repo)).toEqual(["lib-repo"]);
     expect(s.waiting).toEqual([]);
   });
+
+  describe("with a hold on one repository", () => {
+    const hold = (dep: string, target: string): LagHold => ({ package: dep, repo: target, reason: "The owner keeps this version.", ruling: "https://example.test/r", until: "2026-11-07" });
+
+    it("does not send the held package, and sends the other packages of that repository", () => {
+      const s = selectUpdates(fixture(), null, "all", new Set(), [hold("@ex/core", "lib-repo")]);
+      const lib = s.ready.find((u) => u.repo === "lib-repo") as RepoUpdate;
+      expect(lib.items.map((i) => i.dep)).toEqual(["@ex/util"]);
+      expect(lib.held).toEqual({ items: 1, deps: ["@ex/core"] });
+    });
+
+    it("gives another fingerprint, so a new push replaces an open pull request that holds the raise", () => {
+      const before = selectUpdates(fixture()).ready.find((u) => u.repo === "lib-repo") as RepoUpdate;
+      const after = selectUpdates(fixture(), null, "all", new Set(), [hold("@ex/core", "lib-repo")]).ready.find((u) => u.repo === "lib-repo") as RepoUpdate;
+      expect(after.fingerprint).not.toBe(before.fingerprint);
+    });
+
+    it("makes the update wait when each package is held, and keeps an open pull request from a merge", () => {
+      const s = selectUpdates(fixture(), null, "all", new Set(), [hold("@ex/core", "lib-repo"), hold("@ex/util", "lib-repo")]);
+      expect(s.ready.map((u) => u.repo)).toEqual(["secret-repo"]);
+      expect(s.waiting.find((w) => w.repo === "lib-repo")).toMatchObject({ holdsOpen: true, dependsOn: expect.arrayContaining(["hold:@ex/core", "hold:@ex/util"]) });
+      expect(s.needed.has("lib-repo")).toBe(true);
+    });
+
+    it("does not stop that package in another repository", () => {
+      const s = selectUpdates(fixture(), null, "all", new Set(), [hold("@ex/util", "lib-repo")]);
+      expect(s.ready.find((u) => u.repo === "secret-repo")?.items.map((i) => i.dep)).toEqual(["@ex/util"]);
+      expect(s.ready.find((u) => u.repo === "lib-repo")?.items.map((i) => i.dep)).toEqual(["@ex/core"]);
+    });
+
+    it("changes nothing when it names a repository with no such update", () => {
+      expect(selectUpdates(fixture(), null, "all", new Set(), [hold("@ex/util", "app-repo")])).toEqual(selectUpdates(fixture()));
+    });
+  });
 });
 
 describe("a release in flight", () => {
@@ -192,6 +227,45 @@ describe("a release in flight", () => {
       const r = await apply({ owner: OWNER, plan: pending(), gh, updater: updater(), dryRun: true });
       expect(r.results.find((x) => x.repo === "pub-repo" && x.actionId === "update:pub-repo"), text).toMatchObject({ state: "planned" });
     }
+  });
+});
+
+describe("a hold in a run of apply", () => {
+  const pendingOne = () =>
+    plan(
+      buildGraph({
+        owner: OWNER,
+        repos: [
+          repo("base-repo", { "": { name: "@ex/base", version: "2.0.0" } }),
+          repo("dep-repo", { "": { name: "@ex/dep", version: "1.0.0", dependencies: { "@ex/base": "^1.0.0" } } }, { resolved: { "": { "@ex/base": "1.0.0" } } }),
+        ],
+        npm: { "@ex/base": npm("2.0.0"), "@ex/dep": npm("1.0.0") },
+        now: new Date("2026-01-01T00:00:00Z"),
+      }),
+    );
+  const routes: Record<string, Handler> = {
+    [`GET ${base}/dep-repo/pulls`]: () => [200, [pull(5, "dep-repo")]],
+    [`GET ${base}/dep-repo`]: meta,
+    [`GET ${base}/dep-repo/contents/.github/workflows/release.yml`]: () => [404, {}],
+    [`GET ${base}/dep-repo/commits/sha5/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }],
+    [`GET ${base}/dep-repo/commits/sha5/status`]: () => [200, { state: "pending", total_count: 0 }],
+    [`GET ${base}/dep-repo/compare/main...sha5`]: () => [200, { behind_by: 0 }],
+  };
+  const holds: LagHold[] = [{ package: "@ex/base", repo: "dep-repo", reason: "The owner keeps this version.", ruling: "https://example.test/r", until: "2026-11-07" }];
+
+  it("sends no update, and does not merge the open pull request", async () => {
+    const { gh, calls } = server(routes);
+    const up = updater();
+    const r = await apply({ owner: OWNER, plan: pendingOne(), gh, updater: up, dryRun: false, holds });
+    expect(up.seen).toEqual([]);
+    expect(calls.filter((c) => c.method === "PUT")).toEqual([]);
+    expect(r.results.find((x) => x.repo === "dep-repo" && x.actionId === "update:dep-repo")).toMatchObject({ state: "waiting", pr: { number: 5 } });
+  });
+
+  it("works on the update with no hold", async () => {
+    const { gh } = server(routes);
+    const r = await apply({ owner: OWNER, plan: pendingOne(), gh, updater: updater(), dryRun: true });
+    expect(r.results.find((x) => x.repo === "dep-repo" && x.actionId === "update:dep-repo")).toMatchObject({ state: "planned" });
   });
 });
 

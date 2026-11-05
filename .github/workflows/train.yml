@@ -105,7 +105,7 @@ jobs:
           WORKFLOWS: ${{ steps.wf.outcome == 'success' && 'yes' || 'no' }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ]; then dry=false; else dry=true; fi
-          args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR")
+          args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR" --holds lag-holds.json)
           if [ "$dry" != "false" ]; then args+=(--dry-run); else args+=(--take-replaced); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
           if [ -n "$URGENT" ]; then args+=(--urgent "$URGENT"); fi

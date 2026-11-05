@@ -7,11 +7,14 @@ export const HOLD_MAX_DAYS = 14;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * One decision that a package stays with no release. A row over its limit that has a valid hold does not fail the gate. It
- * keeps its days in the report, and it reads as held.
+ * One decision that a package waits. With no field `repo`, the package stays with no release. A row over its limit with
+ * a valid hold does not fail the gate. It keeps its days in the report, and it reads as held. With the field `repo`, the
+ * train sends no update of the package to that repository. That hold says nothing about a release of the package.
  */
 export interface LagHold {
   package: string;
+  /** The dependent repository that does not get an update of the package. Absent: the hold is about the release of the package. */
+  repo?: string;
   /** The reason in plain words. An extension of the date needs a new reason. */
   reason: string;
   /** The `https` address of the text of the decision. */
@@ -39,9 +42,23 @@ const text = (record: Readonly<Record<string, unknown>>, field: string): string 
   return typeof value === "string" ? value.trim() : "";
 };
 
+/** This function gives the hold of a record of the file. An empty field `repo` is the same as no field. */
+function holdOfRecord(record: Readonly<Record<string, unknown>>): LagHold {
+  const repo = text(record, "repo");
+  return { package: text(record, "package"), ...(repo === "" ? {} : { repo }), reason: text(record, "reason"), ruling: text(record, "ruling"), until: text(record, "until") };
+}
+
+/** This function gives the name of a hold in a fault. */
+const holdName = (hold: LagHold): string => (hold.repo === undefined ? hold.package : `${hold.package} in ${hold.repo}`);
+
+/** This function tells if a hold stops the update of the package `dep` in the repository `repo`. */
+export function holdsUpdate(holds: readonly LagHold[], repo: string, dep: string): boolean {
+  return holds.some((hold) => hold.repo === repo && hold.package === dep);
+}
+
 /** This function gives the faults of one hold at the time `now`. */
 function holdFaults(hold: LagHold, now: Date): string[] {
-  const name = hold.package === "" ? "A hold with no package" : hold.package;
+  const name = hold.package === "" ? "A hold with no package" : holdName(hold);
   const faults: string[] = [];
   if (hold.package === "") faults.push(`${name}: the field package is empty.`);
   if (hold.reason === "") faults.push(`${name}: the hold has no reason.`);
@@ -65,10 +82,11 @@ export function readHolds(value: unknown, now: Date): HoldReading {
   const seen = new Set<string>();
   for (const item of list as unknown[]) {
     const record = typeof item === "object" && item !== null ? (item as Record<string, unknown>) : {};
-    const hold: LagHold = { package: text(record, "package"), reason: text(record, "reason"), ruling: text(record, "ruling"), until: text(record, "until") };
+    const hold = holdOfRecord(record);
     const faults = holdFaults(hold, now);
-    if (seen.has(hold.package)) faults.push(`${hold.package}: the file has two holds of this package.`);
-    seen.add(hold.package);
+    const key = holdName(hold);
+    if (seen.has(key)) faults.push(`${key}: the file has two holds of this package.`);
+    seen.add(key);
     reading.faults.push(...faults);
     if (faults.length === 0) reading.holds.push(hold);
   }
@@ -78,8 +96,8 @@ export function readHolds(value: unknown, now: Date): HoldReading {
 /** This function gives a fault for each hold with a later date and the same reason. An extension needs a new reason. */
 export function extensionFaults(before: readonly LagHold[], after: readonly LagHold[]): string[] {
   return after.flatMap((hold) => {
-    const old = before.find((item) => item.package === hold.package);
-    return old !== undefined && hold.until > old.until && hold.reason === old.reason ? [`${hold.package}: the hold goes to ${hold.until} with its old reason. An extension needs a new reason.`] : [];
+    const old = before.find((item) => holdName(item) === holdName(hold));
+    return old !== undefined && hold.until > old.until && hold.reason === old.reason ? [`${holdName(hold)}: the hold goes to ${hold.until} with its old reason. An extension needs a new reason.`] : [];
   });
 }
 
@@ -87,5 +105,5 @@ export function extensionFaults(before: readonly LagHold[], after: readonly LagH
 export function holdsOfFile(value: unknown): LagHold[] {
   const list = typeof value === "object" && value !== null ? (value as { holds?: unknown }).holds : undefined;
   if (!Array.isArray(list)) return [];
-  return (list as Record<string, unknown>[]).map((record) => ({ package: text(record, "package"), reason: text(record, "reason"), ruling: text(record, "ruling"), until: text(record, "until") }));
+  return (list as Record<string, unknown>[]).map(holdOfRecord);
 }

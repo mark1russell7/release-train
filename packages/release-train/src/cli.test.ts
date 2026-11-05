@@ -1,7 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { paceOptions, parseArgs } from "./cli.ts";
+import { applyHolding, paceOptions, parseArgs } from "./cli.ts";
 
 const workflow = readFileSync(new URL("../../../.github/workflows/train.yml", import.meta.url), "utf8");
 
@@ -24,6 +26,37 @@ describe("parseArgs", () => {
 
   it("reads the urgent names, comma-separated and in each --urgent", () => {
     expect(parseArgs(["apply", "--urgent", "@ex/a, @ex/b,", "--urgent", "c"]).urgent).toEqual(["@ex/a", "@ex/b", "c"]);
+  });
+});
+
+describe("the holds of the command apply", () => {
+  const file = (value: unknown): string => {
+    const folder = mkdtempSync(join(tmpdir(), "apply-holds-"));
+    const path = join(folder, "holds.json");
+    writeFileSync(path, JSON.stringify(value));
+    return path;
+  };
+  const hold = { package: "p", repo: "r", reason: "The owner holds it.", ruling: "https://example.test/r", until: "2026-11-07" };
+  const now = new Date("2026-11-05T12:00:00Z");
+
+  it("gets the file from the step of train.yml", () => {
+    expect(parseArgs(argsOfStep({ EVENT: "workflow_dispatch", INPUT_DRY: "true" })).holds).toBe("lag-holds.json");
+  });
+
+  it("has no hold with no file", () => {
+    expect(applyHolding({}, () => undefined)).toEqual([]);
+  });
+
+  it("gives the valid holds of the file", () => {
+    const lines: string[] = [];
+    expect(applyHolding({ holds: file({ holds: [hold] }), now }, (line) => lines.push(line))).toEqual([hold]);
+    expect(lines).toEqual([]);
+  });
+
+  it("writes a fault, and an expired hold holds nothing", () => {
+    const lines: string[] = [];
+    expect(applyHolding({ holds: file({ holds: [{ ...hold, until: "2026-11-04" }] }), now }, (line) => lines.push(line))).toEqual([]);
+    expect(lines).toEqual(["A fault of the holds: p in r: the date 2026-11-04 of the hold is in the past."]);
   });
 });
 
