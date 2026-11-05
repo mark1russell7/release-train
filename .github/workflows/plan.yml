@@ -15,6 +15,10 @@ concurrency:
   group: plan
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   plan:
     runs-on: ubuntu-latest
