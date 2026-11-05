@@ -163,12 +163,13 @@ function listedPath(item: string): string | null {
 /**
  * This function gives the `files` list of a manifest, as paths. It gives null if the manifest has no such list, or if the
  * list has a wildcard. The caller then reads the names of the files only, so a file can count that the package does not publish.
+ * A negated item only takes files out, so the function leaves it out: a file can count, and no change goes unseen.
  */
 export function publishedPaths(manifest: Readonly<Record<string, unknown>>): string[] | null {
   const files = manifest.files;
   if (!Array.isArray(files) || !files.every((x) => typeof x === "string")) return null;
   const always = [manifest.main, ...(typeof manifest.bin === "string" ? [manifest.bin] : Object.values((manifest.bin ?? {}) as object))].filter((x): x is string => typeof x === "string");
-  const paths = [...(files as string[]), ...always].map(listedPath);
+  const paths = [...(files as string[]).filter((x) => !x.startsWith("!")), ...always].map(listedPath);
   return paths.includes(null) ? null : (paths as string[]);
 }
 

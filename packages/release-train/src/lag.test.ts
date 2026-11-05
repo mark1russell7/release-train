@@ -77,9 +77,15 @@ describe("the files list of a package", () => {
     expect(isReleased("packages/x/cli/a.js", "packages/x", list)).toBe(true);
   });
 
-  it("gives no list for a wildcard or a negation, so the names of the files decide", () => {
+  it("leaves out a negated item, so a build config does not count and the source does", () => {
+    const list = publishedPaths({ files: ["build", "src", "!src/**/*.test.ts", "!src/fc-setup.ts"] });
+    expect(list).toEqual(["build", "src"]);
+    expect(isReleased("packages/x/tsdown.config.ts", "packages/x", list)).toBe(false);
+    expect(isReleased("packages/x/src/a.ts", "packages/x", list)).toBe(true);
+  });
+
+  it("gives no list for a wildcard, so the names of the files decide", () => {
     expect(publishedPaths({ files: ["build/*.js"] })).toBeNull();
-    expect(publishedPaths({ files: ["build", "!build/x"] })).toBeNull();
     expect(publishedPaths({})).toBeNull();
     expect(publishedPaths({ files: ["build/**"] })).toEqual(["build"]);
   });
