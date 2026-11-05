@@ -22,4 +22,4 @@ This file gives the items of the release train and their status. The Status page
 | RT14 | The first API report builds each package when the root has no script `build`, and a failure keeps its reason | Done | #101 |
 | RT15 | A run takes the urgent names of each run that it replaced, so an urgent dispatch is not lost | Done | #102 |
 | RT16 | The command `lag` reports each change with no release and each red train pull request, and a daily workflow holds the limits | Done | #104 |
-| RT17 | The command `lag` reads the `files` list of a package, and a `docs` or `style` commit does not start its clock | In progress | |
+| RT17 | The command `lag` reads the `files` list of a package, and a `docs` or `style` commit does not start its clock | Done | #105 |
