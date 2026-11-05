@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { FetchFn } from "./collect.ts";
 import type { GhResponse, GitHub } from "./github.ts";
-import { LAG_LIMIT_MS, RED_LIMIT_MS, isReleased, lagOver, lagReport, lagSummary, usedManifest } from "./lag.ts";
+import { LAG_LIMIT_MS, RED_LIMIT_MS, isReleased, lagOver, lagReport, lagSummary, publishedPaths, usedManifest } from "./lag.ts";
 import type { PackageNode } from "./types.ts";
 
 const NOW = new Date("2026-11-04T12:00:00Z");
@@ -49,6 +49,39 @@ describe("isReleased", () => {
     for (const f of ["packages/x/site/a.ts", "packages/x/.gitignore", "packages/x/renovate.json", "packages/y/src/a.ts", "packages/x/src/a.test.ts", "packages/x/src/a.test.unit.ts", "packages/x/test/api/report.txt", "packages/x/README.md", "packages/x/tsconfig.test.json", "packages/x/docs/a.ts", "packages/x/bench/a.ts", "packages/x/vitest.config.ts"]) {
       expect(isReleased(f, "packages/x")).toBe(false);
     }
+  });
+});
+
+describe("the files list of a package", () => {
+  const prober = publishedPaths({ main: "./src/index.ts", files: ["build", "bpf/prober.h", "native/src", "fixtures/records.bin", "README.md", "LICENSE"] });
+
+  it("counts a listed file, also in a folder that the names do not count", () => {
+    expect(isReleased("packages/x/fixtures/records.bin", "packages/x", prober)).toBe(true);
+    expect(isReleased("packages/x/native/src/a.rs", "packages/x", prober)).toBe(true);
+  });
+
+  it("counts the source of a package that lists the output of its build", () => {
+    expect(isReleased("packages/x/src/a.ts", "packages/x", prober)).toBe(true);
+    expect(isReleased("packages/x/src/a.ts", "packages/x", publishedPaths({ files: ["native"] }))).toBe(false);
+  });
+
+  it("does not count a file that the package does not publish, a test or a text", () => {
+    for (const f of ["packages/x/image/compare.sh", "packages/x/src/a.test.ts", "packages/x/README.md", "packages/x/LICENSE"]) {
+      expect(isReleased(f, "packages/x", prober)).toBe(false);
+    }
+  });
+
+  it("counts the main file and the bin files, because npm publishes them with any list", () => {
+    const list = publishedPaths({ files: ["build/"], main: "./entry.js", bin: { a: "./cli/a.js" } });
+    expect(isReleased("packages/x/entry.js", "packages/x", list)).toBe(true);
+    expect(isReleased("packages/x/cli/a.js", "packages/x", list)).toBe(true);
+  });
+
+  it("gives no list for a wildcard or a negation, so the names of the files decide", () => {
+    expect(publishedPaths({ files: ["build/*.js"] })).toBeNull();
+    expect(publishedPaths({ files: ["build", "!build/x"] })).toBeNull();
+    expect(publishedPaths({})).toBeNull();
+    expect(publishedPaths({ files: ["build/**"] })).toEqual(["build"]);
   });
 });
 
@@ -148,6 +181,57 @@ describe("lagReport", () => {
       [`/repos/o/r/compare/${OLD}...main`]: { status: "ahead", commits: [commit("b1", ago(9 * 24 * HOUR))], files: [{ filename: "packages/x/src/a.test.ts" }, { filename: "packages/x/README.md" }] },
     });
     expect(r.rows).toEqual([]);
+  });
+
+  it("does not report a change to a file that the files list leaves out", async () => {
+    const r = await run([pkg("@o/x")], {
+      [`/repos/o/r/compare/${OLD}...main`]: { status: "ahead", commits: [commit("b1", ago(9 * 24 * HOUR))], files: [{ filename: "packages/x/image/compare.sh" }] },
+      "/repos/o/r/contents/packages/x/package.json?ref=main": encodedManifest({ files: ["build"] }),
+    });
+    expect(r.rows).toEqual([]);
+  });
+
+  it("reports a change to a listed file in a folder that the names do not count", async () => {
+    const r = await run([pkg("@o/x")], {
+      [`/repos/o/r/compare/${OLD}...main`]: { status: "ahead", commits: [commit("b1", ago(9 * 24 * HOUR))], files: [{ filename: "packages/x/fixtures/a.bin" }] },
+      "/repos/o/r/commits/b1": { files: [{ filename: "packages/x/fixtures/a.bin" }] },
+      "/repos/o/r/contents/packages/x/package.json?ref=main": encodedManifest({ files: ["fixtures"] }),
+    });
+    expect(r.rows[0]?.over).toBe(true);
+  });
+
+  it("does not start the clock at a docs or style commit", async () => {
+    const r = await run([pkg("@o/x")], {
+      [`/repos/o/r/compare/${OLD}...main`]: {
+        status: "ahead",
+        commits: [commit("b1", ago(9 * 24 * HOUR), "docs: a comment"), commit("b2", ago(HOUR), "fix: a change")],
+        files: [{ filename: "packages/x/src/a.ts" }],
+      },
+      "/repos/o/r/commits/b1": { files: [{ filename: "packages/x/src/a.ts" }] },
+      "/repos/o/r/commits/b2": { files: [{ filename: "packages/x/src/a.ts" }] },
+    });
+    expect(r.rows[0]?.firstChange.title).toBe("fix: a change");
+    expect(r.rows[0]?.over).toBe(false);
+  });
+
+  it("does not report a package when each change comes from a docs or style commit", async () => {
+    const r = await run([pkg("@o/x")], {
+      [`/repos/o/r/compare/${OLD}...main`]: {
+        status: "ahead",
+        total_commits: 2,
+        commits: [commit("b1", ago(9 * 24 * HOUR), "docs(core): a comment"), commit("b2", ago(9 * 24 * HOUR), "style: a format")],
+        files: [{ filename: "packages/x/src/a.ts" }],
+      },
+    });
+    expect(r.rows).toEqual([]);
+  });
+
+  it("keeps a row when the read of the commits stops before their end", async () => {
+    const many = [commit("d0", ago(HOUR), "docs: a comment"), ...Array.from({ length: 70 }, (_, i) => commit(`c${i}`, ago(HOUR)))];
+    const routes: Record<string, unknown> = { [`/repos/o/r/compare/${OLD}...main`]: { status: "ahead", total_commits: 71, commits: many, files: [{ filename: "packages/x/src/a.ts" }] } };
+    for (const c of many) routes[`/repos/o/r/commits/${c.sha}`] = { files: [{ filename: "other.ts" }] };
+    const r = await run([pkg("@o/x")], routes);
+    expect(r.rows[0]?.partial).toBe(true);
   });
 
   it("does not report a package at the head of the branch", async () => {

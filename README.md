@@ -212,6 +212,8 @@ The command makes no write. It reports these items:
 | A missing release | 2 days | The default branch has a new version, and npm does not have it. |
 | A red train pull request | 1 day | An open pull request of the train has a failed check. |
 
+The `files` list of the package tells which changes count. The source of a package that lists a build folder also counts. A list with a wildcard, or no list, gives a read of the file names only. A commit of the type `docs` or `style` does not start the clock.
+
 - The published commit comes from npm: the provenance of the version, or its `gitHead`. A package with neither goes to the list "Not read".
 - A file counts when its name is in the package. Tests, texts, sites and the settings of tools do not count. The command reads names only, so a file that the package does not publish can count.
 - A `package.json` counts when a field that a user gets changes, as `dependencies` or `exports`. A change of `devDependencies` or `scripts` does not count.
