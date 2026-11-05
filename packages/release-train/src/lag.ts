@@ -106,6 +106,8 @@ interface CommitInfo {
 
 interface CompareAnswer {
   status: string;
+  total_commits?: number;
+  base_commit?: CommitInfo;
   commits?: CommitInfo[];
   files?: { filename: string }[];
 }
@@ -145,15 +147,53 @@ export function usedManifest(manifest: Readonly<Record<string, unknown>>): strin
   return JSON.stringify(Object.entries(manifest).filter(([k]) => USED_FIELDS.includes(k)).sort(([a], [b]) => a.localeCompare(b)));
 }
 
+/** One page of the commits of a folder. It is larger than `MAX_WALK`, so a full page does not read as all the commits. */
+const FOLDER_PAGE = 100;
+/** These folders hold the output of a build. A package that lists one of them publishes what its `src` folder builds. */
+const BUILD_OUTPUT = /^(build|dist|lib|out)$/;
+/** A commit of this type changes no behavior, so it does not start the clock of a release. */
+const NO_EFFECT_COMMIT = /^(docs|style)(\([^)]*\))?:/;
+
+/** This function gives the folder or the file that an item of a `files` list names, or null for a pattern with a wildcard. */
+function listedPath(item: string): string | null {
+  const plain = item.replace(/^\.\//, "").replace(/\/(\*\*?(\/\*)?)?$/, "");
+  return /[*?![\]{}]/.test(plain) || plain === "" ? null : plain;
+}
+
+/**
+ * This function gives the `files` list of a manifest, as paths. It gives null if the manifest has no such list, or if the
+ * list has a wildcard. The caller then reads the names of the files only, so a file can count that the package does not publish.
+ * A negated item only takes files out. A negated plain path stays in the list with its `!`, so that file does not count. A
+ * negated pattern goes out of the list: a file can count, and no change goes unseen.
+ */
+export function publishedPaths(manifest: Readonly<Record<string, unknown>>): string[] | null {
+  const files = manifest["files"];
+  if (!Array.isArray(files) || !files.every((x) => typeof x === "string")) return null;
+  const bin = manifest["bin"];
+  const always = [manifest["main"], ...(typeof bin === "string" ? [bin] : Object.values((bin ?? {}) as object))].filter((x): x is string => typeof x === "string");
+  const negated = (files as string[]).filter((x) => x.startsWith("!")).map((x) => listedPath(x.slice(1)));
+  const paths = [...(files as string[]).filter((x) => !x.startsWith("!")), ...always].map(listedPath);
+  if (paths.includes(null)) return null;
+  return [...(paths as string[]), ...negated.filter((x) => x !== null).map((x) => `!${x}`)];
+}
+
 /**
  * This function tells if a file is a part of what a package publishes. `path` is the folder of the package, and the root
- * folder is the empty string. The function reads a name only, so a file that the package does not publish can count.
+ * folder is the empty string. `published` is the result of `publishedPaths`. A listed file counts, and so does the `src`
+ * folder of a package that lists the output of a build. With no list, the function reads the name of the file only.
  */
-export function isReleased(file: string, path: string): boolean {
+export function isReleased(file: string, path: string, published: readonly string[] | null = null): boolean {
   const prefix = path === "" ? "" : `${path}/`;
   if (!file.startsWith(prefix)) return false;
   const inside = file.slice(prefix.length);
-  return !OUTSIDE_FOLDER.test(inside) && !OUTSIDE_FILE.test(inside);
+  if (inside === "package.json") return true;
+  if (OUTSIDE_FILE.test(inside)) return false;
+  const guess = !OUTSIDE_FOLDER.test(inside);
+  if (published === null) return guess;
+  const under = (x: string): boolean => inside === x || inside.startsWith(`${x}/`);
+  if (published.some((x) => x.startsWith("!") && under(x.slice(1)))) return false;
+  if (published.some(under)) return true;
+  return guess && inside.startsWith("src/") && published.some((x) => BUILD_OUTPUT.test(x));
 }
 
 const days = (ms: number): number => Math.round((ms / (24 * 60 * 60 * 1000)) * 10) / 10;
@@ -213,14 +253,18 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     }
     return c;
   };
-  const manifestAt = async (repo: string, file: string, ref: string): Promise<string | null> => {
+  const readManifest = async (repo: string, file: string, ref: string): Promise<Record<string, unknown> | null> => {
     const r = await i.gh.request<{ content?: string }>("GET", `${slug(repo)}/contents/${file}?ref=${encodeURIComponent(ref)}`);
     if (r.data?.content === undefined) return null;
     try {
-      return usedManifest(JSON.parse(Buffer.from(r.data.content, "base64").toString("utf8")) as Record<string, unknown>);
+      return JSON.parse(Buffer.from(r.data.content, "base64").toString("utf8")) as Record<string, unknown>;
     } catch {
       return null;
     }
+  };
+  const manifestAt = async (repo: string, file: string, ref: string): Promise<string | null> => {
+    const m = await readManifest(repo, file, ref);
+    return m === null ? null : usedManifest(m);
   };
   const commits = new Map<string, Promise<string[]>>();
   const filesOf = (repo: string, sha: string): Promise<string[]> => {
@@ -240,6 +284,15 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     return null;
   };
 
+  // A busy repository has many commits since a release, and few of them touch one package. So the walk reads the commits
+  // of the folder of the package. A failed read gives null, and the walk then reads the commits of the comparison.
+  const commitsOfFolder = async (repo: string, path: string, branch: string, base: CommitInfo | undefined): Promise<CommitInfo[] | null> => {
+    if (path === "" || base === undefined) return null;
+    const query = `path=${encodeURIComponent(path)}&sha=${encodeURIComponent(branch)}&since=${encodeURIComponent(base.commit.committer.date)}&per_page=${FOLDER_PAGE}`;
+    const r = await i.gh.request<CommitInfo[]>("GET", `${slug(repo)}/commits?${query}`);
+    return Array.isArray(r.data) ? r.data.filter((c) => c.sha !== base.sha).reverse() : null;
+  };
+
   const rowOf = async (p: PackageNode): Promise<LagRow | null> => {
     const published = p.npm.latest as string;
     const branch = i.branches.get(p.repo);
@@ -251,7 +304,10 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     if (answer.status === "identical" || answer.status === "behind") return null;
     const listed = answer.files ?? [];
     const manifest = p.path === "" ? "package.json" : `${p.path}/package.json`;
-    const source = listed.filter((x) => isReleased(x.filename, p.path) && x.filename !== manifest);
+    // A failed read gives no list, so the names of the files decide and a fault gives a row.
+    const head = await readManifest(p.repo, manifest, branch);
+    const shippedFiles = head === null ? null : publishedPaths(head);
+    const source = listed.filter((x) => isReleased(x.filename, p.path, shippedFiles) && x.filename !== manifest);
     // A failed read counts as a change, so a fault gives a row and not a silent pass.
     const newVersion = p.version !== published;
     const manifestListed = listed.some((x) => x.filename === manifest);
@@ -263,22 +319,34 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     };
     const manifestMoved = newVersion || (manifestListed && (await movedAt(branch)));
     const counts = async (sha: string): Promise<boolean> => {
-      const files = (await filesOf(p.repo, sha)).filter((x) => isReleased(x, p.path));
+      const files = (await filesOf(p.repo, sha)).filter((x) => isReleased(x, p.path, shippedFiles));
       if (files.some((x) => x !== manifest)) return true;
       return files.length > 0 && manifestMoved && (await movedAt(sha));
     };
     const changed = source.length + (manifestMoved ? 1 : 0);
     if (changed === 0 && listed.length < COMPARE_FILES) return null;
 
-    const walk = (answer.commits ?? []).slice(0, MAX_WALK);
+    const folder = await commitsOfFolder(p.repo, p.path, branch, answer.base_commit);
+    const walk = (folder ?? answer.commits ?? []).slice(0, MAX_WALK);
     let first: CommitInfo | undefined;
+    let noEffect = 0;
     for (const c of walk) {
+      if (NO_EFFECT_COMMIT.test(c.commit.message)) {
+        noEffect += 1;
+        continue;
+      }
       if (await counts(c.sha)) {
         first = c;
         break;
       }
     }
     if (first === undefined && changed === 0) return null;
+    // Each commit is read, and the only commits with a change are of a type with no effect.
+    const allRead =
+      folder !== null
+        ? folder.length <= MAX_WALK
+        : (answer.commits ?? []).length <= MAX_WALK && (answer.total_commits ?? 0) <= (answer.commits ?? []).length;
+    if (first === undefined && allRead && noEffect > 0) return null;
     const partial = first === undefined;
     const shown = first ?? walk[walk.length - 1];
     if (shown === undefined) return miss(p, "GitHub listed changed files with no commit.");
