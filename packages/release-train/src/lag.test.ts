@@ -234,6 +234,47 @@ describe("lagReport", () => {
     expect(r.rows[0]?.partial).toBe(true);
   });
 
+  describe("the commits of the folder", () => {
+    const base = commit("p0", ago(20 * 24 * HOUR));
+    const folderRoute = `/repos/o/r/commits?path=packages%2Fx&sha=main&since=${encodeURIComponent(base.commit.committer.date)}&per_page=100`;
+    const others = Array.from({ length: 70 }, (_, i) => commit(`c${i}`, ago(10 * 24 * HOUR)));
+    const answer = { status: "ahead", base_commit: base, total_commits: 71, commits: others, files: [{ filename: "packages/x/src/a.ts" }] };
+
+    it("does not report a change that only a docs commit makes, in a repository with many commits", async () => {
+      const r = await run([pkg("@o/x")], {
+        [`/repos/o/r/compare/${OLD}...main`]: answer,
+        [folderRoute]: [commit("d1", ago(9 * 24 * HOUR), "docs: comments"), base],
+      });
+      expect(r.rows).toEqual([]);
+    });
+
+    it("gives the first commit of the folder that changes a published file, newest last", async () => {
+      const r = await run([pkg("@o/x")], {
+        [`/repos/o/r/compare/${OLD}...main`]: answer,
+        [folderRoute]: [commit("f2", ago(HOUR), "fix: later"), commit("f1", ago(9 * 24 * HOUR), "fix: first"), base],
+        "/repos/o/r/commits/f1": { files: [{ filename: "packages/x/src/a.ts" }] },
+        "/repos/o/r/commits/f2": { files: [{ filename: "packages/x/src/a.ts" }] },
+      });
+      expect(r.rows[0]?.firstChange.title).toBe("fix: first");
+      expect(r.rows[0]?.partial).toBe(false);
+      expect(r.rows[0]?.over).toBe(true);
+    });
+
+    it("keeps a row when the page of the folder is full, because more commits can follow", async () => {
+      const full = Array.from({ length: 100 }, (_, i) => commit(`d${i}`, ago(HOUR), "docs: comments"));
+      const r = await run([pkg("@o/x")], { [`/repos/o/r/compare/${OLD}...main`]: answer, [folderRoute]: full });
+      expect(r.rows[0]?.partial).toBe(true);
+    });
+
+    it("reads the commits of the comparison when the read of the folder fails", async () => {
+      const r = await run([pkg("@o/x")], {
+        [`/repos/o/r/compare/${OLD}...main`]: { ...answer, total_commits: 1, commits: [commit("g1", ago(9 * 24 * HOUR))] },
+        "/repos/o/r/commits/g1": { files: [{ filename: "packages/x/src/a.ts" }] },
+      });
+      expect(r.rows[0]?.over).toBe(true);
+    });
+  });
+
   it("does not report a package at the head of the branch", async () => {
     const r = await run([pkg("@o/x")], { [`/repos/o/r/compare/${OLD}...main`]: { status: "identical", commits: [], files: [] } });
     expect(r.rows).toEqual([]);

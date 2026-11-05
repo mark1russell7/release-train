@@ -107,6 +107,7 @@ interface CommitInfo {
 interface CompareAnswer {
   status: string;
   total_commits?: number;
+  base_commit?: CommitInfo;
   commits?: CommitInfo[];
   files?: { filename: string }[];
 }
@@ -146,6 +147,8 @@ export function usedManifest(manifest: Readonly<Record<string, unknown>>): strin
   return JSON.stringify(Object.entries(manifest).filter(([k]) => USED_FIELDS.includes(k)).sort(([a], [b]) => a.localeCompare(b)));
 }
 
+/** One page of the commits of a folder. It is larger than `MAX_WALK`, so a full page is never read as all the commits. */
+const FOLDER_PAGE = 100;
 /** These folders hold the output of a build. A package that lists one of them publishes what its `src` folder builds. */
 const BUILD_OUTPUT = /^(build|dist|lib|out)$/;
 /** A commit of this type changes no behavior, so it does not start the clock of a release. */
@@ -274,6 +277,15 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     return null;
   };
 
+  // A busy repository has many commits since a release, and few of them touch one package. So the walk reads the commits
+  // of the folder of the package. A failed read gives null, and the walk then reads the commits of the comparison.
+  const commitsOfFolder = async (repo: string, path: string, branch: string, base: CommitInfo | undefined): Promise<CommitInfo[] | null> => {
+    if (path === "" || base === undefined) return null;
+    const query = `path=${encodeURIComponent(path)}&sha=${encodeURIComponent(branch)}&since=${encodeURIComponent(base.commit.committer.date)}&per_page=${FOLDER_PAGE}`;
+    const r = await i.gh.request<CommitInfo[]>("GET", `${slug(repo)}/commits?${query}`);
+    return Array.isArray(r.data) ? r.data.filter((c) => c.sha !== base.sha).reverse() : null;
+  };
+
   const rowOf = async (p: PackageNode): Promise<LagRow | null> => {
     const published = p.npm.latest as string;
     const branch = i.branches.get(p.repo);
@@ -307,7 +319,8 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     const changed = source.length + (manifestMoved ? 1 : 0);
     if (changed === 0 && listed.length < COMPARE_FILES) return null;
 
-    const walk = (answer.commits ?? []).slice(0, MAX_WALK);
+    const folder = await commitsOfFolder(p.repo, p.path, branch, answer.base_commit);
+    const walk = (folder ?? answer.commits ?? []).slice(0, MAX_WALK);
     let first: CommitInfo | undefined;
     let noEffect = 0;
     for (const c of walk) {
@@ -322,7 +335,10 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     }
     if (first === undefined && changed === 0) return null;
     // Each commit is read, and the only commits with a change are of a type with no effect.
-    const allRead = (answer.commits ?? []).length <= MAX_WALK && (answer.total_commits ?? 0) <= (answer.commits ?? []).length;
+    const allRead =
+      folder !== null
+        ? folder.length <= MAX_WALK
+        : (answer.commits ?? []).length <= MAX_WALK && (answer.total_commits ?? 0) <= (answer.commits ?? []).length;
     if (first === undefined && allRead && noEffect > 0) return null;
     const partial = first === undefined;
     const shown = first ?? walk[walk.length - 1];
