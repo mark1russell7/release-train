@@ -147,7 +147,7 @@ export function usedManifest(manifest: Readonly<Record<string, unknown>>): strin
   return JSON.stringify(Object.entries(manifest).filter(([k]) => USED_FIELDS.includes(k)).sort(([a], [b]) => a.localeCompare(b)));
 }
 
-/** One page of the commits of a folder. It is larger than `MAX_WALK`, so a full page is never read as all the commits. */
+/** One page of the commits of a folder. It is larger than `MAX_WALK`, so a full page does not read as all the commits. */
 const FOLDER_PAGE = 100;
 /** These folders hold the output of a build. A package that lists one of them publishes what its `src` folder builds. */
 const BUILD_OUTPUT = /^(build|dist|lib|out)$/;
@@ -167,9 +167,10 @@ function listedPath(item: string): string | null {
  * negated pattern goes out of the list: a file can count, and no change goes unseen.
  */
 export function publishedPaths(manifest: Readonly<Record<string, unknown>>): string[] | null {
-  const files = manifest.files;
+  const files = manifest["files"];
   if (!Array.isArray(files) || !files.every((x) => typeof x === "string")) return null;
-  const always = [manifest.main, ...(typeof manifest.bin === "string" ? [manifest.bin] : Object.values((manifest.bin ?? {}) as object))].filter((x): x is string => typeof x === "string");
+  const bin = manifest["bin"];
+  const always = [manifest["main"], ...(typeof bin === "string" ? [bin] : Object.values((bin ?? {}) as object))].filter((x): x is string => typeof x === "string");
   const negated = (files as string[]).filter((x) => x.startsWith("!")).map((x) => listedPath(x.slice(1)));
   const paths = [...(files as string[]).filter((x) => !x.startsWith("!")), ...always].map(listedPath);
   if (paths.includes(null)) return null;
