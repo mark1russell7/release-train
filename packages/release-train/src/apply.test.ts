@@ -25,7 +25,7 @@ import { gitHub } from "./github.ts";
 import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import type { Manifest, NpmInfo, RepoSnapshot, Resolved } from "./types.ts";
-import { CONVENTIONS, ageExcluded, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
+import { API_REPORT_PACKAGE, CONVENTIONS, ageExcluded, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 const OWNER = "example-owner";
@@ -1110,14 +1110,15 @@ describe("gitUpdater and conventions fix", () => {
 });
 
 describe("gitUpdater and the first API report", () => {
-  const update = (): RepoUpdate => {
+  const update = (dep: string = CONVENTIONS): RepoUpdate => {
     const u = selectUpdates(fixture(), ["lib-repo"]).ready[0] as RepoUpdate;
-    return { ...u, lockKind: "pnpm" as const, items: u.items.filter((i) => i.dep === "@ex/util").map((i) => ({ ...i, dep: CONVENTIONS, to: "0.29.0" })) };
+    return { ...u, lockKind: "pnpm" as const, items: u.items.filter((i) => i.dep === "@ex/util").map((i) => ({ ...i, dep, to: "0.29.0" })) };
   };
   const REPORT = "packages/a/test/api/public-api.txt";
 
   /** The clone has the script `start`. The fix adds `check:api` and writes LICENSE. The step `broken` fails. */
-  const start = async (options: { had?: boolean; broken?: string; config?: string; noBuild?: boolean; noReport?: string } = {}) => {
+  const start = async (options: { had?: boolean; broken?: string; config?: string; noBuild?: boolean; noReport?: string; tool?: boolean } = {}) => {
+    const dep = options.tool === true ? API_REPORT_PACKAGE : CONVENTIONS;
     const cmds: string[] = [];
     const trees: { manifest: string; lock: string }[] = [];
     let message = "";
@@ -1130,7 +1131,7 @@ describe("gitUpdater and the first API report", () => {
       if (cmd === "git" && args[0] === "clone") {
         const apiReport = options.config === undefined ? {} : { apiReport: { report: options.config } };
         const scripts = { ...(options.noBuild === true ? {} : { build: "tsc" }), ...(options.had === true ? { "check:api": "api-report check" } : {}) };
-        writeFileSync(file, `${JSON.stringify({ name: "x", scripts, ...apiReport, devDependencies: { [CONVENTIONS]: "^0.8.0" } }, null, 2)}\n`);
+        writeFileSync(file, `${JSON.stringify({ name: "x", scripts, ...apiReport, devDependencies: { [dep]: "^0.8.0" } }, null, 2)}\n`);
       }
       if (cmd === "git" && args[0] === "write-tree") {
         trees.push({ manifest: readFileSync(file, "utf8"), lock: readFileSync(join(opts.cwd, "pnpm-lock.yaml"), "utf8") });
@@ -1168,13 +1169,13 @@ describe("gitUpdater and the first API report", () => {
       }
       if (cmd === "pnpm" && args[0] === "install") {
         const to = update().items[0]?.to ?? "";
-        writeFileSync(join(opts.cwd, "pnpm-lock.yaml"), `lockfileVersion: '9.0'\nimporters:\n  .:\n    devDependencies:\n      '${CONVENTIONS}':\n        specifier: ^0.8.0\n        version: ${to}\n`);
+        writeFileSync(join(opts.cwd, "pnpm-lock.yaml"), `lockfileVersion: '9.0'\nimporters:\n  .:\n    devDependencies:\n      '${dep}':\n        specifier: ^0.8.0\n        version: ${to}\n`);
       }
       const stdout = cmd === "pnpm" && args[0] === "--version" ? "12.10.1\n" : cmd === "git" && args[0] === "status" ? " M package.json\n" : "";
       return { code: 0, stdout, stderr: "" };
     };
     const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: async () => new Response("{}", { status: 200 }) });
-    const result = await up.update(update(), { defaultBranch: "main", rebuild: false });
+    const result = await up.update(update(dep), { defaultBranch: "main", rebuild: false });
     return { cmds, message, result, manifest, reportStayed };
   };
 
@@ -1209,6 +1210,36 @@ describe("gitUpdater and the first API report", () => {
   it("uses the report file that the repository names", async () => {
     const { result } = await start({ config: "./api.md" });
     expect(result).toMatchObject({ fixed: ["package.json", "LICENSE", "packages/a/api.md"] });
+  });
+
+  it("writes the reports in the commit of an update that moves api-report", async () => {
+    const { cmds, message, result } = await start({ had: true, tool: true });
+    const order = ["pnpm install --lockfile-only", "pnpm install --frozen-lockfile --ignore-scripts", "pnpm run build", "pnpm exec api-report update"].map((c) => cmds.lastIndexOf(c));
+    expect(order.every((at) => at >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(result).toMatchObject({ status: "pushed", apiReports: [REPORT] });
+    expect(result.fixed).toBeUndefined();
+    expect(message).toContain("- api-report update: 1 report");
+    expect(cmds.slice(0, cmds.findIndex((c) => c.includes(" commit ")))).toContain(`git add -A -- ${REPORT}`);
+    expect(prBody(update(API_REPORT_PACKAGE), result)).toContain("## API reports\n");
+  });
+
+  it("keeps the update and tells the step when a step of the reports fails", async () => {
+    for (const broken of ["pnpm run build", "pnpm exec api-report update"]) {
+      const { message, result, manifest } = await start({ had: true, tool: true, broken });
+      expect(result).toMatchObject({ status: "pushed", apiReportStep: broken });
+      expect(result.apiReportError).toContain("TS2307");
+      expect(result.apiReports).toBeUndefined();
+      expect(message).toContain(`- api-report update did not finish, it failed at ${broken}`);
+      expect(manifest).toContain(API_REPORT_PACKAGE);
+      expect(prBody(update(API_REPORT_PACKAGE), result)).toContain("## API reports not updated");
+    }
+  });
+
+  it("does not start api-report update when the repository has no script", async () => {
+    const { cmds, result } = await start({ tool: true });
+    expect(cmds).not.toContain("pnpm exec api-report update");
+    expect(result.apiReports).toBeUndefined();
   });
 
   it("writes no report for a repository that already has the script", async () => {

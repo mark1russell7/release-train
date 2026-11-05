@@ -302,6 +302,12 @@ export interface UpdateResult {
   fixError?: string | null;
   /** The step that failed with the fix, when it is not `typecheck`. */
   fixStep?: string;
+  /** The reports that `api-report update` changed, when the update moved that tool. */
+  apiReports?: string[];
+  /** The first error lines, when a step of that update failed. */
+  apiReportError?: string;
+  /** The step that failed. */
+  apiReportStep?: string;
 }
 
 /** The part of the train that changes the files: a clone, the range changes, the lockfile update and the push. */
@@ -497,7 +503,7 @@ export function prTitle(u: RepoUpdate): string {
 }
 
 /** This function gives the body of the pull request of an update. */
-export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; fixStep?: string; fixError?: string | null; urgentAge?: string[] }) | null): string {
+export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; apiReports?: string[]; apiReportError?: string; apiReportStep?: string; fixStep?: string; fixError?: string | null; urgentAge?: string[] }) | null): string {
   const lockOf = new Map((r?.changes ?? []).map((c) => [`${c.path}|${c.dep}`, c]));
   const rows = u.items.map((i) => {
     const c = lockOf.get(`${i.path}|${i.dep}`);
@@ -566,6 +572,29 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
       ...reverted.map((file) => `- \`${file}\``),
       "",
       ...(r?.fixError ? ["```text", r.fixError, "```", ""] : []),
+    );
+  }
+  const apiReports = r?.apiReports ?? [];
+  if (apiReports.length > 0) {
+    lines.push(
+      "## API reports",
+      "",
+      "The update moves `api-report`, so the train started `api-report update`. The default branch passed `check:api`, so a difference here comes from the tool. A difference that is more than a change of form is a finding.",
+      "",
+      ...apiReports.map((file) => `- \`${file}\``),
+      "",
+    );
+  }
+  if (r?.apiReportError) {
+    lines.push(
+      "## API reports not updated",
+      "",
+      `The update moves \`api-report\`, but ${r.apiReportStep ?? "a step"} failed. \`check:api\` can fail on this branch until a person starts \`api-report update\`.`,
+      "",
+      "```text",
+      r.apiReportError,
+      "```",
+      "",
     );
   }
   lines.push("## Other lockfile changes", "");
