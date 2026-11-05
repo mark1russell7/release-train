@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import semver from "semver";
-import { changesetText, decideBump, setManifestVersion, typedFiles } from "./release.ts";
+import { addChangelogSection, changesetText, decideBump, setManifestVersion, typedFiles } from "./release.ts";
 import { ageExcludeAdd, ageRuleEdit, globMatch, ownScopes } from "./settings.ts";
 import type { LockChange, ReleaseDone, RepoUpdate, UpdateResult, Updater, YoungItem } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
@@ -537,6 +537,13 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
               if (text === null) return fail(`${r.path || "."}/package.json has no version field.`);
               writeFileSync(file, text);
               bumped.push(r.path);
+              // Each version has its section. The owner can add text to the section before the merge.
+              const log = join(dir, r.path, "CHANGELOG.md");
+              if (existsSync(log)) {
+                const ranges = r.changes.map((c) => `\`${c.dep}\``).join(", ");
+                const section = addChangelogSection(readFileSync(log, "utf8"), d.to, `The release train changes the range of ${ranges} to a version outside the old range. ${d.why}`);
+                if (section !== null) writeFileSync(log, section);
+              }
             }
           }
           if (viaChangeset) {

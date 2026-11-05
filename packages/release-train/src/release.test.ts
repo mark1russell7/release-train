@@ -9,7 +9,7 @@ import { gitHub } from "./github.ts";
 import type { FetchFn } from "./collect.ts";
 import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
-import { awaitRelease, changesetText, decideBump, namesModule, setManifestVersion, typedFiles } from "./release.ts";
+import { addChangelogSection, awaitRelease, changesetText, decideBump, namesModule, setManifestVersion, typedFiles } from "./release.ts";
 import type { Manifest, NpmInfo, RepoSnapshot } from "./types.ts";
 import { changesetName, gitUpdater } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
@@ -144,6 +144,35 @@ describe("gitUpdater with a cascade release", () => {
     expect(seen.manifest).toContain('"version": "0.4.0"');
     expect(seen.manifest).toContain('"@ex/core": "^2.0.0"');
     expect(prBody(u, r)).toContain("| `@ex/pub` | 0.3.0 -> 0.4.0 | minor |");
+  });
+
+  it("adds the section of the new version to the changelog of the package, and keeps the changelog when it has the section", async () => {
+    const u = { ...(selectUpdates(cascadePlan()).ready.find((x) => x.repo === "pub-repo") as RepoUpdate), lockKind: "none" as const };
+    const go = async (first: string): Promise<string> => {
+      let log = "";
+      const inner = runWith(false, [], {});
+      const run: RunFn = async (cmd, args, opts) => {
+        const out = await inner(cmd, args, opts);
+        if (cmd === "git" && args[0] === "clone") writeFileSync(join(opts.cwd, "CHANGELOG.md"), first);
+        if (cmd === "git" && args.includes("commit")) log = readFileSync(join(opts.cwd, "CHANGELOG.md"), "utf8");
+        return out;
+      };
+      const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: fetchFn });
+      expect((await up.update(u, { defaultBranch: "main", rebuild: false })).status).toBe("pushed");
+      return log;
+    };
+    const added = await go("# Changes\n\n## 0.3.0\n\nOld.\n");
+    expect(added).toMatch(/^# Changes\n\n## 0\.4\.0\n\nThe release train changes the range of `@ex\/core` to a version outside the old range\. .+\n\n## 0\.3\.0\n\nOld\.\n$/);
+    const kept = "## 0.4.0\n\nThe owner wrote this.\n\n## 0.3.0\n";
+    expect(await go(kept)).toBe(kept);
+  });
+
+  it("puts a section below Unreleased, reads each form of a heading and keeps the line ends", () => {
+    expect(addChangelogSection("# C\n\n## Unreleased\n\n- a\n\n## 1.0.0\n", "1.1.0", "Why.")).toBe("# C\n\n## Unreleased\n\n- a\n\n## 1.1.0\n\nWhy.\n\n## 1.0.0\n");
+    expect(addChangelogSection("# C\n", "1.1.0", "Why.")).toBe("# C\n\n## 1.1.0\n\nWhy.\n");
+    expect(addChangelogSection("# C\r\n\r\n## 1.0.0\r\n", "1.1.0", "Why.")).toBe("# C\r\n\r\n## 1.1.0\r\n\r\nWhy.\r\n\r\n## 1.0.0\r\n");
+    for (const text of ["## 1.1.0\n", "## [1.1.0] (2026-11-05)\n", "## v1.1.0 - notes\n"]) expect(addChangelogSection(text, "1.1.0", "Why."), text).toBeNull();
+    expect(addChangelogSection("## 1.1.0-rc.1\n", "1.1.0", "Why.")).toBe("## 1.1.0\n\nWhy.\n\n## 1.1.0-rc.1\n");
   });
 
   it("keeps a version on main that is already high enough", async () => {

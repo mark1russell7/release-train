@@ -96,6 +96,22 @@ export function setManifestVersion(text: string, to: string): string | null {
   return `${text.slice(0, open + 1)}${to}${text.slice(close)}`;
 }
 
+/**
+ * This function adds the section of a version above the first version section of a changelog. It keeps the other text. It
+ * gives null when the changelog already has a section for the version.
+ */
+export function addChangelogSection(text: string, version: string, why: string): string | null {
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(eol);
+  const heading = /^##\s+\[?v?(\d[^\s\]]*)/;
+  if (lines.some((line) => heading.exec(line)?.[1] === version)) return null;
+  const at = lines.findIndex((line) => heading.test(line));
+  const section = [`## ${version}`, "", why, ""];
+  if (at >= 0) lines.splice(at, 0, ...section);
+  else lines.push(...(lines.at(-1) === "" ? [] : [""]), ...section);
+  return lines.join(eol);
+}
+
 /** This function gives the text of a changeset file. */
 export function changesetText(packages: readonly { name: string; type: ReleaseType }[], summary: string): string {
   return ["---", ...packages.map((p) => `"${p.name}": ${p.type}`), "---", "", summary, ""].join("\n");

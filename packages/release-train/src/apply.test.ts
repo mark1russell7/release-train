@@ -139,6 +139,62 @@ describe("selection", () => {
   });
 });
 
+describe("a release in flight", () => {
+  /** A repository with 1.1.0 on main and 1.0.0 on npm, and a dependency with a new major version. */
+  const pending = () =>
+    plan(
+      buildGraph({
+        owner: OWNER,
+        repos: [
+          repo("base-repo", { "": { name: "@ex/base", version: "2.0.0" } }),
+          repo("pub-repo", { "": { name: "@ex/pub", version: "1.1.0", dependencies: { "@ex/base": "^1.0.0" } } }, { resolved: { "": { "@ex/base": "1.0.0" } } }),
+        ],
+        npm: { "@ex/base": npm("2.0.0"), "@ex/pub": npm("1.0.0") },
+        now: new Date("2026-01-01T00:00:00Z"),
+      }),
+    );
+  const workflow = (text: string): Handler => () => [200, { content: Buffer.from(text).toString("base64") }];
+  const routes = (text: string, last: { status: string; conclusion: string | null }): Record<string, Handler> => ({
+    [`GET ${base}/pub-repo/pulls`]: () => [200, [pull(5, "pub-repo")]],
+    [`GET ${base}/pub-repo`]: meta,
+    [`GET ${base}/pub-repo/contents/.github/workflows/release.yml`]: workflow(text),
+    [`GET ${base}/pub-repo/actions/workflows/release.yml/runs`]: () => [200, { workflow_runs: [last] }],
+    [`GET ${base}/pub-repo/commits/sha5/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }],
+    [`GET ${base}/pub-repo/commits/sha5/status`]: () => [200, { state: "pending", total_count: 0 }],
+    [`GET ${base}/pub-repo/compare/main...sha5`]: () => [200, { behind_by: 0 }],
+  });
+  const ON_PUSH = "on:\n  push:\n    branches: [main]\n";
+  const BY_HAND = "on:\n  workflow_dispatch:\n";
+
+  it("holds a range of the package, and no other repository", () => {
+    expect(selectUpdates(pending()).ready.map((u) => u.repo)).toEqual(["pub-repo"]);
+    const s = selectUpdates(pending(), null, "all", new Set(["pub-repo"]));
+    expect(s.ready).toEqual([]);
+    expect(s.waiting).toEqual([expect.objectContaining({ repo: "pub-repo", holdsOpen: true, dependsOn: expect.arrayContaining(["release-in-flight:release:pub-repo"]) })]);
+    expect(selectUpdates(pending(), null, "all", new Set(["other-repo"])).ready.map((u) => u.repo)).toEqual(["pub-repo"]);
+  });
+
+  it("does not merge an open green pull request while the release workflow runs", async () => {
+    const { gh, calls } = server(routes(ON_PUSH, { status: "queued", conclusion: null }));
+    const up = updater();
+    const r = await apply({ owner: OWNER, plan: pending(), gh, updater: up, dryRun: false });
+    expect(up.seen).toEqual([]);
+    expect(calls.filter((c) => c.method === "PUT")).toEqual([]);
+    expect(r.results.find((x) => x.repo === "pub-repo" && x.actionId === "update:pub-repo")).toMatchObject({ state: "waiting", pr: { number: 5 } });
+  });
+
+  it("does not hold a range when the last release failed or when the release starts by hand", async () => {
+    for (const [text, last] of [
+      [ON_PUSH, { status: "completed", conclusion: "failure" }],
+      [BY_HAND, { status: "completed", conclusion: "success" }],
+    ] as const) {
+      const { gh } = server(routes(text, last));
+      const r = await apply({ owner: OWNER, plan: pending(), gh, updater: updater(), dryRun: true });
+      expect(r.results.find((x) => x.repo === "pub-repo" && x.actionId === "update:pub-repo"), text).toMatchObject({ state: "planned" });
+    }
+  });
+});
+
 describe("apply", () => {
   it("changes nothing in a dry run", async () => {
     const { gh, calls } = server({
