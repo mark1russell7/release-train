@@ -173,6 +173,8 @@ export const FIX_SINCE = "0.8.2";
 /** The root script that checks the API reports, and the report of a package when the repository names no other file. */
 export const API_SCRIPT = "check:api";
 export const API_REPORT = "test/api/public-api.txt";
+/** The package of the reports. A new version can change the form of each report. */
+export const API_REPORT_PACKAGE = "@mark1russell7/api-report";
 
 function tail(s: string, n = 800): string {
   const t = s.trim();
@@ -318,6 +320,51 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    * fails, the root `package.json` and the lockfile go back. Thus an update cannot add the script without its reports.
    * The build follows CI: the root script when the repository has one, else the script of each package.
    */
+  /** This function gives the steps that write the API reports: the lockfile, the install, the build as CI does it, and `api-report update`. */
+  const reportSteps = (dir: string, u: RepoUpdate): readonly (readonly [string, readonly string[]])[] => {
+    const manifest = join(dir, "package.json");
+    const npm = u.lockKind === "npm";
+    const quiet = ["--ignore-scripts", "--no-audit", "--no-fund"];
+    const workspaces = (JSON.parse(readFileSync(manifest, "utf8")) as { workspaces?: unknown }).workspaces !== undefined;
+    const eachBuild: readonly (readonly [string, readonly string[]])[] = npm ? (workspaces ? [["npm", ["run", "build", "--workspaces", "--if-present"]]] : []) : [["pnpm", ["-r", "--if-present", "run", "build"]]];
+    return [
+      npm ? ["npm", ["install", "--package-lock-only", ...quiet]] : ["pnpm", ["install", "--lockfile-only"]],
+      npm ? ["npm", ["ci", ...quiet]] : ["pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+      ...(typeof readScripts(manifest)?.["build"] === "string" ? [[npm ? "npm" : "pnpm", ["run", "build"]] as const] : eachBuild),
+      npm ? ["npm", ["exec", "--", "api-report", "update"]] : ["pnpm", ["exec", "api-report", "update"]],
+    ];
+  };
+
+  /** This function gives the path of a report inside a package: the file that the repository names, or the default. */
+  const reportFile = (manifest: string): string => {
+    const config = (JSON.parse(readFileSync(manifest, "utf8")) as { apiReport?: { report?: unknown } }).apiReport?.report;
+    return typeof config === "string" ? config.replace(/^\.\//, "") : API_REPORT;
+  };
+
+  /**
+   * A new version of `api-report` can change the form of each report, and then `check:api` fails with no change to the API.
+   * So an update that moves the tool in a repository with the script writes the reports in the same commit. The default branch
+   * passed `check:api` with the old tool, so a difference in the commit comes from the tool. When a step fails, the update
+   * stays and the function gives the reason. Then `check:api` is red on the pull request, and its body tells the step.
+   */
+  const reportUpdate = async (dir: string, u: RepoUpdate, fixEnv: NodeJS.ProcessEnv, fixed: readonly string[]): Promise<{ reports: string[]; error: string | null; step?: string }> => {
+    const manifest = join(dir, "package.json");
+    if (!u.items.some((i) => i.dep === API_REPORT_PACKAGE) || typeof readScripts(manifest)?.[API_SCRIPT] !== "string") return { reports: [], error: null };
+    const report = reportFile(manifest);
+    const isReport = (file: string): boolean => file === report || file.endsWith(`/${report}`);
+    // The fix wrote the first reports after the lockfile moved, so they have the new form.
+    if (fixed.some(isReport)) return { reports: [], error: null };
+    for (const [cmd, args] of reportSteps(dir, u)) {
+      const result = await run(cmd, [...args], { cwd: dir, env: fixEnv });
+      if (result.code !== 0) {
+        const error = errorLines(`${result.stdout}\n${result.stderr}`).slice(0, 5).join("\n");
+        return { reports: [], error: error === "" ? tail(result.stdout || result.stderr, 500) : error, step: `${cmd} ${args.join(" ")}` };
+      }
+    }
+    const listed = await run("git", ["ls-files", "--modified", "--others", "--exclude-standard"], { cwd: dir, env: fixEnv });
+    return { reports: listed.stdout.split("\n").filter(isReport), error: null };
+  };
+
   const conventionsFix = async (dir: string, u: RepoUpdate, fixEnv: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<FixOutcome> => {
     const none: FixOutcome = { fixed: [], reverted: [], error: null };
     const to = u.items.find((i) => i.dep === CONVENTIONS)?.to;
@@ -374,15 +421,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     const outcome = await typechecked();
     if (hadApiCheck || before === null || typeof readScripts(manifest)?.[API_SCRIPT] !== "string") return outcome;
     const npm = u.lockKind === "npm";
-    const quiet = ["--ignore-scripts", "--no-audit", "--no-fund"];
-    const workspaces = (JSON.parse(readFileSync(manifest, "utf8")) as { workspaces?: unknown }).workspaces !== undefined;
-    const eachBuild: readonly (readonly [string, readonly string[]])[] = npm ? (workspaces ? [["npm", ["run", "build", "--workspaces", "--if-present"]]] : []) : [["pnpm", ["-r", "--if-present", "run", "build"]]];
-    const steps: readonly (readonly [string, readonly string[]])[] = [
-      npm ? ["npm", ["install", "--package-lock-only", ...quiet]] : ["pnpm", ["install", "--lockfile-only"]],
-      npm ? ["npm", ["ci", ...quiet]] : ["pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"]],
-      ...(typeof scripts?.["build"] === "string" ? [[npm ? "npm" : "pnpm", ["run", "build"]] as const] : eachBuild),
-      npm ? ["npm", ["exec", "--", "api-report", "update"]] : ["pnpm", ["exec", "api-report", "update"]],
-    ];
+    const steps = reportSteps(dir, u);
     const untracked = async (): Promise<string[]> => {
       const listed = await run("git", ["ls-files", "--others", "--exclude-standard"], { cwd: dir, env: fixEnv });
       return listed.stdout.split("\n").filter((file) => file !== "");
@@ -398,8 +437,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
       const result = await run(cmd, [...args], { cwd: dir, env: fixEnv });
       if (result.code !== 0) return failed(`the first API report (${cmd} ${args.join(" ")})`, result);
     }
-    const config = (JSON.parse(readFileSync(manifest, "utf8")) as { apiReport?: { report?: unknown } }).apiReport?.report;
-    const report = typeof config === "string" ? config.replace(/^\.\//, "") : API_REPORT;
+    const report = reportFile(manifest);
     const reports = (await untracked()).filter((file) => !known.has(file) && (file === report || file.endsWith(`/${report}`)));
     return { ...outcome, fixed: [...new Set([...outcome.fixed, ...reports])] };
   };
@@ -622,6 +660,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
         // 3. A new version of conventions brings the fixes of its rules. The train writes them in the same commit, so a new
         // rule does not block the update for a break that a script can fix. CI of the pull request checks the result.
         const { fixed, reverted, error: fixError, step: fixStep } = await conventionsFix(dir, u, fixEnv, install);
+        const { reports: apiReports, error: apiReportError, step: apiReportStep } = await reportUpdate(dir, u, fixEnv, fixed);
         // 4. The files that the train wrote get the format of the repository.
         await formatChanged(dir, u, added, fixEnv, install);
         const after = read();
@@ -651,17 +690,20 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           ...(settingsChanged ? [`- pnpm-workspace.yaml: ${[...(u.ageScopes ?? []), ...urgentAge].join(", ")} in minimumReleaseAgeExclude`] : []),
           ...(fixed.length > 0 ? [`- conventions fix: ${fixed.join(", ")}`] : []),
           ...(reverted.length > 0 ? [`- conventions fix removed, it broke ${fixStep ?? "typecheck"}: ${reverted.join(", ")}`] : []),
+          ...(apiReports.length > 0 ? [`- api-report update: ${apiReports.length} ${apiReports.length === 1 ? "report" : "reports"}`] : []),
+          ...(apiReportError !== null ? [`- api-report update did not finish, it failed at ${apiReportStep ?? "a step"}`] : []),
         ].join("\n");
         await sh("git", ["add", "-u"], "git add");
         if (added.length > 0) await sh("git", ["add", "--", ...added], "git add");
         // A fix can write a new file (license-file writes LICENSE). `git add -u` does not see a new file, so the train
         // stages each file of the fix by name. With -A, a file that the fix removed is staged as removed (packing #232, 11-03).
         if (fixed.length > 0) await sh("git", ["add", "-A", "--", ...fixed], "git add");
+        if (apiReports.length > 0) await sh("git", ["add", "-A", "--", ...apiReports], "git add");
         await sh("git", ["-c", `user.name=${o.author.name}`, "-c", `user.email=${o.author.email}`, "commit", "--quiet", "--no-verify", "-m", msg], "git commit");
 
         // 7. No push when the branch already has the same content in the files of the train.
         const pushed = await pushHead(dir, sh, TRAIN_BRANCH, remote, ctx.rebuild);
-        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(urgentAge.size > 0 ? { urgentAge: [...urgentAge].sort() } : {}), ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError, ...(fixStep === undefined ? {} : { fixStep }) } : {}) };
+        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(urgentAge.size > 0 ? { urgentAge: [...urgentAge].sort() } : {}), ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError, ...(fixStep === undefined ? {} : { fixStep }) } : {}), ...(apiReports.length > 0 ? { apiReports } : {}), ...(apiReportError !== null ? { apiReportError, ...(apiReportStep === undefined ? {} : { apiReportStep }) } : {}) };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       } finally {

@@ -24,3 +24,4 @@ This file gives the items of the release train and their status. The Status page
 | RT16 | The command `lag` reports each change with no release and each red train pull request, and a daily workflow holds the limits | Done | #104 |
 | RT17 | The command `lag` reads the `files` list of a package, and a `docs` or `style` commit does not start its clock | Done | #105 |
 | RT18 | A hold with a reason, a link and a date keeps the gate able to fail on another package, and a flip test holds this | Done | #111 |
+| RT19 | An update that moves `api-report` writes the reports in the same commit, so a new form of a report does not stop the update | Done | #114 |
