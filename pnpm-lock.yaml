@@ -167,8 +167,8 @@ importers:
   .:
     devDependencies:
       '@mark1russell7/api-report':
-        specifier: ^0.2.0
-        version: 0.2.2
+        specifier: ^0.3.1
+        version: 0.3.1
       '@mark1russell7/conventions':
         specifier: ^0.25.0
         version: 0.25.0
@@ -180,7 +180,7 @@ importers:
         version: https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905
       '@mark1russell7/template-cli':
         specifier: ^0.1.0
-        version: 0.1.4
+        version: 0.1.5
       publint:
         specifier: ^0.3.25
         version: 0.3.25
@@ -201,7 +201,7 @@ importers:
         version: 0.6.5(ws@8.22.1)(zod@4.6.7)
       '@procedures/shell':
         specifier: ^0.47.1
-        version: 0.47.1
+        version: 0.47.2
       semver:
         specifier: ^7.8.5
         version: 7.8.5
@@ -432,8 +432,8 @@ packages:
       zod:
         optional: true
 
-  '@mark1russell7/api-report@0.2.2':
-    resolution: {integrity: sha512-5Res2AutTOsfAnvUy1HeAwI0wHwF96GOyO92a59nhVdE7nRxa4evp1wQSez1KTzRLFkJ2k4hzJhkfCusZ6xnaA==}
+  '@mark1russell7/api-report@0.3.1':
+    resolution: {integrity: sha512-vA1KjafzH3Y5dfFZlGnqcvQn5H7QcGVSzM1tw3R8f1hng6uqrbCX596V+GdhLTCzo2X0Jmr3QLAw9WMEWc/7pQ==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -515,16 +515,16 @@ packages:
     engines: {node: '>=22'}
     hasBin: true
 
-  '@mark1russell7/template-cli@0.1.4':
-    resolution: {integrity: sha512-wXhE7Kqjm8O0jGkxHBgFRn+d1qe8rffcrfbURPor1knmO6Sf/eQ3uKCqgCsP+PSlSVidaQu8GnUWo1jD3Fdm7A==}
+  '@mark1russell7/template-cli@0.1.5':
+    resolution: {integrity: sha512-OenwEgVEkrt6HjUtIsTgplkJJTBIZLwb0mxiPow533++mbrrJ8BvHK+MsMLFm6X5A8EJZlLgd6IXJspZy3L2og==}
     engines: {node: '>=22.12'}
     hasBin: true
 
   '@oxc-project/types@0.155.0':
     resolution: {integrity: sha512-SeE8JPwW1xs1tHeNycjUtUBdhorRa8o4jlvjwk49R7/Z291i+4DQa7JJIgOm/TaYQZx+QrPQbVJ/9c8dMIZN8Q==}
 
-  '@procedures/client@0.47.1':
-    resolution: {integrity: sha512-V7gv75NVe7Uby5I0WyMYzg1TzEn3RWkKphFf+AFWMr2x3hs1H8KHmB+QN1BQphwU7a4BjOQIOjIsaukzJPpiPQ==}
+  '@procedures/client@0.47.2':
+    resolution: {integrity: sha512-c21k2K+YICceRYJH4QNN33tbYio1/SnXMjMToyBIM0Ljy78elbK4t9JLYH3Cejf9y+l4PU5sX7eclDSLgpRQ7A==}
     engines: {node: '>=22'}
     peerDependencies:
       express: ^4.0.0 || ^5.0.0
@@ -532,8 +532,8 @@ packages:
       express:
         optional: true
 
-  '@procedures/shell@0.47.1':
-    resolution: {integrity: sha512-/74J7xSPN9KkC3tWL0yG+MmgjSVk0XeWKOESiF94nTrbXpQXM1OC5vs6w1V/IE9kuxZae4cxr/p46tNJLIiu2g==}
+  '@procedures/shell@0.47.2':
+    resolution: {integrity: sha512-J0wEION6tl0PMrV9son0rskhlHOd2eoAAerenyjTG0yxU0EcNl4fCVcxHYVlbTsln+FOaujq+84sXRjc8qB5Fw==}
     engines: {node: '>=22'}
 
   '@publint/pack@0.1.7':
@@ -1220,7 +1220,7 @@ snapshots:
     optionalDependencies:
       zod: 4.6.7
 
-  '@mark1russell7/api-report@0.2.2': {}
+  '@mark1russell7/api-report@0.3.1': {}
 
   '@mark1russell7/coeval@0.18.0': {}
 
@@ -1257,13 +1257,13 @@ snapshots:
     dependencies:
       typescript: 6.0.3
 
-  '@mark1russell7/template-cli@0.1.4':
+  '@mark1russell7/template-cli@0.1.5':
     dependencies:
       '@clack/prompts': 1.8.1
 
   '@oxc-project/types@0.155.0': {}
 
-  '@procedures/client@0.47.1':
+  '@procedures/client@0.47.2':
     dependencies:
       '@mark1russell7/algebra': 0.8.1(zod@4.6.7)
       '@mark1russell7/coeval': 0.18.0
@@ -1281,9 +1281,9 @@ snapshots:
       - pg
       - utf-8-validate
 
-  '@procedures/shell@0.47.1':
+  '@procedures/shell@0.47.2':
     dependencies:
-      '@procedures/client': 0.47.1
+      '@procedures/client': 0.47.2
       zod: 4.6.7
     transitivePeerDependencies:
       - '@grpc/grpc-js'
