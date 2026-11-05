@@ -220,8 +220,24 @@ The `files` list of the package tells which changes count. The source of a packa
 - The age of a red pull request starts at its first block. A merge closes a train pull request, so a new head does not reset this age.
 - The age starts at the first commit after the release that changes such a file. The command reads at most 60 commits of each package. Then the age shows "over".
 - A row under its limit is in the report too, so a kept version shows on its first day.
-- `--gate` gives the exit code 1 when a row is over its limit. The workflow `lag.yml` uses this option once each day, so a lag makes the workflow red.
+- `--gate` gives the exit code 1 when a row is over its limit with no hold. The workflow `lag.yml` uses this option once each day, so a lag makes the workflow red.
 - `--public-only`, `--json` and `--out <file>` work as in the other commands. Without `--public-only`, the output has private names. So a run without it stays on a local computer.
+
+### Holds
+
+A release can wait on purpose. Without a hold, the gate then stays red, and a new package over the limit gives no new signal. The file `lag-holds.json` lists each hold.
+
+```json
+{ "holds": [{ "package": "@scope/name", "reason": "Why the release waits.", "ruling": "https://example.com/decision", "until": "2026-11-07" }] }
+```
+
+- `lag --holds <file>` reads the list. A held row does not fail the gate. It keeps its days in the report, and it reads as held, not as passed.
+- `until` is the last day of the hold in UTC. The date is at most 14 days after the run.
+- A hold with no reason, no `https` link or no date gives a fault, and so does a date in the past. A fault fails the gate, and that hold holds nothing.
+- A hold with no row over the limit is in the report. It gives no fault.
+- A later date needs a new reason. `holds --holds <file> --before <file>` examines this, and the workflow `lag-holds.yml` starts it on each pull request.
+- `lag-flip.ts` is the flip test. In one job, a new package over the limit fails while another is held, a date in the past fails, and a held row alone passes. The workflows `lag.yml` and `lag-holds.yml` start it.
+- `--from-report <file>` reads a saved report in place of the repositories, and `--now <time>` sets the time of the run. The flip test uses both.
 
 ## Stage 3: template sync
 

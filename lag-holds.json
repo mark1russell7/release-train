@@ -1,0 +1,34 @@
+{
+  "holds": [
+    {
+      "package": "@mark1russell7/vex",
+      "reason": "Main holds breaking changes, so no patch release goes out. The next release is Vex 0.18.0, after Vex pull request 280 and a green weekly run on main. Vex gives its date by this day.",
+      "ruling": "https://github.com/mark1russell7/Vex/blob/1d14a5dd297f111d1e7cb7214cedf21554c8fa99/spec/regressions.md#the-version-on-npm",
+      "until": "2026-11-07"
+    },
+    {
+      "package": "@mark1russell7/vex-testkit",
+      "reason": "Main holds breaking changes, so no patch release goes out. The next release is Vex 0.18.0, after Vex pull request 280 and a green weekly run on main. Vex gives its date by this day.",
+      "ruling": "https://github.com/mark1russell7/Vex/blob/1d14a5dd297f111d1e7cb7214cedf21554c8fa99/spec/regressions.md#the-version-on-npm",
+      "until": "2026-11-07"
+    },
+    {
+      "package": "@mark1russell7/vex-domains",
+      "reason": "Main holds breaking changes, so no patch release goes out. The next release is Vex 0.18.0, after Vex pull request 280 and a green weekly run on main. Vex gives its date by this day.",
+      "ruling": "https://github.com/mark1russell7/Vex/blob/1d14a5dd297f111d1e7cb7214cedf21554c8fa99/spec/regressions.md#the-version-on-npm",
+      "until": "2026-11-07"
+    },
+    {
+      "package": "@mark1russell7/vex-compiler",
+      "reason": "Main holds breaking changes, so no patch release goes out. The next release is Vex 0.18.0, after Vex pull request 280 and a green weekly run on main. Vex gives its date by this day.",
+      "ruling": "https://github.com/mark1russell7/Vex/blob/1d14a5dd297f111d1e7cb7214cedf21554c8fa99/spec/regressions.md#the-version-on-npm",
+      "until": "2026-11-07"
+    },
+    {
+      "package": "@mark1russell7/vex-mcp",
+      "reason": "Main holds breaking changes, so no patch release goes out. The next release is Vex 0.18.0, after Vex pull request 280 and a green weekly run on main. Vex gives its date by this day.",
+      "ruling": "https://github.com/mark1russell7/Vex/blob/1d14a5dd297f111d1e7cb7214cedf21554c8fa99/spec/regressions.md#the-version-on-npm",
+      "until": "2026-11-07"
+    }
+  ]
+}

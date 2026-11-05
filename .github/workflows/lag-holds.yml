@@ -1,0 +1,39 @@
+# The check of the holds of the lag gate. It starts the flip test of the gate, examines lag-holds.json, and fails when a hold
+# goes to a later date with its old reason. It reads no other repository.
+name: Lag holds
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lag-holds-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  holds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: The gate fails on a new row and on a passed date, and passes on a held row
+        run: node --no-warnings packages/release-train/src/lag-flip.ts
+      - name: The holds have no fault, and a later date has a new reason
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git show "$BASE:lag-holds.json" > "$RUNNER_TEMP/before.json" 2>/dev/null || printf '{"holds":[]}\n' > "$RUNNER_TEMP/before.json"
+          node --no-warnings packages/release-train/src/bin.ts holds --holds lag-holds.json --before "$RUNNER_TEMP/before.json"
