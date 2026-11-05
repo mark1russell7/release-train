@@ -2,6 +2,7 @@ import { pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { BLOCKED_LABEL, TRAIN_BRANCH } from "./apply.ts";
 import type { GitHub } from "./github.ts";
+import type { HoldReading, LagHold } from "./holds.ts";
 import { SYNC_BRANCH } from "./sync.ts";
 import { provenanceCommit } from "./tags.ts";
 import type { PackageNode } from "./types.ts";
@@ -45,8 +46,10 @@ export interface LagRow {
   partial: boolean;
   ageDays: number;
   reason: LagReason;
-  /** True when the age is over the limit. */
+  /** True when the age is over the limit. A hold does not change this field. */
   over: boolean;
+  /** The hold of a row over its limit. */
+  held?: LagHold;
 }
 
 /** One pull request of the train with a failed check. */
@@ -81,6 +84,10 @@ export interface LagReport {
   rows: LagRow[];
   red: RedRow[];
   unread: LagUnread[];
+  /** The faults of the hold list. Each fault fails the gate. */
+  holdFaults?: string[];
+  /** The holds with no row over its limit in this run. */
+  idleHolds?: LagHold[];
 }
 
 /** The input of `lagReport`. */
@@ -447,9 +454,29 @@ async function redRows(i: LagInput, now: number, log: (line: string) => void): P
   return out;
 }
 
-/** This function tells if a report has a row over its limit. */
+/** This function gives the report with its holds. A row over its limit keeps its days and takes its hold. */
+export function applyHolds(report: LagReport, reading: HoldReading): LagReport {
+  const hold = (name: string): LagHold | undefined => reading.holds.find((item) => item.package === name);
+  const rows = report.rows.map((row) => {
+    const held = row.over ? hold(row.package) : undefined;
+    return held === undefined ? row : { ...row, held };
+  });
+  const idleHolds = reading.holds.filter((item) => !rows.some((row) => row.held === item));
+  return { ...report, rows, holdFaults: reading.faults, idleHolds };
+}
+
+/** This function tells if the gate fails: a row over its limit with no hold, or a fault of the hold list. */
 export function lagOver(report: LagReport): boolean {
-  return report.rows.some((r) => r.over) || report.red.some((r) => r.over);
+  return report.rows.some((r) => r.over && r.held === undefined) || report.red.some((r) => r.over) || (report.holdFaults ?? []).length > 0;
+}
+
+/** This function gives the sentence of the gate. A run with held rows does not read as a pass. */
+function gateLine(r: LagReport): string {
+  const open = r.rows.filter((x) => x.over && x.held === undefined).length + r.red.filter((x) => x.over).length;
+  const faults = (r.holdFaults ?? []).length;
+  if (open > 0 || faults > 0) return `The gate fails: ${open} row${open === 1 ? "" : "s"} over its limit with no hold, ${faults} fault${faults === 1 ? "" : "s"} of the holds.`;
+  const held = r.rows.filter((x) => x.held !== undefined).length;
+  return held > 0 ? `The gate holds ${held} row${held === 1 ? "" : "s"} over its limit. No row fails.` : "The gate passes.";
 }
 
 const WHY: Record<LagReason, string> = {
@@ -459,12 +486,15 @@ const WHY: Record<LagReason, string> = {
 
 /** This function gives the report as Markdown. */
 export function lagSummary(r: LagReport): string {
-  const over = r.rows.filter((x) => x.over);
+  const over = r.rows.filter((x) => x.over && x.held === undefined);
+  const held = r.rows.filter((x) => x.held !== undefined);
   const watch = r.rows.filter((x) => !x.over);
   const lines = [
     `# Release lag of ${r.owner} at ${r.generatedAt}`,
     "",
-    `${r.packages} published packages: ${over.length} over the limit of ${days(LAG_LIMIT_MS)} days, ${watch.length} under it, ${r.unread.length} not read. ${r.red.filter((x) => x.over).length} of ${r.red.length} red train pull requests are over ${days(RED_LIMIT_MS)} day.`,
+    gateLine(r),
+    "",
+    `${r.packages} published packages: ${over.length} over the limit of ${days(LAG_LIMIT_MS)} days, ${held.length} held over it, ${watch.length} under it, ${r.unread.length} not read. ${r.red.filter((x) => x.over).length} of ${r.red.length} red train pull requests are over ${days(RED_LIMIT_MS)} day.`,
   ];
   const table = (title: string, rows: readonly LagRow[]): void => {
     if (rows.length === 0) return;
@@ -475,8 +505,18 @@ export function lagSummary(r: LagReport): string {
       lines.push(`| ${x.package} | ${x.published} | ${x.onBranch ?? "?"} | ${age} | ${WHY[x.reason]} | ${x.firstChange.sha.slice(0, 7)} ${title} |`);
     }
   };
+  const changeOf = (x: LagRow): string => `${x.firstChange.sha.slice(0, 7)} ${x.firstChange.title.replaceAll("|", "\\|")}`;
+  if ((r.holdFaults ?? []).length > 0) lines.push("", "## Faults of the holds", "", ...(r.holdFaults ?? []).map((fault) => `- ${fault}`));
   table("Over the limit", over);
+  if (held.length > 0) {
+    lines.push("", "## Held, over the limit", "", "| Package | npm | Branch | Days | Held to | Reason | First change |", "| --- | --- | --- | --- | --- | --- | --- |");
+    for (const x of held) {
+      const age = `${x.partial ? "over " : ""}${x.ageDays}`;
+      lines.push(`| ${x.package} | ${x.published} | ${x.onBranch ?? "?"} | ${age} | ${x.held?.until ?? ""} | [${(x.held?.reason ?? "").replaceAll("|", "\\|")}](${x.held?.ruling ?? ""}) | ${changeOf(x)} |`);
+    }
+  }
   table("Under the limit", watch);
+  if ((r.idleHolds ?? []).length > 0) lines.push("", "## Holds with no row over the limit", "", ...(r.idleHolds ?? []).map((item) => `- ${item.package}, to ${item.until}`));
   if (r.red.length > 0) {
     lines.push("", "## Red pull requests of the train", "", "| Pull request | Days | Failed checks |", "| --- | --- | --- |");
     for (const x of r.red) lines.push(`| [${x.repo} #${x.number}](${x.url}) | ${x.ageDays} | ${x.checks.join(", ")} |`);

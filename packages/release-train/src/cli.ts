@@ -1,6 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
-import { lagOver, lagReport, lagSummary } from "./lag.ts";
+import { extensionFaults, holdsOfFile, readHolds } from "./holds.ts";
+import type { HoldReading } from "./holds.ts";
+import { applyHolds, lagOver, lagReport, lagSummary } from "./lag.ts";
+import type { LagReport } from "./lag.ts";
 import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, pendingVersions, publicReport } from "./apply.ts";
 import { collect, pool } from "./collect.ts";
 import { writeDb } from "./db.ts";
@@ -58,6 +61,14 @@ export interface CliOptions {
   write: boolean;
   /** `lag`: the command exits with 1 when a row is over its limit. */
   gate: boolean;
+  /** `lag` and `holds`: the file of the holds. */
+  holds?: string;
+  /** `lag`: a saved report. The command then reads no repository. */
+  fromReport?: string;
+  /** `holds`: the earlier file of the holds. */
+  before?: string;
+  /** `lag` and `holds`: the time of the run, for a test. */
+  now?: Date;
 }
 
 /** This function reads the arguments of the command line. */
@@ -112,6 +123,14 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--take-replaced") o.takeReplaced = true;
     else if (a === "--write") o.write = true;
     else if (a === "--gate") o.gate = true;
+    else if (a === "--holds") o.holds = value();
+    else if (a === "--from-report") o.fromReport = value();
+    else if (a === "--before") o.before = value();
+    else if (a === "--now") {
+      const v = new Date(value());
+      if (Number.isNaN(v.getTime())) throw new Error("--now needs a time.");
+      o.now = v;
+    }
     else if (a === "--since") {
       const v = value().trim();
       if (!validDate(v)) throw new Error(`--since needs a date of the form YYYY-MM-DD, not ${v}.`);
@@ -230,8 +249,9 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (o.command === "await-release") return runAwait(o);
   if (o.command === "tags") return runTags(o);
   if (o.command === "lag") return runLag(o);
+  if (o.command === "holds") return runHolds(o);
   if (o.command !== "plan" && o.command !== "apply") {
-    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply", "await-release", "tags" and "lag".\n`);
+    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply", "await-release", "tags", "lag" and "holds".\n`);
     return 2;
   }
   return o.command === "apply" ? runApply(o) : runPlan(o);
@@ -349,14 +369,46 @@ async function runApply(o: CliOptions): Promise<number> {
  */
 /**
  * The lag command: it reports each change with no release, and each red pull request of the train. It makes no write.
- * With `--gate`, a row over its limit gives the exit code 1.
+ * With `--gate`, a row over its limit with no hold, or a fault of the holds, gives the exit code 1.
  */
 async function runLag(o: CliOptions): Promise<number> {
+  const read = o.fromReport === undefined ? await readLag(o) : (JSON.parse(readFileSync(o.fromReport, "utf8")) as LagReport);
+  const report = o.holds === undefined ? read : applyHolds(read, holdsFromFile(o.holds, o.now ?? new Date()));
+  if (o.out) writeFileSync(o.out, `${JSON.stringify(report, null, 2)}\n`);
+  process.stdout.write(o.json ? `${JSON.stringify(report, null, 2)}\n` : `${lagSummary(report)}\n`);
+  return o.gate && lagOver(report) ? 1 : 0;
+}
+
+/** This function reads the file of the holds. A file that the command cannot read is a fault, so it does not hide a row. */
+function holdsFromFile(file: string, now: Date): HoldReading {
+  try {
+    return readHolds(JSON.parse(readFileSync(file, "utf8")), now);
+  } catch (error) {
+    return { holds: [], faults: [`The file ${file} of the holds gives this error: ${error instanceof Error ? error.message : String(error)}`] };
+  }
+}
+
+/** The holds command: it examines the file of the holds, and with `--before` it examines each change of a date. */
+function runHolds(o: CliOptions): number {
+  if (o.holds === undefined) {
+    process.stderr.write("The command holds needs --holds <file>.\n");
+    return 2;
+  }
+  const reading = holdsFromFile(o.holds, o.now ?? new Date());
+  const before = o.before === undefined ? [] : holdsOfFile(JSON.parse(readFileSync(o.before, "utf8")));
+  const faults = [...reading.faults, ...extensionFaults(before, reading.holds)];
+  for (const fault of faults) process.stderr.write(`${fault}\n`);
+  process.stdout.write(`${reading.holds.length} valid holds, ${faults.length} faults.\n`);
+  return faults.length === 0 ? 0 : 1;
+}
+
+/** This function reads the lag from the repositories and npm. */
+async function readLag(o: CliOptions): Promise<LagReport> {
   const tok = token();
   const log = (l: string): void => void process.stderr.write(`${l}\n`);
   const data = await collect({ owner: o.owner, token: tok, publicOnly: o.publicOnly, log });
   const graph = buildGraph({ owner: o.owner, repos: data.repos, npm: data.npm, warnings: data.warnings });
-  const report = await lagReport({
+  return lagReport({
     owner: o.owner,
     gh: gitHub({ token: tok }),
     packages: graph.packages,
@@ -364,9 +416,6 @@ async function runLag(o: CliOptions): Promise<number> {
     publicOnly: o.publicOnly,
     log,
   });
-  if (o.out) writeFileSync(o.out, `${JSON.stringify(report, null, 2)}\n`);
-  process.stdout.write(o.json ? `${JSON.stringify(report, null, 2)}\n` : `${lagSummary(report)}\n`);
-  return o.gate && lagOver(report) ? 1 : 0;
 }
 
 async function runTags(o: CliOptions): Promise<number> {
