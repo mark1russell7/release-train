@@ -345,7 +345,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    * A new version of `api-report` can change the form of each report, and then `check:api` fails with no change to the API.
    * So an update that moves the tool in a repository with the script writes the reports in the same commit. The default branch
    * passed `check:api` with the old tool, so a difference in the commit comes from the tool. When a step fails, the update
-   * stays and the function gives the reason: `check:api` is red on the pull request, and its body tells the step.
+   * stays and the function gives the reason. Then `check:api` is red on the pull request, and its body tells the step.
    */
   const reportUpdate = async (dir: string, u: RepoUpdate, fixEnv: NodeJS.ProcessEnv, fixed: readonly string[]): Promise<{ reports: string[]; error: string | null; step?: string }> => {
     const manifest = join(dir, "package.json");
