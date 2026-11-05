@@ -102,6 +102,8 @@ export interface WaitingUpdate {
   actionId: string;
   wave: number;
   dependsOn: string[];
+  /** When true, an open pull request of the train in this repository does not merge: a release that is in flight holds its ranges. */
+  holdsOpen?: boolean;
 }
 
 /** The adoptions of a plan: an adoption with an item that can go is ready, each other adoption waits. */
@@ -146,8 +148,12 @@ function heldDeps(items: readonly ActionItem[], late: readonly string[], carried
  * This function selects the items that the train applies in this run. An item is ready when npm has its target version and
  * nothing holds it (`heldDeps`). The ready items of a repository go, and a later run sends the other items.
  * The plan does not change: its action stays one action with all its items, so the wave order of its waits stays.
+ *
+ * The set `flying` names the repositories with a release in flight. Main has a new version, and npm does not have it yet.
+ * A run publishes the commit that it started on, so a range that changes at this time does not go into that version.
+ * The next run of the plan then sees no need for a release. So the item waits, and after the release the cascade raises the version.
  */
-export function selectUpdates(p: Plan, only: readonly string[] | null = null, cascade: readonly string[] | "all" = "all"): Selection {
+export function selectUpdates(p: Plan, only: readonly string[] | null = null, cascade: readonly string[] | "all" = "all", flying: ReadonlySet<string> = new Set()): Selection {
   const latest = new Map(p.nodes.filter((n) => n.kind === "package").map((n) => [n.name, n.npmLatest]));
   const lock = new Map(p.repos.map((r) => [r.name, r.lockKind]));
   const links = new Map(p.repos.filter((r) => r.submodules?.length).map((r) => [r.name, r.submodules ?? []]));
@@ -176,14 +182,19 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null, ca
     const cascades = rel?.packages.some((x) => x.bump !== null) ? rel : undefined;
     // A cascade that is not on for the repository (option --cascade) holds the published ranges too.
     const off = cascades && cascade !== "all" && !cascade.includes(a.repo);
-    const relWaits = cascades ? (off ? [`cascade-off:${cascades.id}`] : cascades.blocked ? [`blocked:${cascades.id}`] : cascades.dependsOn.filter((d) => d !== a.id)) : [];
+    const inFlight = new Set(flying.has(a.repo) ? rel?.packages.filter((x) => x.bump === null).map((x) => x.name) : []);
+    const holdsOpen = rel !== undefined && a.items.some((i) => i.dependent !== null && inFlight.has(i.dependent) && i.newRange !== null && RUNTIME.has(i.type));
+    const relWaits = [
+      ...(cascades ? (off ? [`cascade-off:${cascades.id}`] : cascades.blocked ? [`blocked:${cascades.id}`] : cascades.dependsOn.filter((d) => d !== a.id)) : []),
+      ...(holdsOpen ? [`release-in-flight:${rel.id}`] : []),
+    ];
     const releasing = new Set(rel?.packages.map((x) => x.name));
     const carried = a.items.filter((i) => i.dependent !== null && releasing.has(i.dependent) && i.newRange && RUNTIME.has(i.type)).map((i) => i.dep);
     const late = a.items.filter((i) => !onNpm(i)).map((i) => i.dep);
     const held = heldDeps(a.items, relWaits.length > 0 ? [...late, ...carried] : late, carried, sets);
     const going = a.items.filter((i) => !held.has(i.dep));
     if (going.length === 0) {
-      waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: [...a.dependsOn, ...relWaits] });
+      waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: [...a.dependsOn, ...relWaits], ...(holdsOpen ? { holdsOpen } : {}) });
       continue;
     }
     const carries = relWaits.length === 0 && !carried.some((d) => held.has(d));
@@ -748,7 +759,24 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const gh = o.gh;
   const owner = o.owner;
   const base = `/repos/${owner}`;
-  const sel = selectUpdates(o.plan, o.only ?? null, o.cascade ?? "all");
+  /** This function tells if the last run of the release workflow did not fail: a failed run does not publish again by itself. */
+  const lastReleaseFlies = async (repo: string): Promise<boolean> => {
+    const last = (await gh.request<{ workflow_runs: { status: string; conclusion: string | null }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?per_page=1`)).data?.workflow_runs?.[0];
+    return !last || last.status !== "completed" || last.conclusion === "success";
+  };
+  // A version that starts by hand is not in flight, so a range can still go into it. An error of a read holds the item for one run.
+  const flying = new Set<string>();
+  for (const repo of pendingVersions(o.plan, o.only ?? null).keys()) {
+    if (!o.plan.actions.some((a) => a.kind === "adopt-breaking" && a.repo === repo)) continue;
+    try {
+      const wf = await gh.request<{ content?: string }>("GET", `${base}/${repo}/contents/.github/workflows/release.yml`);
+      const text = wf.data?.content ? Buffer.from(wf.data.content, "base64").toString("utf8") : "";
+      if (text && !dispatchOnly(text) && (await lastReleaseFlies(repo))) flying.add(repo);
+    } catch {
+      flying.add(repo);
+    }
+  }
+  const sel = selectUpdates(o.plan, o.only ?? null, o.cascade ?? "all", flying);
   const privateOf = new Map(o.plan.repos.map((r) => [r.name, r.private]));
   const scan = o.plan.repos.map((r) => r.name).filter((n) => !o.only || o.only.includes(n));
   const results: RepoResult[] = [];
@@ -968,11 +996,12 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     result({ repo, actionId: null, kind: null, wave: null, state: "closed", items: 0, pr: { number: pr.number, url: pr.html_url }, autoMerge: null, ci: null, detail: "The plan has no update for the repository." });
   }
 
-  // 2. The adoptions that wait for a release. An open pull request of the train in such a repository still merges on green.
+  // 2. The adoptions that wait for a release. An open pull request of the train in such a repository still merges on green,
+  // except when a release in flight holds its ranges.
   for (const w of sel.waiting) {
     const pr = open.get(w.repo);
     const base0 = { repo: w.repo, private: w.private, actionId: w.actionId, kind: null, wave: w.wave, items: 0, autoMerge: null };
-    if (pr && !o.dryRun) {
+    if (pr && !o.dryRun && w.holdsOpen !== true) {
       const meta = (await gh.request<RepoMeta>("GET", `${base}/${w.repo}`)).data;
       await disableAutoMerge(pr);
       const s = await settle(w.repo, pr, meta);
@@ -1213,8 +1242,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       if (!text) continue;
       if (!dispatchOnly(text)) {
         // A last release run that failed does not publish again by itself, so its versions are not in flight.
-        const last = (await gh.request<{ workflow_runs: { status: string; conclusion: string | null }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?per_page=1`)).data?.workflow_runs?.[0];
-        if (!last || last.status !== "completed" || last.conclusion === "success") fly(repo);
+        if (await lastReleaseFlies(repo)) fly(repo);
         continue;
       }
       if (!o.releaseDispatch) continue;
