@@ -287,8 +287,8 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     const manifest = p.path === "" ? "package.json" : `${p.path}/package.json`;
     // A failed read gives no list, so the names of the files decide and a fault gives a row.
     const head = await readManifest(p.repo, manifest, branch);
-    const published = head === null ? null : publishedPaths(head);
-    const source = listed.filter((x) => isReleased(x.filename, p.path, published) && x.filename !== manifest);
+    const shippedFiles = head === null ? null : publishedPaths(head);
+    const source = listed.filter((x) => isReleased(x.filename, p.path, shippedFiles) && x.filename !== manifest);
     // A failed read counts as a change, so a fault gives a row and not a silent pass.
     const newVersion = p.version !== published;
     const manifestListed = listed.some((x) => x.filename === manifest);
@@ -300,7 +300,7 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     };
     const manifestMoved = newVersion || (manifestListed && (await movedAt(branch)));
     const counts = async (sha: string): Promise<boolean> => {
-      const files = (await filesOf(p.repo, sha)).filter((x) => isReleased(x, p.path, published));
+      const files = (await filesOf(p.repo, sha)).filter((x) => isReleased(x, p.path, shippedFiles));
       if (files.some((x) => x !== manifest)) return true;
       return files.length > 0 && manifestMoved && (await movedAt(sha));
     };
