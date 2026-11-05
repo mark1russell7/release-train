@@ -2,6 +2,8 @@ import { createHash, createHmac } from "node:crypto";
 import semver from "semver";
 import { pool } from "./collect.ts";
 import type { GitHub } from "./github.ts";
+import { holdsUpdate } from "./holds.ts";
+import type { LagHold } from "./holds.ts";
 import { adoptWhy, moveSets } from "./plan.ts";
 import type { Action, ActionItem, Plan } from "./plan.ts";
 import type { DepType, LockKind } from "./types.ts";
@@ -102,7 +104,7 @@ export interface WaitingUpdate {
   actionId: string;
   wave: number;
   dependsOn: string[];
-  /** When true, an open pull request of the train in this repository does not merge: a release that is in flight holds its ranges. */
+  /** When true, an open pull request of the train in this repository does not merge. A release in flight holds its ranges, or a hold names this repository. */
   holdsOpen?: boolean;
 }
 
@@ -152,8 +154,11 @@ function heldDeps(items: readonly ActionItem[], late: readonly string[], carried
  * The set `flying` names the repositories with a release in flight. Main has a new version, and npm does not have it yet.
  * A run publishes the commit that it started on, so a range that changes at this time does not go into that version.
  * The next run of the plan then sees no need for a release. So the item waits, and after the release the cascade raises the version.
+ *
+ * The list `holds` can name a package and a dependent repository. That package does not go to that repository, and each
+ * package that must move with it stays too. The same package goes to each other repository.
  */
-export function selectUpdates(p: Plan, only: readonly string[] | null = null, cascade: readonly string[] | "all" = "all", flying: ReadonlySet<string> = new Set()): Selection {
+export function selectUpdates(p: Plan, only: readonly string[] | null = null, cascade: readonly string[] | "all" = "all", flying: ReadonlySet<string> = new Set(), holds: readonly LagHold[] = []): Selection {
   const latest = new Map(p.nodes.filter((n) => n.kind === "package").map((n) => [n.name, n.npmLatest]));
   const lock = new Map(p.repos.map((r) => [r.name, r.lockKind]));
   const links = new Map(p.repos.filter((r) => r.submodules?.length).map((r) => [r.name, r.submodules ?? []]));
@@ -191,10 +196,11 @@ export function selectUpdates(p: Plan, only: readonly string[] | null = null, ca
     const releasing = new Set(rel?.packages.map((x) => x.name));
     const carried = a.items.filter((i) => i.dependent !== null && releasing.has(i.dependent) && i.newRange && RUNTIME.has(i.type)).map((i) => i.dep);
     const late = a.items.filter((i) => !onNpm(i)).map((i) => i.dep);
-    const held = heldDeps(a.items, relWaits.length > 0 ? [...late, ...carried] : late, carried, sets);
+    const ruled = [...new Set(a.items.map((i) => i.dep).filter((dep) => holdsUpdate(holds, a.repo, dep)))];
+    const held = heldDeps(a.items, [...(relWaits.length > 0 ? [...late, ...carried] : late), ...ruled], carried, sets);
     const going = a.items.filter((i) => !held.has(i.dep));
     if (going.length === 0) {
-      waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: [...a.dependsOn, ...relWaits], ...(holdsOpen ? { holdsOpen } : {}) });
+      waiting.push({ repo: a.repo, private: a.repoPrivate, actionId: a.id, wave: a.wave, dependsOn: [...a.dependsOn, ...relWaits, ...ruled.map((dep) => `hold:${dep}`)], ...(holdsOpen || ruled.length > 0 ? { holdsOpen: true } : {}) });
       continue;
     }
     const carries = relWaits.length === 0 && !carried.some((d) => held.has(d));
@@ -385,6 +391,8 @@ export interface ApplyOptions {
   releaseDispatch?: boolean;
   /** The repositories whose breaking adoptions carry a cascade release, or "all". The adoptions of other repositories with a release wait. Default: "all". */
   cascade?: readonly string[] | "all";
+  /** The valid holds of the file of the holds. A hold with a repository stops the update of its package in that repository. */
+  holds?: readonly LagHold[];
   /** The template sync. Absent or null: the run does not sync the template files. */
   sync?: SyncOptions | null;
   /**
@@ -805,7 +813,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       flying.add(repo);
     }
   }
-  const sel = selectUpdates(o.plan, o.only ?? null, o.cascade ?? "all", flying);
+  const sel = selectUpdates(o.plan, o.only ?? null, o.cascade ?? "all", flying, o.holds ?? []);
   const privateOf = new Map(o.plan.repos.map((r) => [r.name, r.private]));
   const scan = o.plan.repos.map((r) => r.name).filter((n) => !o.only || o.only.includes(n));
   const results: RepoResult[] = [];

@@ -86,8 +86,10 @@ export interface LagReport {
   unread: LagUnread[];
   /** The faults of the hold list. Each fault fails the gate. */
   holdFaults?: string[];
-  /** The holds with no row over its limit in this run. */
+  /** The release holds with no row over its limit in this run. */
   idleHolds?: LagHold[];
+  /** The holds that stop an update in one repository. A held update has no row, so these holds do not change the gate. */
+  repoHolds?: LagHold[];
 }
 
 /** The input of `lagReport`. */
@@ -456,13 +458,13 @@ async function redRows(i: LagInput, now: number, log: (line: string) => void): P
 
 /** This function gives the report with its holds. A row over its limit keeps its days and takes its hold. */
 export function applyHolds(report: LagReport, reading: HoldReading): LagReport {
-  const hold = (name: string): LagHold | undefined => reading.holds.find((item) => item.package === name);
+  const hold = (name: string): LagHold | undefined => reading.holds.find((item) => item.package === name && item.repo === undefined);
   const rows = report.rows.map((row) => {
     const held = row.over ? hold(row.package) : undefined;
     return held === undefined ? row : { ...row, held };
   });
-  const idleHolds = reading.holds.filter((item) => !rows.some((row) => row.held === item));
-  return { ...report, rows, holdFaults: reading.faults, idleHolds };
+  const idleHolds = reading.holds.filter((item) => item.repo === undefined && !rows.some((row) => row.held === item));
+  return { ...report, rows, holdFaults: reading.faults, idleHolds, repoHolds: reading.holds.filter((item) => item.repo !== undefined) };
 }
 
 /** This function tells if the gate fails: a row over its limit with no hold, or a fault of the hold list. */
@@ -517,6 +519,7 @@ export function lagSummary(r: LagReport): string {
   }
   table("Under the limit", watch);
   if ((r.idleHolds ?? []).length > 0) lines.push("", "## Holds with no row over the limit", "", ...(r.idleHolds ?? []).map((item) => `- ${item.package}, to ${item.until}`));
+  if ((r.repoHolds ?? []).length > 0) lines.push("", "## Updates held in one repository", "", ...(r.repoHolds ?? []).map((item) => `- ${item.package} in ${item.repo ?? ""}, to ${item.until}: [${item.reason}](${item.ruling})`));
   if (r.red.length > 0) {
     lines.push("", "## Red pull requests of the train", "", "| Pull request | Days | Failed checks |", "| --- | --- | --- |");
     for (const x of r.red) lines.push(`| [${x.repo} #${x.number}](${x.url}) | ${x.ageDays} | ${x.checks.join(", ")} |`);

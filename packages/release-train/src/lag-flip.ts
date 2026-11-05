@@ -1,5 +1,5 @@
 // The flip test of the lag gate. This script starts the command `lag` on a saved report, with no network, and each case
-// gives a hold list. The gate has to fail on the first two cases and pass on the third, in the same job. So a gate that
+// gives a hold list. The gate has to fail on the first three cases and pass on the last, in the same job. So a gate that
 // cannot fail makes this script fail.
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -40,10 +40,11 @@ export interface FlipCase {
   says: string;
 }
 
-/** The three cases of the flip test. */
+/** The cases of the flip test. */
 export const FLIP_CASES: readonly FlipCase[] = [
   { name: "a new package over the limit fails while another package is held", report: report(["held", "new"]), holds: [hold("held", "2026-11-07")], code: 1, says: "The gate fails" },
   { name: "a date in the past fails", report: report(["held"]), holds: [hold("held", "2026-11-04")], code: 1, says: "is in the past" },
+  { name: "a hold of an update in one repository does not hold the release of the package", report: report(["held"]), holds: [{ ...hold("held", "2026-11-07"), repo: "other" }], code: 1, says: "The gate fails" },
   { name: "a held row alone passes, and it reads as held", report: report(["held"]), holds: [hold("held", "2026-11-07")], code: 0, says: "The gate holds 1 row" },
 ];
 

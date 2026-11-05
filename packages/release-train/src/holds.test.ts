@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { HOLDS_FILE, extensionFaults, holdsOfFile, readHolds } from "./holds.ts";
+import { HOLDS_FILE, extensionFaults, holdsOfFile, holdsUpdate, readHolds } from "./holds.ts";
 import type { LagHold } from "./holds.ts";
 import { FLIP_CASES, runFlip } from "./lag-flip.ts";
 import { applyHolds, lagOver, lagSummary } from "./lag.ts";
@@ -78,6 +78,65 @@ describe("the hold list", () => {
   });
 });
 
+describe("a hold of an update in one repository", () => {
+  const here: LagHold = { ...good, repo: "app-repo" };
+
+  it("takes a valid hold, and keeps the field", () => {
+    expect(readHolds({ holds: [here] }, NOW)).toEqual({ holds: [here], faults: [] });
+    expect(holdsOfFile({ holds: [here] })).toEqual([here]);
+  });
+
+  it("reads an empty field as no field", () => {
+    expect(readHolds({ holds: [{ ...good, repo: " " }] }, NOW).holds[0]).not.toHaveProperty("repo");
+  });
+
+  it("names the repository in a fault, and an expired hold holds nothing", () => {
+    const reading = readHolds({ holds: [{ ...here, until: "2026-11-04" }] }, NOW);
+    expect(reading.faults).toEqual(["p in app-repo: the date 2026-11-04 of the hold is in the past."]);
+    expect(reading.holds).toEqual([]);
+  });
+
+  it("keeps the limit of 14 days", () => {
+    expect(readHolds({ holds: [{ ...here, until: "2026-11-20" }] }, NOW).faults).toEqual(["p in app-repo: the date 2026-11-20 of the hold is more than 14 days after the run."]);
+  });
+
+  it("takes one package in two repositories and with a release hold, and fails on two holds of one pair", () => {
+    const other = { ...good, repo: "other-repo" };
+    expect(readHolds({ holds: [here, other, good] }, NOW).faults).toEqual([]);
+    expect(readHolds({ holds: [here, here] }, NOW).faults).toEqual(["p in app-repo: the file has two holds of this package."]);
+  });
+
+  it("asks a new reason for a later date of the same pair only", () => {
+    const later = { ...here, until: "2026-11-09" };
+    expect(extensionFaults([here], [later])).toEqual(["p in app-repo: the hold goes to 2026-11-09 with its old reason. An extension needs a new reason."]);
+    expect(extensionFaults([good], [later])).toEqual([]);
+    expect(extensionFaults([{ ...good, repo: "other-repo" }], [later])).toEqual([]);
+  });
+
+  it("stops the update only in its repository, and a release hold stops no update", () => {
+    expect(holdsUpdate([here], "app-repo", "p")).toBe(true);
+    expect(holdsUpdate([here], "other-repo", "p")).toBe(false);
+    expect(holdsUpdate([here], "app-repo", "q")).toBe(false);
+    expect(holdsUpdate([good], "app-repo", "p")).toBe(false);
+  });
+
+  it("does not hold a release row, so the gate fails on that row", () => {
+    const report1 = applyHolds(report([row("p")]), { holds: [here], faults: [] });
+    expect(report1.rows[0]?.held).toBeUndefined();
+    expect(lagOver(report1)).toBe(true);
+  });
+
+  it("adds no row and does not fail the gate, and the report lists it apart", () => {
+    const report1 = applyHolds(report([row("q", false)]), { holds: [here], faults: [] });
+    expect(report1.rows).toHaveLength(1);
+    expect(lagOver(report1)).toBe(false);
+    const text = lagSummary(report1);
+    expect(text).toContain("The gate passes.");
+    expect(text).toContain("## Updates held in one repository\n\n- p in app-repo, to 2026-11-07: [The owner holds it.](https://example.test/r)");
+    expect(text).not.toContain("Holds with no row");
+  });
+});
+
 describe("the gate with holds", () => {
   it("keeps a held row over its limit, and passes", () => {
     const held = applyHolds(report([row("p")]), { holds: [good], faults: [] });
@@ -125,8 +184,8 @@ describe("the gate with holds", () => {
 });
 
 describe("the flip test", () => {
-  it("has two cases that fail and one that passes", () => {
-    expect(FLIP_CASES.map((item) => item.code)).toEqual([1, 1, 0]);
+  it("has three cases that fail and one that passes", () => {
+    expect(FLIP_CASES.map((item) => item.code)).toEqual([1, 1, 1, 0]);
   });
 
   it("passes on the real gate", () => {
@@ -135,6 +194,6 @@ describe("the flip test", () => {
 
   it("finds a gate that gives another result", () => {
     const wrong = FLIP_CASES.map((item) => ({ ...item, code: item.code === 0 ? 1 : 0 }));
-    expect(runFlip(wrong)).toHaveLength(3);
+    expect(runFlip(wrong)).toHaveLength(FLIP_CASES.length);
   });
 });
