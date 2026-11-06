@@ -118,7 +118,14 @@ interface CompareAnswer {
   total_commits?: number;
   base_commit?: CommitInfo;
   commits?: CommitInfo[];
-  files?: { filename: string }[];
+  files?: ChangedFile[];
+}
+
+/** A file of a comparison. A change of the mode only, or of a binary file, has 0 changed lines. */
+interface ChangedFile {
+  filename: string;
+  status?: string;
+  changes?: number;
 }
 
 interface PackageVersion {
@@ -271,6 +278,19 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
       return null;
     }
   };
+  // The blob of a file at a ref, or null when the read fails.
+  const blobAt = async (repo: string, file: string, ref: string): Promise<string | null> => {
+    const r = await i.gh.request<{ sha?: string }>("GET", `${slug(repo)}/contents/${file}?ref=${encodeURIComponent(ref)}`);
+    return typeof r.data?.sha === "string" ? r.data.sha : null;
+  };
+  // A modified file with 0 changed lines has a new mode or binary content. The blobs tell which: the same blob means a
+  // change of the mode only (for example 644 to 755 of a bin file), and npm sets the modes of a package itself, so it does
+  // not count. A failed read counts as a change.
+  const sameContent = async (repo: string, file: ChangedFile, from: string, to: string): Promise<boolean> => {
+    if (file.status !== "modified" || file.changes !== 0) return false;
+    const [before, after] = await Promise.all([blobAt(repo, file.filename, from), blobAt(repo, file.filename, to)]);
+    return before !== null && before === after;
+  };
   const manifestAt = async (repo: string, file: string, ref: string): Promise<string | null> => {
     const m = await readManifest(repo, file, ref);
     return m === null ? null : usedManifest(m);
@@ -316,7 +336,9 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     // A failed read gives no list, so the names of the files decide and a fault gives a row.
     const head = await readManifest(p.repo, manifest, branch);
     const shippedFiles = head === null ? null : publishedPaths(head);
-    const source = listed.filter((x) => isReleased(x.filename, p.path, shippedFiles) && x.filename !== manifest);
+    const released = listed.filter((x) => isReleased(x.filename, p.path, shippedFiles) && x.filename !== manifest);
+    const kept = await Promise.all(released.map((x) => sameContent(p.repo, x, commit, branch)));
+    const source = released.filter((_, at) => kept[at] !== true);
     // A failed read counts as a change, so a fault gives a row and not a silent pass.
     const newVersion = p.version !== published;
     const manifestListed = listed.some((x) => x.filename === manifest);

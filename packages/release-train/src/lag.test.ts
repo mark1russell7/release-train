@@ -125,6 +125,34 @@ describe("lagReport", () => {
     expect(r.rows[0]).toMatchObject({ reason: "kept-version", over: true, files: 1 });
   });
 
+  it("does not report a file whose mode changed and whose content did not", async () => {
+    const r = await run([pkg("@o/x")], {
+      [`/repos/o/r/compare/${OLD}...main`]: { status: "ahead", commits: [commit("b1", ago(9 * 24 * HOUR))], files: [{ filename: "packages/x/src/cli.ts", status: "modified", changes: 0 }] },
+      "/repos/o/r/commits/b1": { files: [{ filename: "packages/x/src/cli.ts" }] },
+      [`/repos/o/r/contents/packages/x/src/cli.ts?ref=${OLD}`]: { sha: "blob1" },
+      "/repos/o/r/contents/packages/x/src/cli.ts?ref=main": { sha: "blob1" },
+    });
+    expect(r.rows).toEqual([]);
+  });
+
+  it("reports a file with 0 changed lines and a new blob, such as a binary file", async () => {
+    const r = await run([pkg("@o/x")], {
+      [`/repos/o/r/compare/${OLD}...main`]: { status: "ahead", commits: [commit("b1", ago(9 * 24 * HOUR))], files: [{ filename: "packages/x/src/cli.ts", status: "modified", changes: 0 }] },
+      "/repos/o/r/commits/b1": { files: [{ filename: "packages/x/src/cli.ts" }] },
+      [`/repos/o/r/contents/packages/x/src/cli.ts?ref=${OLD}`]: { sha: "blob1" },
+      "/repos/o/r/contents/packages/x/src/cli.ts?ref=main": { sha: "blob2" },
+    });
+    expect(r.rows[0]).toMatchObject({ reason: "kept-version", over: true, files: 1 });
+  });
+
+  it("reports a file with 0 changed lines when a blob cannot be read", async () => {
+    const r = await run([pkg("@o/x")], {
+      [`/repos/o/r/compare/${OLD}...main`]: { status: "ahead", commits: [commit("b1", ago(9 * 24 * HOUR))], files: [{ filename: "packages/x/src/cli.ts", status: "modified", changes: 0 }] },
+      "/repos/o/r/commits/b1": { files: [{ filename: "packages/x/src/cli.ts" }] },
+    });
+    expect(r.rows[0]).toMatchObject({ files: 1 });
+  });
+
   it("starts the age at the commit that moved a runtime field, and not at an earlier change of the tools", async () => {
     const r = await run([pkg("@o/x")], {
       [`/repos/o/r/compare/${OLD}...main`]: {
