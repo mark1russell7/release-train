@@ -21,7 +21,7 @@
   "dependencies": {
     "@mark1russell7/conventions": "^0.29.1",
     "@mark1russell7/service": "^0.6.5",
-    "@procedures/shell": "^0.47.1",
+    "@procedures/shell": "^0.48.1",
     "semver": "^7.8.5",
     "yaml": "^2.9.1"
   },
