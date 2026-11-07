@@ -96,17 +96,25 @@ export function setManifestVersion(text: string, to: string): string | null {
   return `${text.slice(0, open + 1)}${to}${text.slice(close)}`;
 }
 
+/** This function tells if a decision breaks the API: MINOR before `1.0.0` and MAJOR after, as {@link decideBump} gives them. */
+export function decisionBreaks(d: Pick<BumpDecision, "type">): boolean {
+  return d.type !== "patch";
+}
+
 /**
  * This function adds the section of a version above the first version section of a changelog. It keeps the other text. It
  * gives null when the changelog already has a section for the version.
+ *
+ * @remarks Each line of `breaks` goes in a list under the heading `### Breaking`. A changelog check reads that heading as the
+ * mark of a break, so a version that breaks the API gives at least one line.
  */
-export function addChangelogSection(text: string, version: string, why: string): string | null {
+export function addChangelogSection(text: string, version: string, why: string, breaks: readonly string[] = []): string | null {
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const lines = text.split(eol);
   const heading = /^##\s+\[?v?(\d[^\s\]]*)/;
   if (lines.some((line) => heading.exec(line)?.[1] === version)) return null;
   const at = lines.findIndex((line) => heading.test(line));
-  const section = [`## ${version}`, "", why, ""];
+  const section = [`## ${version}`, "", why, "", ...(breaks.length === 0 ? [] : ["### Breaking", "", ...breaks.map((line) => `- ${line}`), ""])];
   if (at >= 0) lines.splice(at, 0, ...section);
   else lines.push(...(lines.at(-1) === "" ? [] : [""]), ...section);
   return lines.join(eol);

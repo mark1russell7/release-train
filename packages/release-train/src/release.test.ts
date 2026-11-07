@@ -9,7 +9,7 @@ import { gitHub } from "./github.ts";
 import type { FetchFn } from "./collect.ts";
 import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
-import { addChangelogSection, awaitRelease, changesetText, decideBump, namesModule, setManifestVersion, typedFiles } from "./release.ts";
+import { addChangelogSection, awaitRelease, changesetText, decideBump, decisionBreaks, namesModule, setManifestVersion, typedFiles } from "./release.ts";
 import type { Manifest, NpmInfo, RepoSnapshot } from "./types.ts";
 import { changesetName, gitUpdater } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
@@ -162,9 +162,44 @@ describe("gitUpdater with a cascade release", () => {
       return log;
     };
     const added = await go("# Changes\n\n## 0.3.0\n\nOld.\n");
-    expect(added).toMatch(/^# Changes\n\n## 0\.4\.0\n\nThe release train changes the range of `@ex\/core` to a version outside the old range\. .+\n\n## 0\.3\.0\n\nOld\.\n$/);
+    expect(added).toMatch(/^# Changes\n\n## 0\.4\.0\n\nThe release train changes the range of `@ex\/core` to a version outside the old range\. .+\n\n### Breaking\n\n- The range `\^1\.0\.0` of `@ex\/core` in `dependencies` does not hold `2\.0\.0`, so it changes\.\n\n## 0\.3\.0\n\nOld\.\n$/);
     const kept = "## 0.4.0\n\nThe owner wrote this.\n\n## 0.3.0\n";
     expect(await go(kept)).toBe(kept);
+  });
+
+  it("marks a break with the heading Breaking and one line for each range", () => {
+    expect(addChangelogSection("## 0.3.0\n", "0.4.0", "Why.", ["A.", "B."])).toBe("## 0.4.0\n\nWhy.\n\n### Breaking\n\n- A.\n- B.\n\n## 0.3.0\n");
+    expect(addChangelogSection("# C\r\n", "2.0.0", "Why.", ["A."])).toBe("# C\r\n\r\n## 2.0.0\r\n\r\nWhy.\r\n\r\n### Breaking\r\n\r\n- A.\r\n");
+    expect(addChangelogSection("## 0.3.0\n", "0.3.1", "Why.", [])).toBe("## 0.3.1\n\nWhy.\n\n## 0.3.0\n");
+  });
+
+  it("gives a break for MINOR before 1.0.0 and for MAJOR, and no break for PATCH", () => {
+    const types = ["patch", "minor", "major"] as const;
+    expect(types.map((type) => decisionBreaks({ type }))).toEqual([false, true, true]);
+  });
+
+  it("writes no mark of a break for a patch release", async () => {
+    const plain = tgz({ "package/dist/index.d.ts": "export declare const x: number;" });
+    const patchFetch: FetchFn = async (url) => (url.endsWith(".tgz") ? new Response(plain, { status: 200 }) : fetchFn(url));
+    const u = { ...(selectUpdates(cascadePlan()).ready.find((x) => x.repo === "pub-repo") as RepoUpdate), lockKind: "none" as const };
+    let log = "";
+    const inner = runWith(false, [], {});
+    const run: RunFn = async (cmd, args, opts) => {
+      const out = await inner(cmd, args, opts);
+      if (cmd === "git" && args[0] === "clone") writeFileSync(join(opts.cwd, "CHANGELOG.md"), "## 0.3.0\n\nOld.\n");
+      if (cmd === "git" && args.includes("commit")) log = readFileSync(join(opts.cwd, "CHANGELOG.md"), "utf8");
+      return out;
+    };
+    const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: patchFetch });
+    const r = await up.update(u, { defaultBranch: "main", rebuild: false });
+    expect(r.releases?.[0]).toMatchObject({ to: "0.3.1", type: "patch" });
+    expect(log).toMatch(/^## 0\.3\.1\n\n.+\n\n## 0\.3\.0\n/);
+    expect(log).not.toContain("### Breaking");
+    const seen: { manifest?: string; changeset?: string } = {};
+    const withSets = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run: runWith(true, [], seen), fetch: patchFetch });
+    await withSets.update(u, { defaultBranch: "main", rebuild: false });
+    expect(seen.changeset).toContain('"@ex/pub": patch');
+    expect(seen.changeset).not.toContain("breaking");
   });
 
   it("puts a section below Unreleased, reads each form of a heading and keeps the line ends", () => {
@@ -238,6 +273,7 @@ describe("gitUpdater with a cascade release", () => {
     expect(r.releases?.[0]?.via).toBe("changeset");
     expect(seen.manifest).toContain('"version": "0.3.0"');
     expect(seen.changeset).toContain('"@ex/pub": minor');
+    expect(seen.changeset).toContain("This release has breaking changes.");
     expect(cmds.some((c) => /^git add -- \.changeset\/release-train-[0-9a-f]{8}\.md$/.test(c))).toBe(true);
   });
 });

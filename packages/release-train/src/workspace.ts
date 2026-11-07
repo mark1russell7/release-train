@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import semver from "semver";
-import { addChangelogSection, changesetText, decideBump, setManifestVersion, typedFiles } from "./release.ts";
+import { addChangelogSection, changesetText, decideBump, decisionBreaks, setManifestVersion, typedFiles } from "./release.ts";
 import { ageExcludeAdd, ageRuleEdit, globMatch, ownScopes } from "./settings.ts";
 import type { LockChange, ReleaseDone, RepoUpdate, UpdateResult, Updater, YoungItem } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
@@ -579,7 +579,14 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
               const log = join(dir, r.path, "CHANGELOG.md");
               if (existsSync(log)) {
                 const ranges = r.changes.map((c) => `\`${c.dep}\``).join(", ");
-                const section = addChangelogSection(readFileSync(log, "utf8"), d.to, `The release train changes the range of ${ranges} to a version outside the old range. ${d.why}`);
+                // A break of the API gets the mark of a break, with one line for each range.
+                const breaks = !decisionBreaks(d)
+                  ? []
+                  : r.changes.map((c) => {
+                      const item = u.items.find((i) => i.dep === c.dep && i.type === c.type && i.path === r.path) ?? u.items.find((i) => i.dep === c.dep);
+                      return item === undefined ? `The range of \`${c.dep}\` in \`${c.type}\` changes.` : `The range \`${item.range}\` of \`${c.dep}\` in \`${c.type}\` does not hold \`${item.to}\`, so it changes.`;
+                    });
+                const section = addChangelogSection(readFileSync(log, "utf8"), d.to, `The release train changes the range of ${ranges} to a version outside the old range. ${d.why}`, breaks);
                 if (section !== null) writeFileSync(log, section);
               }
             }
@@ -587,9 +594,14 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           if (viaChangeset) {
             const deps = [...new Set(rels.flatMap((r) => r.changes.map((c) => c.dep)))];
             const summary = `The release train: the ranges of ${deps.join(", ")} change to a version outside the old range.`;
-            const name = changesetName((n) => existsSync(join(dir, ".changeset", n)), u.fingerprint);
-            writeFileSync(join(dir, ".changeset", name), changesetText(releases, summary));
-            added.push(`.changeset/${name}`);
+            // A changeset gives its text to each of its packages. So a break and a patch go in two files, and only the break has the mark.
+            const groups = [releases.filter((r) => decisionBreaks(r)), releases.filter((r) => !decisionBreaks(r))];
+            for (const [at, group] of groups.entries()) {
+              if (group.length === 0) continue;
+              const name = changesetName((n) => existsSync(join(dir, ".changeset", n)), u.fingerprint);
+              writeFileSync(join(dir, ".changeset", name), changesetText(group, at === 0 ? `${summary} This release has breaking changes.` : summary));
+              added.push(`.changeset/${name}`);
+            }
           }
         }
 
