@@ -1,20 +1,6 @@
 {
   "holds": [
     {
-      "package": "@mark1russell7/packing",
-      "repo": "layout-contract",
-      "reason": "The nightly sweep keeps one pair of engines to 11-17, so its rows stay comparable over one epoch. The raise lands with the switch to the engine spaces, and a read states its effect on the rows.",
-      "ruling": "https://github.com/mark1russell7/layout-contract/blob/main/docs/SWEEP.md#one-pair-of-engines-to-11-17",
-      "until": "2026-11-17"
-    },
-    {
-      "package": "@mark1russell7/highways",
-      "repo": "layout-contract",
-      "reason": "The nightly sweep keeps one pair of engines to 11-17, so its rows stay comparable over one epoch. The raise lands with the switch to the engine spaces, and a read states its effect on the rows.",
-      "ruling": "https://github.com/mark1russell7/layout-contract/blob/main/docs/SWEEP.md#one-pair-of-engines-to-11-17",
-      "until": "2026-11-17"
-    },
-    {
       "package": "@mark1russell7/vex",
       "reason": "Main holds breaking changes, so no patch release goes out. Vex 0.18.0 has the date 11-07, with a last line at 11-08 18:00Z. A red proof Weekly on main ends this date, and a new date needs a new reason.",
       "ruling": "https://github.com/mark1russell7/Vex/blob/1d14a5dd297f111d1e7cb7214cedf21554c8fa99/spec/regressions.md#the-version-on-npm",
