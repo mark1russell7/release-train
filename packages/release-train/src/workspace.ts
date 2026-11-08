@@ -172,6 +172,18 @@ export const FIX_SINCE = "0.8.2";
 
 /** The root script that checks the API reports, and the report of a package when the repository names no other file. */
 export const API_SCRIPT = "check:api";
+
+/**
+ * This function gives the arguments of `api-report` that write the reports that the script `check:api` compares.
+ * A script `api-report check <folders and options>` gives `update` with the same folders and options. With no
+ * folder, `api-report` reads the globs of the workspace, and these can leave out the root package. Logger names only
+ * `site` in its workspace, and its script is `api-report check .`. For any other form, the function gives `update`.
+ */
+export function apiReportUpdateArgs(script: string | undefined): string[] {
+  const match = /^\s*api-report\s+check((?:\s+[\w./@:=*!-]+)*)\s*$/.exec(script ?? "");
+  if (match === null) return ["update"];
+  return ["update", ...(match[1] ?? "").trim().split(/\s+/).filter((part) => part !== "")];
+}
 export const API_REPORT = "test/api/public-api.txt";
 /** The package of the reports. A new version can change the form of each report. */
 export const API_REPORT_PACKAGE = "@mark1russell7/api-report";
@@ -327,11 +339,14 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     const quiet = ["--ignore-scripts", "--no-audit", "--no-fund"];
     const workspaces = (JSON.parse(readFileSync(manifest, "utf8")) as { workspaces?: unknown }).workspaces !== undefined;
     const eachBuild: readonly (readonly [string, readonly string[]])[] = npm ? (workspaces ? [["npm", ["run", "build", "--workspaces", "--if-present"]]] : []) : [["pnpm", ["-r", "--if-present", "run", "build"]]];
+    const scripts = readScripts(manifest);
+    const check = scripts?.[API_SCRIPT];
+    const update = apiReportUpdateArgs(typeof check === "string" ? check : undefined);
     return [
       npm ? ["npm", ["install", "--package-lock-only", ...quiet]] : ["pnpm", ["install", "--lockfile-only"]],
       npm ? ["npm", ["ci", ...quiet]] : ["pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"]],
-      ...(typeof readScripts(manifest)?.["build"] === "string" ? [[npm ? "npm" : "pnpm", ["run", "build"]] as const] : eachBuild),
-      npm ? ["npm", ["exec", "--", "api-report", "update"]] : ["pnpm", ["exec", "api-report", "update"]],
+      ...(typeof scripts?.["build"] === "string" ? [[npm ? "npm" : "pnpm", ["run", "build"]] as const] : eachBuild),
+      npm ? ["npm", ["exec", "--", "api-report", ...update]] : ["pnpm", ["exec", "api-report", ...update]],
     ];
   };
 
