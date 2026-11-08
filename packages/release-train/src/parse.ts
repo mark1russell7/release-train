@@ -1,3 +1,4 @@
+import { globToRegExp } from "@mark1russell7/conventions";
 import { parse as parseYaml, parseAllDocuments } from "yaml";
 import { DEP_TYPES } from "./types.ts";
 import type { Manifest, Resolved, SpecKind } from "./types.ts";
@@ -36,37 +37,27 @@ export function parseSpec(name: string, spec: string): ParsedSpec {
   return { target: name, kind: "registry", range: s };
 }
 
-/** This function changes a workspace glob into a regular expression for a folder path. */
-export function globToRegExp(glob: string): RegExp {
-  // A loop removes the end slashes: the expression /\/+$/ backtracks in polynomial time on a long run of slashes.
+/**
+ * This function removes a `./` at the start of a workspace glob and each `/` at its end. A loop removes the end
+ * slashes: the expression /\/+$/ backtracks in polynomial time on a long run of slashes.
+ */
+function cleanGlob(glob: string): string {
   const start = glob.startsWith("./") ? 2 : 0;
   let end = glob.length;
   while (end > start && glob.charAt(end - 1) === "/") end -= 1;
-  const g = glob.slice(start, end);
-  let out = "";
-  for (let i = 0; i < g.length; i++) {
-    const c = g[i] as string;
-    if (c === "*") {
-      if (g[i + 1] === "*") {
-        out += ".*";
-        i++;
-        if (g[i + 1] === "/") i++;
-      } else {
-        out += "[^/]*";
-      }
-    } else if (c === "?") {
-      out += "[^/]";
-    } else {
-      out += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-    }
-  }
-  return new RegExp(`^${out}$`);
+  return glob.slice(start, end);
 }
+
+/**
+ * This function gives a regular expression for a workspace glob, with `globToRegExp` of `@mark1russell7/conventions`.
+ * As in pnpm, `a/**` also names `a`, `**` matches zero or more segments, and `{a,b}` matches one of its parts.
+ */
+const workspacePattern = (glob: string): RegExp => globToRegExp(cleanGlob(glob));
 
 /** This function gives the folders of the workspace packages, from the globs and the folders that hold a `package.json`. */
 export function matchWorkspaces(globs: readonly string[], dirs: readonly string[]): string[] {
-  const include = globs.filter((g) => !g.startsWith("!")).map(globToRegExp);
-  const exclude = globs.filter((g) => g.startsWith("!")).map((g) => globToRegExp(g.slice(1)));
+  const include = globs.filter((g) => !g.startsWith("!")).map(workspacePattern);
+  const exclude = globs.filter((g) => g.startsWith("!")).map((g) => workspacePattern(g.slice(1)));
   return dirs
     .filter((d) => d !== "" && !d.split("/").includes("node_modules"))
     .filter((d) => include.some((r) => r.test(d)) && !exclude.some((r) => r.test(d)))
