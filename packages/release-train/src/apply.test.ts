@@ -26,7 +26,7 @@ import { buildGraph } from "./graph.ts";
 import type { LagHold } from "./holds.ts";
 import { plan } from "./plan.ts";
 import type { Manifest, NpmInfo, RepoSnapshot, Resolved } from "./types.ts";
-import { API_REPORT_PACKAGE, CONVENTIONS, ageExcluded, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
+import { API_REPORT_PACKAGE, CONVENTIONS, ageExcluded, apiReportUpdateArgs, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 const OWNER = "example-owner";
@@ -1191,7 +1191,7 @@ describe("gitUpdater and the first API report", () => {
   const REPORT = "packages/a/test/api/public-api.txt";
 
   /** The clone has the script `start`. The fix adds `check:api` and writes LICENSE. The step `broken` fails. */
-  const start = async (options: { had?: boolean; broken?: string; config?: string; noBuild?: boolean; noReport?: string; tool?: boolean } = {}) => {
+  const start = async (options: { had?: boolean; script?: string; broken?: string; config?: string; noBuild?: boolean; noReport?: string; tool?: boolean } = {}) => {
     const dep = options.tool === true ? API_REPORT_PACKAGE : CONVENTIONS;
     const cmds: string[] = [];
     const trees: { manifest: string; lock: string }[] = [];
@@ -1204,7 +1204,7 @@ describe("gitUpdater and the first API report", () => {
       const file = join(opts.cwd, "package.json");
       if (cmd === "git" && args[0] === "clone") {
         const apiReport = options.config === undefined ? {} : { apiReport: { report: options.config } };
-        const scripts = { ...(options.noBuild === true ? {} : { build: "tsc" }), ...(options.had === true ? { "check:api": "api-report check" } : {}) };
+        const scripts = { ...(options.noBuild === true ? {} : { build: "tsc" }), ...(options.had === true ? { "check:api": options.script ?? "api-report check" } : {}) };
         writeFileSync(file, `${JSON.stringify({ name: "x", scripts, ...apiReport, devDependencies: { [dep]: "^0.8.0" } }, null, 2)}\n`);
       }
       if (cmd === "git" && args[0] === "write-tree") {
@@ -1298,6 +1298,14 @@ describe("gitUpdater and the first API report", () => {
     expect(prBody(update(API_REPORT_PACKAGE), result)).toContain("## API reports\n");
   });
 
+  it("writes the reports of the folders that the script check:api names", async () => {
+    // Logger 2026-11-06: the workspace names only site, and the script is `api-report check .`
+    const { cmds, result } = await start({ had: true, tool: true, script: "api-report check ." });
+    expect(cmds).toContain("pnpm exec api-report update .");
+    expect(cmds).not.toContain("pnpm exec api-report update");
+    expect(result).toMatchObject({ status: "pushed", apiReports: [REPORT] });
+  });
+
   it("keeps the update and tells the step when a step of the reports fails", async () => {
     for (const broken of ["pnpm run build", "pnpm exec api-report update"]) {
       const { message, result, manifest } = await start({ had: true, tool: true, broken });
@@ -1378,6 +1386,21 @@ describe("gitUpdater with pnpm", () => {
     for (const i of pnpmU.items) {
       expect(seen[0]?.[`${i.path}|${i.dep}`]).toBe(i.to);
       expect(seen[1]?.[`${i.path}|${i.dep}`]).toBe(i.newRange ?? i.range);
+    }
+  });
+});
+
+describe("apiReportUpdateArgs", () => {
+  it("gives update with the folders and options of the check", () => {
+    expect(apiReportUpdateArgs("api-report check")).toEqual(["update"]);
+    expect(apiReportUpdateArgs("api-report check .")).toEqual(["update", "."]);
+    expect(apiReportUpdateArgs("  api-report check packages/a packages/b  ")).toEqual(["update", "packages/a", "packages/b"]);
+    expect(apiReportUpdateArgs("api-report check --packages=packages/* !packages/site")).toEqual(["update", "--packages=packages/*", "!packages/site"]);
+  });
+
+  it("gives update alone for each other form of the script", () => {
+    for (const script of [undefined, "", "pnpm -r run check:api", "api-report check . && tsc", "api-report check \"a b\"", "api-report update .", "node scripts/api.ts check"]) {
+      expect(apiReportUpdateArgs(script)).toEqual(["update"]);
     }
   });
 });
