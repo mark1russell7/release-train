@@ -20,8 +20,8 @@
   },
   "dependencies": {
     "@mark1russell7/conventions": "^0.35.0",
-    "@mark1russell7/service": "^0.6.5",
-    "@procedures/shell": "^0.48.1",
+    "@mark1russell7/service": "^0.7.2",
+    "@procedures/shell": "^0.52.0",
     "semver": "^7.8.5",
     "yaml": "^2.9.1"
   },

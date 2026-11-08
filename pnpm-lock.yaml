@@ -197,11 +197,11 @@ importers:
         specifier: ^0.35.0
         version: 0.35.0
       '@mark1russell7/service':
-        specifier: ^0.6.5
-        version: 0.6.5(ws@8.22.1)(zod@4.6.7)
+        specifier: ^0.7.2
+        version: 0.7.2(ws@8.22.1)(zod@4.6.7)
       '@procedures/shell':
-        specifier: ^0.48.1
-        version: 0.48.2
+        specifier: ^0.52.0
+        version: 0.52.0
       semver:
         specifier: ^7.8.5
         version: 7.8.5
@@ -432,6 +432,15 @@ packages:
       zod:
         optional: true
 
+  '@mark1russell7/algebra@0.8.3':
+    resolution: {integrity: sha512-Z0saYxCDcqZu1leABWqksrIa9y9dbeTjR5l36ZRBqsDW6XfUcM4mWoE90YgzSW86YFP+dcV8y+WCKu8446e/ng==}
+    engines: {node: '>=22.19'}
+    peerDependencies:
+      zod: ^4.1.0
+    peerDependenciesMeta:
+      zod:
+        optional: true
+
   '@mark1russell7/api-report@0.4.1':
     resolution: {integrity: sha512-kx3vmIdzwGJf+aZ66qoYWm65IlrEzrbSXckAQed0I+fxs6+wFygVoum6ZVBeKdz05rHHLD9kiarwQQcI5LhsDQ==}
     engines: {node: '>=22'}
@@ -440,8 +449,12 @@ packages:
   '@mark1russell7/coeval@0.22.0':
     resolution: {integrity: sha512-woojpBeRerVqxfFBx0yiR6ibSpm2f9mcfsUPDdvIyT9GKZ2uCtM0S/108Ur765C0rjNKxopwlSH4xXyhf906iA==}
 
-  '@mark1russell7/collections@0.4.0':
-    resolution: {integrity: sha512-lWton8eiYfL4G24ANbOqyC6LxD1Lkp4DPO+GnCsxGGnCNFJuWLFJ9b1iTcLmbQ4osnYXaGkORTawtMoccXCJiA==}
+  '@mark1russell7/collections@0.5.0':
+    resolution: {integrity: sha512-/SBxY5LOLjIYuBiSf0hdxA6OeGPJUIAHSQSepVDZVnCLEvY1Jte0E3ec0ahN3oyO7oE677FY9d3LuuN18nyv3g==}
+    engines: {node: '>=22.12'}
+
+  '@mark1russell7/collections@0.9.8':
+    resolution: {integrity: sha512-OK0TYjuOnTUyAJjbhnFq86u/Y3M/xE3zsabGB6/dvwxnse2L8KXJ/fwPf2G+AJIGOabQQ8YMZN5nzuq+006yYQ==}
     engines: {node: '>=22.12'}
 
   '@mark1russell7/conventions@0.35.0':
@@ -454,6 +467,10 @@ packages:
     version: 1.0.2
     engines: {node: '>=22'}
     hasBin: true
+
+  '@mark1russell7/optional@1.2.0':
+    resolution: {integrity: sha512-vS5jF21WC/VApRv4p8afRZahcMl9cuNp03LxbVngY9nYkzq+S7Oit6ksySt2baML+tp46UF60sxnHxn1jlwtTg==}
+    engines: {node: '>=22.12'}
 
   '@mark1russell7/quantity@0.3.0':
     resolution: {integrity: sha512-psfyKmVrOz5ynHgr2ED7WM5Pa/XVy6DR28jCaSGY42gvV0CJEq7HJRpV6sgkvWx8s3Et7evJWR56aG5tjCHZIw==}
@@ -499,6 +516,33 @@ packages:
       zod:
         optional: true
 
+  '@mark1russell7/service@0.7.2':
+    resolution: {integrity: sha512-GkCnpn8bNrErkU7bFqltDxPWVFsiZjEsjTtzO4j5+uPV8+Anrdk7A3YNKtsKXDGOJfKejkx8Vdmqmhu7RJIFCg==}
+    engines: {node: '>=22.19'}
+    peerDependencies:
+      '@grpc/grpc-js': ^1.14.6
+      amqplib: ^2.2.0
+      ioredis: ^6.0.0
+      mongodb: ^7.7.0
+      pg: ^8.23.1
+      ws: ^8.22.0
+      zod: ^4.1.0
+    peerDependenciesMeta:
+      '@grpc/grpc-js':
+        optional: true
+      amqplib:
+        optional: true
+      ioredis:
+        optional: true
+      mongodb:
+        optional: true
+      pg:
+        optional: true
+      ws:
+        optional: true
+      zod:
+        optional: true
+
   '@mark1russell7/ste-lint@https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905':
     resolution: {gitHosted: true, integrity: sha512-VWKTHvPQEnTV/nbBzNaFmm/yzfZxqiakZwlroonxX2S8kchU1xssZi5gTgO+Wm5o+Lnhyk7mwLdnq3Sh5gkp4w==, tarball: https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905}
     version: 0.1.1
@@ -513,8 +557,8 @@ packages:
   '@oxc-project/types@0.155.0':
     resolution: {integrity: sha512-SeE8JPwW1xs1tHeNycjUtUBdhorRa8o4jlvjwk49R7/Z291i+4DQa7JJIgOm/TaYQZx+QrPQbVJ/9c8dMIZN8Q==}
 
-  '@procedures/client@0.48.2':
-    resolution: {integrity: sha512-I6YCwyP2aRtb+iRn7u4cO5vN9uUUwGwgJ0ww8JXmyeGjMqWYKclYF5buNBDvHxr1isrjkCVbw8So8QaESqZF1Q==}
+  '@procedures/client@0.52.0':
+    resolution: {integrity: sha512-oXqwm2UFz6SFymuuDXc9gkK0m56xStIE8c3zmOfzoDtXCq2yx3c5SjoIOoVmZUsX7IOHZu8ZQXkK7j6GP79amA==}
     engines: {node: '>=22'}
     peerDependencies:
       express: ^4.0.0 || ^5.0.0
@@ -522,8 +566,8 @@ packages:
       express:
         optional: true
 
-  '@procedures/shell@0.48.2':
-    resolution: {integrity: sha512-LTkPyE0Z52CB2RbFTudjoW2B/bP1fWkdf5NoujXYpMIWxGByHWinhcg0stNJk57LrMEd2CEAZ10srVp2LfALYA==}
+  '@procedures/shell@0.52.0':
+    resolution: {integrity: sha512-r9+kpmtFqrKIN3Xa7dewbKT0fKT8AnrQ+YeStu3LZ8WbsYqlyZMcA+kncJSIwuo5vnORNJP8KkjUQeM7vhF75g==}
     engines: {node: '>=22'}
 
   '@publint/pack@0.1.7':
@@ -1210,17 +1254,29 @@ snapshots:
     optionalDependencies:
       zod: 4.6.7
 
+  '@mark1russell7/algebra@0.8.3(zod@4.6.7)':
+    dependencies:
+      '@mark1russell7/quantity': 0.3.0(zod@4.6.7)
+    optionalDependencies:
+      zod: 4.6.7
+
   '@mark1russell7/api-report@0.4.1': {}
 
   '@mark1russell7/coeval@0.22.0': {}
 
-  '@mark1russell7/collections@0.4.0': {}
+  '@mark1russell7/collections@0.5.0': {}
+
+  '@mark1russell7/collections@0.9.8':
+    dependencies:
+      '@mark1russell7/optional': 1.2.0
 
   '@mark1russell7/conventions@0.35.0':
     dependencies:
       yaml: 2.9.1
 
   '@mark1russell7/cue@https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8': {}
+
+  '@mark1russell7/optional@1.2.0': {}
 
   '@mark1russell7/quantity@0.3.0(zod@4.6.7)':
     dependencies:
@@ -1241,6 +1297,16 @@ snapshots:
       ws: 8.22.1
       zod: 4.6.7
 
+  '@mark1russell7/service@0.7.2(ws@8.22.1)(zod@4.6.7)':
+    dependencies:
+      '@mark1russell7/algebra': 0.8.3(zod@4.6.7)
+      '@mark1russell7/collections': 0.9.8
+      '@mark1russell7/quantity': 0.3.0(zod@4.6.7)
+      '@mark1russell7/rigor-generators': 0.1.1
+    optionalDependencies:
+      ws: 8.22.1
+      zod: 4.6.7
+
   '@mark1russell7/ste-lint@https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905':
     dependencies:
       typescript: 6.0.3
@@ -1251,11 +1317,11 @@ snapshots:
 
   '@oxc-project/types@0.155.0': {}
 
-  '@procedures/client@0.48.2':
+  '@procedures/client@0.52.0':
     dependencies:
       '@mark1russell7/algebra': 0.8.1(zod@4.6.7)
       '@mark1russell7/coeval': 0.22.0
-      '@mark1russell7/collections': 0.4.0
+      '@mark1russell7/collections': 0.5.0
       '@mark1russell7/quantity': 0.3.0(zod@4.6.7)
       '@mark1russell7/service': 0.6.5(ws@8.22.1)(zod@4.6.7)
       '@types/ws': 8.18.2
@@ -1270,9 +1336,9 @@ snapshots:
       - pg
       - utf-8-validate
 
-  '@procedures/shell@0.48.2':
+  '@procedures/shell@0.52.0':
     dependencies:
-      '@procedures/client': 0.48.2
+      '@procedures/client': 0.52.0
       zod: 4.6.7
     transitivePeerDependencies:
       - '@grpc/grpc-js'
