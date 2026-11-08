@@ -9,7 +9,7 @@ import { collect, HttpError } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { docId, writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
-import { globToRegExp, matchWorkspaces, parseNpmLock, parsePnpmLock, parseSpec } from "./parse.ts";
+import { matchWorkspaces, parseNpmLock, parsePnpmLock, parseSpec } from "./parse.ts";
 import { plan } from "./plan.ts";
 import { addProgress, checkState } from "./progress.ts";
 
@@ -136,9 +136,11 @@ describe("parse", () => {
   });
 
   it("matches workspace globs", () => {
-    expect(globToRegExp("packages/*").test("packages/a")).toBe(true);
-    expect(globToRegExp("packages/*").test("packages/a/b")).toBe(false);
-    expect(globToRegExp("apps/**").test("apps/a/b")).toBe(true);
+    const matches = (glob: string, path: string): boolean => matchWorkspaces([glob], [path]).length === 1;
+    expect(matches("packages/*", "packages/a")).toBe(true);
+    expect(matches("packages/*", "packages/a/b")).toBe(false);
+    expect(matches("apps/**", "apps/a/b")).toBe(true);
+    expect(matches("./packages/*/", "packages/a")).toBe(true);
     expect(matchWorkspaces(["packages/*", "!packages/skip"], ["", "packages/a", "packages/skip", "packages/a/node_modules/x"])).toEqual(["packages/a"]);
   });
 
@@ -151,6 +153,70 @@ describe("parse", () => {
     expect(parsePnpmLock(twoDocs)).toEqual({ "": {}, "packages/x": { a: "1.3.0" } });
     const npmLock = JSON.stringify({ packages: { "node_modules/a": { version: "1.0.0" }, "packages/x/node_modules/a": { version: "2.0.0" } } });
     expect(parseNpmLock(npmLock, ["", "packages/x"], ["a"])).toEqual({ "": { a: "1.0.0" }, "packages/x": { a: "2.0.0" } });
+  });
+});
+
+/** The copy of release-train 0.2.9, word for word: the reference of the move to `globToRegExp` of conventions. */
+function copyGlobToRegExp(glob: string): RegExp {
+  const start = glob.startsWith("./") ? 2 : 0;
+  let end = glob.length;
+  while (end > start && glob.charAt(end - 1) === "/") end -= 1;
+  const g = glob.slice(start, end);
+  let out = "";
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i] as string;
+    if (c === "*") {
+      if (g[i + 1] === "*") {
+        out += ".*";
+        i++;
+        if (g[i + 1] === "/") i++;
+      } else {
+        out += "[^/]*";
+      }
+    } else if (c === "?") {
+      out += "[^/]";
+    } else {
+      out += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${out}$`);
+}
+
+describe("the workspace globs of conventions and the copy of release-train 0.2.9", () => {
+  const globs = [
+    "packages/*", "packages/**", "apps/*", "./packages/*", "packages/*/", "./packages/**/", "**", "**/*",
+    "packages/*/*", "tools/?x", "packages/a.b", "packages/(x)", "packages/{a,b}", "docs", "packages/**/test", "**/test/**",
+  ];
+  const paths = [
+    "packages", "packages/a", "packages/a/b", "packages/a/b/c", "apps/web", "apps", "tools/ax", "tools/abx", "packages/a.b",
+    "packages/aXb", "packages/(x)", "packages/b", "packages/{a,b}", "docs", "docs/x", "packages/a/test",
+    "packages/test", "x/test/y", "test", "test/a",
+  ];
+
+  it("agree on each pair of a glob and a path, except the three forms where conventions reads the glob as pnpm does", () => {
+    const differ: string[] = [];
+    let same = 0;
+    for (const glob of globs) {
+      for (const path of paths) {
+        const home = matchWorkspaces([glob], [path]).length === 1;
+        if (home === copyGlobToRegExp(glob).test(path)) same++;
+        else differ.push(`${glob} ${path} ${home}`);
+      }
+    }
+    expect(differ).toEqual([
+      // `a/**` also names the folder `a`
+      "packages/** packages true",
+      "./packages/**/ packages true",
+      // `{a,b}` is one of its parts, not the text "{a,b}"
+      "packages/{a,b} packages/a true",
+      "packages/{a,b} packages/b true",
+      "packages/{a,b} packages/{a,b} false",
+      // `**/` matches zero segments, and `**/test/**` names the folder `test` at each depth
+      "**/test/** packages/a/test true",
+      "**/test/** packages/test true",
+      "**/test/** test true",
+    ]);
+    expect(same).toBe(globs.length * paths.length - 8);
   });
 });
 
