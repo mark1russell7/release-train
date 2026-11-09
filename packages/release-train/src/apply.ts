@@ -519,6 +519,7 @@ interface Pull {
   updated_at?: string;
   merged_at?: string | null;
   mergeable?: boolean | null;
+  mergeable_state?: string;
   auto_merge?: unknown;
   head: { sha: string; ref: string; repo?: { full_name: string } | null };
   base: { ref: string };
@@ -953,6 +954,34 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const hasLabel = (pr: Pull, name: string): boolean => (pr.labels ?? []).some((l) => l.name === name);
 
   /**
+   * This function merges the default branch into a branch that is behind, with the update-branch API of GitHub. Then CI
+   * starts again on the current base. It takes only a branch of the same repository with no conflict. A Renovate branch keeps its
+   * rebase box, because Renovate rebases it. The API refuses a change of the head after the read (HTTP 422).
+   *
+   * The merge starts CI, so it counts as a push in the limit of the run. It takes its turn by the time of the last push of
+   * the head, in the same order as the pushes. The function gives the text to add to the detail.
+   */
+  const catchUp = async (repo: string, pr: Pull, main: string): Promise<string> => {
+    if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX)) return "";
+    if (pr.head.repo === null || (pr.head.repo !== undefined && pr.head.repo.full_name !== `${owner}/${repo}`)) return "";
+    const conflict = ` The branch has a conflict with ${main}: its author must merge ${main} into it.`;
+    const full = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${pr.number}`)).data;
+    if (full?.mergeable === false || full?.mergeable_state === "dirty") return conflict;
+    // The merge starts CI as a push does, so it counts in the limit of pushes of the run.
+    const key = `${repo}#${pr.number}`;
+    const own = turns.has(key) ? turns.get(key) : o.maxPushes === undefined ? undefined : waitMs(await pushTime(repo, pr));
+    turns.delete(key);
+    const wait = limitWait(own);
+    if (wait !== null) return ` The merge of ${main} into the branch waits: ${wait}`;
+    const r = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/update-branch`, { expected_head_sha: pr.head.sha });
+    if (r.ok) {
+      pushes += 1;
+      return ` The train merged ${main} into the branch, so CI runs again.`;
+    }
+    return r.status === 422 ? conflict : ` The update of the branch failed (HTTP ${r.status}).`;
+  };
+
+  /**
    * This function merges a green pull request, or labels a red one. It gives the new state. It merges only a branch that
    * has each commit of the default branch, so CI ran on the current base. A branch that is behind waits for a new build.
    */
@@ -972,7 +1001,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       const cmp = await compareOf(repo, pr.head.sha, main);
       if (cmp === null) return { state: "unchanged", ci, detail: `CI is green, but GitHub did not compare the branch with ${main}. The train does not merge it now.` };
       if (cmp.behind > 0) {
-        return { state: "unchanged", ci, behind: cmp.behind, detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.` };
+        const caught = await catchUp(repo, pr, main);
+        return { state: "unchanged", ci, behind: cmp.behind, detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.${caught}` };
       }
       // A release run tags the commit of its version. When a merge changes a workflow file before the tag, GitHub refuses the
       // tag (HTTP 403): the token of a workflow cannot write workflow files. So a change of a workflow file waits for the run.
@@ -1083,20 +1113,41 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const res = await gh.request<{ commit?: { committer?: { date?: string } } }>("GET", `${base}/${repo}/commits/${sha}`);
     return res.data?.commit?.committer?.date;
   };
+  /** This function gives the time of the last push of a pull request: the committer date of its head, else `updated_at`. */
+  const pushTime = async (repo: string, pr: Pull): Promise<string | undefined> => (await commitDate(repo, pr.head.sha)) ?? pr.updated_at;
   const pushedAt = async (prs: Map<string, Pull>): Promise<Map<string, string | undefined>> => {
     const times = new Map<string, string | undefined>();
     await pool([...prs], o.concurrency ?? 6, async ([repo, pr]) => {
-      times.set(repo, (await commitDate(repo, pr.head.sha)) ?? pr.updated_at);
+      times.set(repo, await pushTime(repo, pr));
     });
     return times;
+  };
+  /** This function gives a time in milliseconds, as `longestWaitFirst` orders it: no time, or one that does not parse, goes first. */
+  const waitMs = (t: string | undefined): number => {
+    const ms = t === undefined ? Number.NaN : Date.parse(t);
+    return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
   };
   /** The start of the run. A new item with no known start of its need waits from it. */
   const runStart = (o.now ?? new Date()).toISOString();
   const slot = Math.floor((o.now ?? new Date()).getTime() / RUN_MS);
   let pushes = 0;
-  /** This function gives the reason why a push waits for the limit of pushes, or null when it can push. */
-  const limitWait = (): string | null =>
-    o.maxPushes !== undefined && pushes >= o.maxPushes ? `This run pushed ${pushes} branches, the most of one run, because the runners are shared. A later run pushes this one.` : null;
+  /**
+   * The run keeps these turns for a merge of the default branch into a labeled pull request, with `catchUp`. The key is
+   * `repo#number`, and the value is the time of the last push of the head. A push yields to each older turn. Thus the
+   * merges and the pushes have one longest-wait order, and a busy run does not starve a merge.
+   */
+  const turns = new Map<string, number>();
+  /**
+   * This function gives the reason why a push waits for the limit of pushes, or null when it can push. `at` is the time
+   * since when the push waits, in milliseconds. Each older turn of `turns` counts in the limit as a push.
+   */
+  const limitWait = (at?: number): string | null => {
+    if (o.maxPushes === undefined) return null;
+    const ahead = at === undefined ? 0 : [...turns.values()].filter((t) => t < at).length;
+    if (pushes + ahead < o.maxPushes) return null;
+    if (ahead === 0) return `This run pushed ${pushes} branches, the most of one run, because the runners are shared. A later run pushes this one.`;
+    return `This run pushed ${pushes} branches and keeps ${ahead} turn(s) for an older merge of the default branch into a labeled pull request. A run pushes at most ${o.maxPushes}, because the runners are shared. A later run pushes this one.`;
+  };
   /** This function gives the reason why a sync push waits for the busy runners, or null when it can push. */
   const busyWait = async (): Promise<string | null> => {
     if (!o.runnersBusy) return null;
@@ -1113,24 +1164,16 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    * This function merges each open pull request with the label MERGE_LABEL in a repository of the plan, through settle.
    * It takes only a branch of the same repository on the default branch. It does not delete the branch, because the
    * branch is not of the train. A Renovate branch that is behind gets a tick in its rebase box, so Renovate rebases it and CI runs again.
+ * Another branch that is behind gets the default branch merged in by settle.
    */
   const mergeLabeled = async (): Promise<void> => {
-    const q = `user:${owner} is:pr is:open label:${MERGE_LABEL}`;
-    const found = await gh.request<{ items?: { number: number; repository_url: string }[] }>("GET", `/search/issues?per_page=100&q=${encodeURIComponent(q)}`);
-    if (!found.ok || !found.data) {
-      log(`GitHub did not search the pull requests with the label ${MERGE_LABEL} (HTTP ${found.status}).`);
-      return;
-    }
-    const inScan = new Set(scan);
-    const metas = new Map<string, RepoMeta | null>();
-    for (const item of found.data.items ?? []) {
-      const repo = item.repository_url.split("/").pop() ?? "";
-      if (!inScan.has(repo)) continue;
-      const base0 = { repo, actionId: `merge:${repo}#${item.number}`, kind: MERGE_KIND, wave: null, items: 0, autoMerge: "train" as const };
+    const items = await findLabeled();
+    if (items === null) return;
+    for (const { repo, number } of items) {
+      const base0 = { repo, actionId: `merge:${repo}#${number}`, kind: MERGE_KIND, wave: null, items: 0, autoMerge: "train" as const };
       try {
-        if (!metas.has(repo)) metas.set(repo, (await gh.request<RepoMeta>("GET", `${base}/${repo}`)).data);
-        const meta = metas.get(repo) ?? null;
-        const pr = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${item.number}`)).data;
+        const meta = await metaOf(repo);
+        const pr = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${number}`)).data;
         if (!pr || pr.state !== "open") continue;
         const main = meta?.default_branch ?? "main";
         // A branch of a fork has a name that can match a branch of this repository, and a merge into another base is not a release path.
@@ -1147,17 +1190,58 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         let detail = s.detail;
         if ((s.behind ?? 0) > 0) {
           const body = pr.body ?? "";
+          // settle merges the default branch into a branch with no rebase box.
           if (body.includes(RENOVATE_REBASE_BOX)) {
             const r = await gh.request("PATCH", `${base}/${repo}/pulls/${pr.number}`, { body: body.replace(RENOVATE_REBASE_BOX, "- [x] <!-- rebase-check -->") });
             detail += r.ok ? " The train ticked the rebase box, so Renovate rebases the branch." : ` The tick of the rebase box failed (HTTP ${r.status}).`;
-          } else {
-            detail += " The branch has no Renovate rebase box: its author must rebase it.";
           }
         }
         result({ ...base0, state: s.state, pr: prRef(pr), ci: s.ci, detail });
       } catch (e) {
         result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
       }
+    }
+  };
+
+  /** This function finds the open pull requests with the label MERGE_LABEL in the repositories of the plan. It searches one time in a run. */
+  let labeled: Promise<{ repo: string; number: number }[] | null> | undefined;
+  const findLabeled = (): Promise<{ repo: string; number: number }[] | null> =>
+    (labeled ??= (async () => {
+      const q = `user:${owner} is:pr is:open label:${MERGE_LABEL}`;
+      const found = await gh.request<{ items?: { number: number; repository_url: string }[] }>("GET", `/search/issues?per_page=100&q=${encodeURIComponent(q)}`);
+      if (!found.ok || !found.data) {
+        log(`GitHub did not search the pull requests with the label ${MERGE_LABEL} (HTTP ${found.status}).`);
+        return null;
+      }
+      const inScan = new Set(scan);
+      return (found.data.items ?? []).map((i) => ({ repo: i.repository_url.split("/").pop() ?? "", number: i.number })).filter((i) => inScan.has(i.repo));
+    })());
+  const metas = new Map<string, RepoMeta | null>();
+  const metaOf = async (repo: string): Promise<RepoMeta | null> => {
+    if (!metas.has(repo)) metas.set(repo, (await gh.request<RepoMeta>("GET", `${base}/${repo}`)).data);
+    return metas.get(repo) ?? null;
+  };
+
+  /**
+   * This function keeps a turn in `turns` for each labeled pull request that settle merges `main` into in this run. It
+   * reads the same facts as mergeLabeled, settle and catchUp. The branch is green and behind the default branch, and it is
+   * of the same repository. It has no Renovate rebase box and no conflict, and no run of another branch is open. A turn
+   * that the run does not use (the facts changed) costs at most one push. The next run reads the facts again.
+   */
+  const keepTurns = async (): Promise<void> => {
+    if (o.maxPushes === undefined || o.dryRun) return;
+    for (const { repo, number } of (await findLabeled()) ?? []) {
+      const meta = await metaOf(repo);
+      const main = meta?.default_branch ?? "main";
+      const pr = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${number}`)).data;
+      if (!pr || pr.state !== "open" || pr.draft || pr.base.ref !== main || pr.head.repo?.full_name !== `${owner}/${repo}`) continue;
+      if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX) || pr.mergeable === false || pr.mergeable_state === "dirty") continue;
+      if ((await ciOf(repo, pr.head.sha)) !== "green") continue;
+      const ageHours = pr.created_at ? ((o.now ?? new Date()).getTime() - Date.parse(pr.created_at)) / 3_600_000 : 0;
+      if (ageHours < YIELD_MAX_HOURS && (await otherRuns(repo, pr.head.ref, meta)) > 0) continue;
+      const cmp = await compareOf(repo, pr.head.sha, main);
+      if (cmp === null || cmp.behind === 0) continue;
+      turns.set(`${repo}#${number}`, waitMs(await pushTime(repo, pr)));
     }
   };
 
@@ -1190,6 +1274,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   // 3 and 4. The adoptions of the current wave and the template sync. One limit covers the pushes of both, so with a pace
   // they go first in turn, and a long queue of one kind does not stop the other kind. An urgent update goes before the sync.
   const syncFirst = pacing && slot % 2 === 1 && !sel.ready.some(isUrgent);
+  await keepTurns();
   if (syncFirst && o.sync) await syncAll(o.sync);
   await updateAll();
   if (!syncFirst && o.sync) await syncAll(o.sync);
@@ -1235,7 +1320,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         const rebuild = await needsRebuild(u.repo, existing, meta.default_branch);
         // A branch with these changes on the current default branch needs no push.
         const due = !existing || rebuild || bodyFingerprint(existing.body) !== u.fingerprint;
-        const wait = urgent ? null : limitWait();
+        const wait = urgent ? null : limitWait(waitMs(pushed.get(u.repo) ?? runStart));
         if (o.dryRun && (wait === null || !due)) {
           const what = !existing ? "The run opens a pull request" : due ? `The run updates PR #${existing.number}` : `The run keeps PR #${existing.number}`;
           if (due && !urgent) pushes += 1;
@@ -1369,7 +1454,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         }
         const rebuild = await needsRebuild(repo, existing, meta.default_branch);
         const same = existing !== null && !rebuild && bodyFingerprint(existing.body) === planned.fingerprint;
-        const wait = same ? null : (limitWait() ?? (await busyWait()));
+        const wait = same ? null : (limitWait(waitMs(syncPushed.get(repo) ?? syncSince)) ?? (await busyWait()));
         if (wait !== null) {
           result({ ...commonOf(planned), state: "waiting", paced: true, pr: prRef(existing), autoMerge: null, ci: null, detail: wait });
           continue;

@@ -415,7 +415,9 @@ describe("apply", () => {
     const moved = await run(() => [200, { behind_by: n++ === 0 ? 0 : 1 }]);
     expect(moved.r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
     expect(moved.r.results[0]?.detail).toContain("1 commit(s) behind main");
-    expect(moved.calls.some((c) => c.method === "PUT")).toBe(false);
+    expect(moved.calls.some((c) => c.method === "PUT" && c.path.endsWith("/merge"))).toBe(false);
+    // The train merges main into its own branch that fell behind, so CI runs again on the current base.
+    expect(moved.calls.some((c) => c.method === "PUT" && c.path.endsWith("/pulls/7/update-branch"))).toBe(true);
     const unknown = await run(() => [404, { message: "Not Found" }]);
     expect(unknown.r.results[0]?.detail).toMatch(/did not compare the branch with main/);
     expect(unknown.calls.some((c) => c.method === "PUT")).toBe(false);
@@ -475,7 +477,7 @@ ${RENOVATE_REBASE_BOX} If you want to rebase/retry this PR, check this box`,
         labels: [{ name: MERGE_LABEL }],
         ...extra,
       });
-    const run = async (o: { pr?: Record<string, unknown>; behind?: number; files?: { filename: string }[]; release?: string[] | null; ci?: string; dryRun?: boolean; search?: Handler }) => {
+    const run = async (o: { pr?: Record<string, unknown>; behind?: number; files?: { filename: string }[]; release?: string[] | null; ci?: string; dryRun?: boolean; search?: Handler; update?: Handler }) => {
       const s = server({
         "GET /search/issues": o.search ?? ((_b, u) => [200, { items: u.searchParams.get("q")?.includes(`label:${MERGE_LABEL}`) ? [{ number: 9, repository_url: `https://api.github.com/repos/${OWNER}/${R}` }, { number: 3, repository_url: `https://api.github.com/repos/${OWNER}/not-in-plan` }] : [] }]),
         [`GET ${base}/${R}`]: meta,
@@ -487,6 +489,7 @@ ${RENOVATE_REBASE_BOX} If you want to rebase/retry this PR, check this box`,
         [`GET ${base}/${R}/compare/main...sha9`]: () => [200, { behind_by: o.behind ?? 0, files: o.files ?? [{ filename: ".github/workflows/ci.yml" }] }],
         ...(o.release === null ? {} : { [`GET ${base}/${R}/actions/workflows/release.yml/runs`]: () => [200, { workflow_runs: (o.release ?? ["completed"]).map((status) => ({ status })) }] }),
         [`PUT ${base}/${R}/pulls/9/merge`]: () => [200, { merged: true }],
+        ...(o.update ? { [`PUT ${base}/${R}/pulls/9/update-branch`]: o.update } : {}),
       });
       const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater(), dryRun: o.dryRun ?? false, only: [R] });
       const mine = r.results.filter((x) => x.kind === "train-merge");
@@ -525,10 +528,26 @@ ${RENOVATE_REBASE_BOX} If you want to rebase/retry this PR, check this box`,
       expect(patch?.body?.["body"]).toContain("- [x] <!-- rebase-check -->");
       expect(patch?.body?.["body"]).not.toContain(RENOVATE_REBASE_BOX);
       expect(calls.some((c) => c.method === "PUT")).toBe(false);
-      // A body with no rebase box gets no edit, and the detail says who must rebase it.
-      const plain = await run({ behind: 1, pr: { body: "a person's pull request" } });
-      expect(plain.mine[0]?.detail).toContain("its author must rebase it");
-      expect(plain.calls.some((c) => c.method === "PATCH")).toBe(false);
+    });
+
+    it("merges main into a branch with no rebase box that is behind, so CI runs again, and names a conflict", async () => {
+      const update = (status: number): Handler => () => [status, status === 202 ? { message: "Updating pull request branch.", url: "u" } : { message: "merge conflict" }];
+      const plain = await run({ behind: 1, pr: { body: "a person's pull request" }, update: update(202) });
+      expect(plain.mine[0]).toMatchObject({ state: "unchanged", ci: "green" });
+      expect(plain.mine[0]?.detail).toContain("The train merged main into the branch, so CI runs again.");
+      const put = plain.calls.find((c) => c.method === "PUT" && c.path.endsWith("/pulls/9/update-branch"));
+      expect(put?.body).toEqual({ expected_head_sha: "sha9" });
+      expect(plain.calls.some((c) => c.method === "PATCH" || c.path.endsWith("/pulls/9/merge"))).toBe(false);
+      // A conflict that GitHub finds at the update (HTTP 422) gives the one detail line for the author.
+      const refused = await run({ behind: 1, pr: { body: "a person's pull request" }, update: update(422) });
+      expect(refused.mine[0]?.detail).toContain("a conflict with main: its author must merge main into it");
+      // A branch that GitHub marks as dirty gets no update call.
+      const dirty = await run({ behind: 1, pr: { body: "a person's pull request", mergeable: false, mergeable_state: "dirty" }, update: update(202) });
+      expect(dirty.mine[0]?.detail).toContain("a conflict with main");
+      expect(dirty.calls.some((c) => c.path.endsWith("/update-branch"))).toBe(false);
+      // A branch of a fork gets no update call.
+      const fork = await run({ behind: 1, pr: { body: "x", head: { sha: "sha9", ref: "main", repo: { full_name: "someone/fork" } } }, update: update(202) });
+      expect(fork.calls.some((c) => c.path.endsWith("/update-branch"))).toBe(false);
     });
 
     it("labels a failed one as blocked, plans only in a dry run, and skips a fork, another base and a draft", async () => {
@@ -709,7 +728,7 @@ function memory(names: readonly string[]) {
       return date ? [200, { commit: { committer: { date } } }] : [404, { message: "Not Found" }];
     };
   });
-  return { ...server(routes), prs, pushed };
+  return { ...server(routes), prs, pushed, routes };
 }
 
 /** An updater that pushes a branch one time. After it, the branch has the changes, as with the real updater. */
@@ -777,6 +796,50 @@ describe("the pace of the update pushes", () => {
     expect(Object.values(last).includes("waiting")).toBe(false);
   });
 
+  describe("a labeled pull request that is behind", () => {
+    const L = "tool-repo";
+    /** This function adds a green labeled pull request of another author in `tool-repo`, 1 commit behind, with its last push at `date`. */
+    const labeled = (m: ReturnType<typeof memory>, date: string) => {
+      m.routes["GET /search/issues"] = (_b, u) => [200, { items: u.searchParams.get("q")?.includes(`label:${MERGE_LABEL}`) ? [{ number: 9, repository_url: `https://api.github.com/repos/${OWNER}/${L}` }] : [] }];
+      m.routes[`GET ${base}/${L}`] = meta;
+      m.routes[`GET ${base}/${L}/pulls/9`] = () => [200, pull(9, L, { body: "a person's pull request", head: { sha: "sha9", ref: "feature", repo: { full_name: `${OWNER}/${L}` } }, labels: [{ name: MERGE_LABEL }], mergeable: true })];
+      m.routes[`GET ${base}/${L}/commits/sha9/check-runs`] = () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }];
+      m.routes[`GET ${base}/${L}/commits/sha9/status`] = () => [200, { state: "pending", total_count: 0 }];
+      m.routes[`GET ${base}/${L}/commits/sha9`] = () => [200, { commit: { committer: { date } } }];
+      m.routes[`GET ${base}/${L}/compare/main...sha9`] = () => [200, { behind_by: 1, files: [] }];
+      m.routes[`PUT ${base}/${L}/pulls/9/update-branch`] = () => [202, { message: "Updating pull request branch." }];
+    };
+    const updates = (m: ReturnType<typeof memory>) => m.calls.filter((c) => c.method === "PUT" && c.path.endsWith(`/${L}/pulls/9/update-branch`)).length;
+
+    it("gets its update within 2 runs at the limit, in the same longest-wait order as the pushes", async () => {
+      // 5 updates and a limit of 2: each run is at the limit. The labeled branch waited longer than each update, so a push yields its turn.
+      const m = memory(names);
+      labeled(m, "1969-12-31T00:00:00Z");
+      const up = once();
+      const first = await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 2, now: slot(0) });
+      expect(up.pushed).toEqual(["a-repo"]);
+      expect(updates(m)).toBe(1);
+      expect(first.results.find((x) => x.kind === "train-merge")?.detail).toContain("The train merged main into the branch, so CI runs again.");
+      const b = first.results.find((x) => x.repo === "b-repo");
+      expect(b).toMatchObject({ state: "waiting", paced: true });
+      expect(b?.detail).toContain("keeps 1 turn(s) for an older merge of the default branch");
+    });
+
+    it("waits behind pushes that waited longer, and gets its turn when they are done", async () => {
+      const m = memory(names);
+      labeled(m, "1970-01-01T02:30:00Z");
+      const up = once();
+      const first = await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 2, now: slot(0) });
+      expect(up.pushed).toEqual(["a-repo", "b-repo"]);
+      expect(updates(m)).toBe(0);
+      expect(first.results.find((x) => x.kind === "train-merge")?.detail).toContain("The merge of main into the branch waits: This run pushed 2 branches");
+      // In slot 6 the updates with no pull request wait from 03:00, so the labeled branch is older and goes first.
+      await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 2, now: slot(6) });
+      expect(up.pushed).toEqual(["a-repo", "b-repo", "c-repo"]);
+      expect(updates(m)).toBe(1);
+    });
+  });
+
   it("pushes the newest versions when a repository that waited gets its turn", async () => {
     const { gh } = memory(["a-repo", "b-repo"]);
     const up = once();
@@ -842,7 +905,10 @@ describe("the pace of the update pushes", () => {
     expect(behind.x).toMatchObject({ state: "waiting", ci: "green", paced: true, pr: { number: 7 } });
     expect(behind.x?.detail).toContain("2 commit(s) behind main");
     expect(behind.x?.detail).toContain("the most of one run");
-    expect(behind.calls.some((c) => c.method === "PUT")).toBe(false);
+    expect(behind.calls.some((c) => c.method === "PUT" && c.path.endsWith("/merge"))).toBe(false);
+    // The merge of main starts CI as a push does, so it also waits for the limit of pushes.
+    expect(behind.calls.some((c) => c.method === "PUT" && c.path.endsWith("/pulls/7/update-branch"))).toBe(false);
+    expect(behind.x?.detail).toContain("The merge of main into the branch waits");
   });
 
   it("counts only a real push: a clone that pushes nothing leaves the limit free, and a branch that has its changes can still push", async () => {
