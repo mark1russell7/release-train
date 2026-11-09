@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { summary } from "./cli.ts";
 import { retryAfterDelay, type Clock } from "@mark1russell7/service";
-import { collect, HttpError, runtimeRanges } from "./collect.ts";
+import { collect, HttpError, manifestFolder, patchVersion, runtimeRanges } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { docId, writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
@@ -26,7 +26,9 @@ interface FakeRepo {
   links?: string[];
 }
 
-function fakeFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls: string[] = [], built: Record<string, { repository: string; path: string } | null> = {}): FetchFn {
+type PullFiles = Record<string, { filename: string; patch?: string }[] | null>;
+
+function fakeFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls: string[] = [], built: Record<string, { repository: string; path: string } | null> = {}, pullFiles: PullFiles = {}): FetchFn {
   const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Response =>
     new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
   return async (url) => {
@@ -82,6 +84,12 @@ function fakeFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls:
       const r = repos.find((x) => x.name === content[1]);
       const text = r?.files[decodeURIComponent(content[2] as string)];
       return text === undefined ? new Response("", { status: 404 }) : new Response(text);
+    }
+    // The files of a pull request: "repo#number" in pullFiles, null for a failed read
+    const prFiles = /^\/repos\/example-owner\/([^/]+)\/pulls\/(\d+)\/files$/.exec(p);
+    if (prFiles) {
+      const list = pullFiles[`${prFiles[1]}#${prFiles[2]}`];
+      return list === null ? json({ message: "Not Found" }, 404) : json(list ?? []);
     }
     if (/\/pulls$/.test(p)) {
       return json([{ number: 7, title: "chore(deps): update @ex/core to v1.4.0", html_url: "https://example.test/pr/7", head: { sha: "abc", ref: "renovate/ex-core" } }]);
@@ -269,6 +277,31 @@ describe("writeDb", () => {
   const dirs: string[] = [];
   afterEach(() => {
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("reads the versions that the open pull requests set in the package.json files of the workspace", async () => {
+    const f = fakeFetch(REPOS, { "@ex/core": "1.4.0" }, [], {}, {
+      "core-repo#7": [
+        { filename: "packages/core/package.json", patch: '@@ -1,3 +1,3 @@\n   "name": "@ex/core",\n-  "version": "1.4.0",\n+  "version": "1.5.0",' },
+        { filename: "README.md", patch: '+  "version": "7.0.0",' },
+        { filename: "packages/skip/package.json", patch: '+  "version": "9.0.0",' },
+      ],
+      "vendor-repo#7": null,
+    });
+    const data = await collect({ owner: "example-owner", token: null, fetch: f });
+    expect(data.repos.find((r) => r.name === "core-repo")?.pulls).toEqual([{ number: 7, path: "packages/core", version: "1.5.0" }]);
+    const app = data.repos.find((r) => r.name === "vendor-repo");
+    expect(app?.pulls).toBeUndefined();
+    expect(app?.warnings.some((w) => w.startsWith("The open pull requests could not be read: HTTP 404"))).toBe(true);
+  });
+
+  it("reads the version line of a diff and the folder of a package.json", () => {
+    expect(patchVersion('+  "version": "1.2.3",')).toBe("1.2.3");
+    expect(patchVersion('+\t"version": "2.0.0"')).toBe("2.0.0");
+    expect(patchVersion('-  "version": "1.2.3",')).toBeNull();
+    expect(patchVersion('+      "version": "1.0.0"')).toBeNull();
+    expect(patchVersion(undefined)).toBeNull();
+    expect([manifestFolder("package.json"), manifestFolder("packages/a/package.json"), manifestFolder("README.md")]).toEqual(["", "packages/a", null]);
   });
 
   it("reads each version on npm and the runtime ranges of the latest version", async () => {
