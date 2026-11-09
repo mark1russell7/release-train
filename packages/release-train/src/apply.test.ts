@@ -7,6 +7,8 @@ import {
   BUSY_LIMIT,
   CLAUDE_LINE,
   COMPARE_FILES_MAX,
+  MERGE_LABEL,
+  RENOVATE_REBASE_BOX,
   RUN_MS,
   TRAIN_BRANCH,
   TRAIN_LABEL,
@@ -458,6 +460,99 @@ describe("apply", () => {
     const plain = await run([{ filename: "package.json" }, { filename: "pnpm-lock.yaml" }], runs("queued"));
     expect(plain.r.results[0]).toMatchObject({ state: "merged" });
     expect(plain.calls.some((c) => c.path.endsWith("/actions/workflows/release.yml/runs"))).toBe(false);
+  });
+
+  describe("the label train-merge", () => {
+    const R = "stale-repo";
+    const pin = (extra: Record<string, unknown> = {}) =>
+      pull(9, R, {
+        title: "chore(deps): pin actions/checkout",
+        body: `Renovate body
+
+${RENOVATE_REBASE_BOX} If you want to rebase/retry this PR, check this box`,
+        head: { sha: "sha9", ref: "renovate/actions", repo: { full_name: `${OWNER}/${R}` } },
+        labels: [{ name: MERGE_LABEL }],
+        ...extra,
+      });
+    const run = async (o: { pr?: Record<string, unknown>; behind?: number; files?: { filename: string }[]; release?: string[] | null; ci?: string; dryRun?: boolean; search?: Handler }) => {
+      const s = server({
+        "GET /search/issues": o.search ?? ((_b, u) => [200, { items: u.searchParams.get("q")?.includes(`label:${MERGE_LABEL}`) ? [{ number: 9, repository_url: `https://api.github.com/repos/${OWNER}/${R}` }, { number: 3, repository_url: `https://api.github.com/repos/${OWNER}/not-in-plan` }] : [] }]),
+        [`GET ${base}/${R}`]: meta,
+        [`GET ${base}/${R}/pulls/9`]: () => [200, pin(o.pr)],
+        [`PATCH ${base}/${R}/pulls/9`]: (b) => [200, { ...pin(o.pr), ...b }],
+        [`GET ${base}/${R}/commits/sha9/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: o.ci ?? "success" }] }],
+        [`GET ${base}/${R}/commits/sha9/status`]: () => [200, { state: "pending", total_count: 0 }],
+        [`POST ${base}/${R}/issues/9/labels`]: () => [200, []],
+        [`GET ${base}/${R}/compare/main...sha9`]: () => [200, { behind_by: o.behind ?? 0, files: o.files ?? [{ filename: ".github/workflows/ci.yml" }] }],
+        ...(o.release === null ? {} : { [`GET ${base}/${R}/actions/workflows/release.yml/runs`]: () => [200, { workflow_runs: (o.release ?? ["completed"]).map((status) => ({ status })) }] }),
+        [`PUT ${base}/${R}/pulls/9/merge`]: () => [200, { merged: true }],
+      });
+      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater(), dryRun: o.dryRun ?? false, only: [R] });
+      const mine = r.results.filter((x) => x.kind === "train-merge");
+      return { r, mine, calls: s.calls };
+    };
+
+    it("merges a green pull request with the label, keeps its branch, and skips a repository that is not in the plan", async () => {
+      const { r, mine, calls } = await run({});
+      expect(mine).toHaveLength(1);
+      expect(mine[0]).toMatchObject({ repo: R, state: "merged", ci: "green", autoMerge: "train", pr: { number: 9 } });
+      expect(calls.some((c) => c.method === "PUT" && c.path.includes("/pulls/9/merge"))).toBe(true);
+      expect(calls.find((c) => c.method === "PUT")?.body).toMatchObject({ sha: "sha9" });
+      expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+      expect(calls.some((c) => c.path.includes("not-in-plan"))).toBe(false);
+      expect(applySummary(r)).toContain(`Label ${MERGE_LABEL}: 1 pull requests, 1 merged.`);
+      expect(applySummary(r)).toContain(`- ${R} [${MERGE_LABEL}]: merged`);
+    });
+
+    it("holds a workflow change while a release run of main is not done, so GitHub does not refuse the tag", async () => {
+      for (const status of ["queued", "in_progress", "waiting", "pending"]) {
+        const { mine, calls } = await run({ release: [status, "completed"] });
+        expect(mine[0]).toMatchObject({ state: "unchanged", ci: "green" });
+        expect(mine[0]?.detail).toContain("1 release run(s) of main are not done");
+        expect(calls.some((c) => c.method === "PUT")).toBe(false);
+      }
+      // No release workflow: the merge goes.
+      expect((await run({ release: null })).mine[0]).toMatchObject({ state: "merged" });
+    });
+
+    it("ticks the Renovate rebase box of a branch that is behind, and does not merge it", async () => {
+      const { mine, calls } = await run({ behind: 2 });
+      expect(mine[0]).toMatchObject({ state: "unchanged", ci: "green" });
+      expect(mine[0]?.detail).toContain("2 commit(s) behind main");
+      expect(mine[0]?.detail).toContain("ticked the rebase box");
+      const patch = calls.find((c) => c.method === "PATCH" && c.path.endsWith("/pulls/9"));
+      expect(patch?.body?.["body"]).toContain("- [x] <!-- rebase-check -->");
+      expect(patch?.body?.["body"]).not.toContain(RENOVATE_REBASE_BOX);
+      expect(calls.some((c) => c.method === "PUT")).toBe(false);
+      // A body with no rebase box gets no edit, and the detail says who must rebase it.
+      const plain = await run({ behind: 1, pr: { body: "a person's pull request" } });
+      expect(plain.mine[0]?.detail).toContain("its author must rebase it");
+      expect(plain.calls.some((c) => c.method === "PATCH")).toBe(false);
+    });
+
+    it("labels a failed one as blocked, plans only in a dry run, and skips a fork, another base and a draft", async () => {
+      const red = await run({ ci: "failure" });
+      expect(red.mine[0]).toMatchObject({ state: "blocked", ci: "failed" });
+      expect(red.calls.some((c) => c.method === "PUT")).toBe(false);
+      const dry = await run({ dryRun: true });
+      expect(dry.mine[0]).toMatchObject({ state: "planned" });
+      expect(dry.calls.some((c) => c.method !== "GET")).toBe(false);
+      for (const pr of [
+        { head: { sha: "sha9", ref: "renovate/actions", repo: { full_name: "someone/stale-repo" } } },
+        { base: { ref: "next" } },
+        { draft: true },
+      ]) {
+        const x = await run({ pr });
+        expect(x.mine[0]).toMatchObject({ state: "skipped" });
+        expect(x.calls.some((c) => c.method !== "GET")).toBe(false);
+      }
+    });
+
+    it("goes on when the search fails", async () => {
+      const { mine, r } = await run({ search: () => [422, { message: "Validation Failed" }] });
+      expect(mine).toEqual([]);
+      expect(r.results.every((x) => x.state !== "error")).toBe(true);
+    });
   });
 
   it("waits with a green merge while a workflow run of another branch is not done, but not longer than YIELD_MAX_HOURS", async () => {
