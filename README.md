@@ -73,6 +73,7 @@ The site at <https://mark1russell7.github.io/release-train/> is a plan explorer.
 - The body of the pull request tells each change, the reason, and each other lockfile change. It has the label `release-train`.
 - Only the train merges its pull requests. It turns off the native auto-merge of GitHub, and it merges a green pull request in a later run.
 - Before a merge, the train compares the branch with the default branch. A branch that is behind gets a new build from the default branch, with a new install, and CI runs again. A merge of two lockfile changes can give a lockfile with no entry for a version, with no git conflict.
+- A branch can change a file in `.github/workflows/`. Then it does not merge while a run of the release workflow on the default branch is queued, waits or is in progress. The run tags the commit of its version, and GitHub refuses that tag (HTTP 403) when a merge changed a workflow file before it. The train merges in a later run, after the release.
 - When CI fails, the pull request stays open with the label `release-train:blocked`.
 - The train closes its pull request when the plan has no update for the repository.
 - The train does not open a pull request again when a person closed one with the same changes.
@@ -196,7 +197,7 @@ The command reads the packages of the plan, their versions on npm and the tags o
 | `failed` | The run did not make the release. The line tells the reason. |
 | `no-commit` | npm names no commit, or npm names two different commits. The version gets no tag. |
 | `off-branch` | The commit is not on the default branch. The version gets no tag. |
-| `young` | The version is younger than one hour, so its release run can still make the tag. |
+| `young` | The version is younger than one hour, and a release run of its commit is not done, so that run can still make the tag. When each release run of the commit is done (for example, GitHub refused its tag), the version does not wait. |
 | `no-tag-job` | The `release.yml` of the repository has no tag job. Such a repository makes no tags on purpose. |
 | `error` | A read failed, so the version has no decision. The exit code is 1. |
 
