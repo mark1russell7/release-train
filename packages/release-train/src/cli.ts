@@ -16,7 +16,7 @@ import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
 import { awaitRelease } from "./release.ts";
 import { takeReplaced } from "./urgent.ts";
-import { SYNC_RULES, apiFiles, syncFacts, syncRepo, syncSummary } from "./sync.ts";
+import { SYNC_RULES, apiFiles, renovateDays, syncFacts, syncRepo, syncSummary } from "./sync.ts";
 import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
 import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tagsSummary, validDate } from "./tags.ts";
 import { gitUpdater } from "./workspace.ts";
@@ -214,9 +214,9 @@ export function summary(p: Plan, progress: Readonly<Record<string, Progress>> = 
     `Actions: ${c.actions["new-package"]} new-package, ${c.actions.release} release, ${c.actions["adopt-breaking"]} adopt-breaking, ${c.actions["adopt-in-range"]} adopt-in-range`,
     `Nodes: ${Object.entries(c.nodes).map(([k, v]) => `${v} ${k}`).join(", ")}`,
     `Flags: ${c.flags} git/file/link specifiers, ${c.blockingFlags} block a release`,
-    `Versions: ${c.taken} on main and on npm already, ${c.behind} published ranges behind`,
+    `Versions: ${c.taken} not free, ${c.behind} published ranges behind`,
   ];
-  for (const t of p.taken) lines.push(`taken: ${t.name}@${t.version} (${t.repo}). ${t.why}`);
+  for (const t of p.taken) lines.push(`taken: ${t.name}@${t.version} (${[t.repo, ...t.pulls.map((n) => `#${n}`)].join(" ")}). ${t.why}`);
   for (const b of p.behind) lines.push(`behind: ${b.name} has ${b.dep}@${b.range} on npm, but ${b.dep} goes to ${b.version}. ${b.name} gets a cascade release in ${b.repo}.`);
   if (p.cycles.length > 0) lines.push(`Cycles: ${p.cycles.map((cy) => `${cy.packages.join(" <-> ")}${cy.runtime ? " (runtime)" : " (dev)"}`).join("; ")}`);
   if (p.actionCycles.length > 0) lines.push(`Action cycles: ${p.actionCycles.map((cy) => cy.join(" <-> ")).join("; ")}`);
@@ -335,11 +335,14 @@ async function planSync(p: Plan, tok: string | null, workflows: WorkflowsMode, l
     return null;
   }
   const pending = pendingVersions(p);
+  const read = await pool(p.repos, 6, async (r) => ({ repo: r.name, files: await apiFiles(gh, p.owner, r.name) }));
+  const filesOf = new Map(read.map((x) => [x.repo, x.files]));
+  const runFacts = { ...facts, renovateDay: await renovateDays(read, facts) };
   const items = await pool(p.repos, 6, async (r): Promise<SyncPlanItem | null> => {
-    const files = await apiFiles(gh, p.owner, r.name);
+    const files = filesOf.get(r.name) ?? null;
     if (!files) return null;
     const releaseInFlight = pending.has(r.name) || (r.pendingChangesets ?? 0) > 0;
-    const result = await syncRepo(files, { ...facts, repo: r.name, releaseInFlight }, SYNC_RULES, workflows !== "no");
+    const result = await syncRepo(files, { ...runFacts, repo: r.name, releaseInFlight }, SYNC_RULES, workflows !== "no");
     return { repo: r.name, private: r.private, result };
   });
   return items.filter((i): i is SyncPlanItem => i !== null);

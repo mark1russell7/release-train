@@ -8,8 +8,8 @@ import { adoptWhy, moveSets } from "./plan.ts";
 import type { Action, ActionItem, Plan } from "./plan.ts";
 import type { DepType, LockKind } from "./types.ts";
 import { ownScopes } from "./settings.ts";
-import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, apiFiles, syncBody, syncNeeds, syncRepo } from "./sync.ts";
-import type { RunFacts, SyncFacts, SyncPush, SyncResult, SyncRule, SyncUpdater, WorkflowsMode } from "./sync.ts";
+import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, apiFiles, renovateDays, syncBody, syncNeeds, syncRepo } from "./sync.ts";
+import type { RepoFiles, RunFacts, SyncFacts, SyncPush, SyncResult, SyncRule, SyncUpdater, WorkflowsMode } from "./sync.ts";
 
 /** The branch of each pull request of the release train. */
 export const TRAIN_BRANCH = "release-train/update";
@@ -1155,8 +1155,26 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       log("Template sync: the template is not readable, so the sync waits.");
       return;
     }
-    const facts0 = s.facts;
     const rules = s.rules ?? SYNC_RULES;
+    // The files of each repository, read one time. The Renovate days need the files of all repositories of the plan.
+    const filesCache = new Map<string, Promise<RepoFiles | null>>();
+    const filesOf = (repo: string): Promise<RepoFiles | null> => {
+      let p = filesCache.get(repo);
+      if (!p) {
+        p = apiFiles(gh, owner, repo);
+        filesCache.set(repo, p);
+      }
+      return p;
+    };
+    const facts0: RunFacts = rules.some((r) => r.id === "renovate-day")
+      ? {
+          ...s.facts,
+          renovateDay: await renovateDays(
+            await pool(o.plan.repos, o.concurrency ?? 6, async (r) => ({ repo: r.name, files: await filesOf(r.name).catch(() => null) })),
+            s.facts,
+          ),
+        }
+      : s.facts;
     const syncOpen = await openOf(SYNC_BRANCH);
     const pending = pendingVersions(o.plan, o.only ?? null);
     const changesets = new Set(o.plan.repos.filter((r) => (r.pendingChangesets ?? 0) > 0).map((r) => r.name));
@@ -1176,7 +1194,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       });
       const fail = (detail: string) => result({ repo, private: isPrivate, actionId: `sync:${repo}`, kind: SYNC_KIND, wave: null, items: 0, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail });
       try {
-        const files = await apiFiles(gh, owner, repo);
+        const files = await filesOf(repo);
         if (!files) continue;
         let planned = await syncRepo(files, facts, rules, workflows);
         const applied = (r: SyncResult): string[] => r.outcomes.filter((x) => x.state === "applied").map((x) => x.rule);

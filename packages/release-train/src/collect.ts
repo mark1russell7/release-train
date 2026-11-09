@@ -2,7 +2,7 @@ import { retry, retryAfterDelay, type Clock } from "@mark1russell7/service";
 import type { Backoff } from "@mark1russell7/service/backoff";
 import { attestationsUrl, workflowProvenance, type Attestations } from "./attest.ts";
 import { DEP_TYPES } from "./types.ts";
-import type { DepType, LockKind, Manifest, ManifestFile, NpmInfo, Provenance, RepoSnapshot } from "./types.ts";
+import type { DepType, LockKind, Manifest, ManifestFile, NpmInfo, Provenance, PullVersion, RepoSnapshot } from "./types.ts";
 import { manifestWorkspaces, matchWorkspaces, parseNpmLock, parsePnpmLock, parsePnpmWorkspace } from "./parse.ts";
 
 /** The `fetch` function that the collector uses. Tests give a mock. */
@@ -67,6 +67,21 @@ export function runtimeRanges(doc: Partial<Record<DepType, unknown>> | undefined
     if (ranges.length > 0) out[t] = Object.fromEntries(ranges);
   }
   return out;
+}
+
+/**
+ * This function gives the version that the diff of a `package.json` sets, or null.
+ * It reads the added line of the field `version` at the first level of indentation.
+ */
+export function patchVersion(patch: string | undefined): string | null {
+  const m = /^\+(?:\t| {2}| {4})"version"\s*:\s*"([^"]+)"/m.exec(patch ?? "");
+  return m?.[1] ?? null;
+}
+
+/** This function gives the folder of a `package.json` path, or null for another file. The root folder is the empty string. */
+export function manifestFolder(file: string): string | null {
+  if (file === "package.json") return "";
+  return file.endsWith("/package.json") ? file.slice(0, -"/package.json".length) : null;
 }
 
 /** The data that `collect` gives to the graph builder. */
@@ -332,6 +347,27 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
           : parseNpmLock(text, snap.manifests.map((m) => m.path), [...used]);
     } catch {
       snap.warnings.push(`${lockPath} could not be read.`);
+    }
+  });
+
+  // Phase 2b: the versions that the open pull requests set, so that the plan finds two pull requests with one version.
+  await pool(snaps, limit, async ({ snap }) => {
+    const folders = new Set(snap.manifests.filter((m) => typeof m.manifest.version === "string").map((m) => m.path));
+    if (folders.size === 0) return;
+    try {
+      const open = await paginate<{ number: number }>(`/repos/${opts.owner}/${snap.name}/pulls?state=open&per_page=100`);
+      const found: PullVersion[] = [];
+      for (const pr of open) {
+        const files = await paginate<{ filename: string; patch?: string }>(`/repos/${opts.owner}/${snap.name}/pulls/${pr.number}/files?per_page=100`);
+        for (const file of files) {
+          const path = manifestFolder(file.filename);
+          const version = path !== null && folders.has(path) ? patchVersion(file.patch) : null;
+          if (path !== null && version) found.push({ number: pr.number, path, version });
+        }
+      }
+      snap.pulls = found;
+    } catch (e) {
+      snap.warnings.push(`The open pull requests could not be read: ${e instanceof Error ? e.message : String(e)}.`);
     }
   });
 
