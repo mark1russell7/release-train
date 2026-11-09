@@ -29,6 +29,13 @@
       "reason": "Main holds breaking changes, so no patch release goes out. Vex 0.18.0 has the date 11-07, with a last line at 11-08 18:00Z. A red proof Weekly on main ends this date, and a new date needs a new reason.",
       "ruling": "https://github.com/mark1russell7/Vex/blob/1d14a5dd297f111d1e7cb7214cedf21554c8fa99/spec/regressions.md#the-version-on-npm",
       "until": "2026-11-08"
+    },
+    {
+      "package": "@mark1russell7/collections",
+      "repo": "client",
+      "reason": "Version 0.7.0 of collections removes Option, Some, None, Ok, Err and Result, and 0.10.0 removes 83 more names. @procedures/collections exports these names from its root. Thus the update is a breaking change of the client group, and it ships as its own MINOR after a release that marks the names deprecated.",
+      "ruling": "https://github.com/mark1russell7/client/blob/556d0a827684e4d7cee70fe35b908e643b088d8d/packages/documentation/SERVER-LAYERS.md#releases-of-the-server-stack",
+      "until": "2026-11-22"
     }
   ]
 }
