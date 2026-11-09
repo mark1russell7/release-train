@@ -113,6 +113,7 @@ export function buildGraph(input: GraphInput): Graph {
     importers,
     edges,
     warnings,
+    ...(input.repos.some((r) => r.pulls) ? { pulls: input.repos.flatMap((r) => (r.pulls ?? []).map((pr) => ({ ...pr, repo: r.name }))) } : {}),
   };
 }
 
@@ -129,6 +130,7 @@ export function publicView(g: Graph): Graph {
   const clean = (ws: readonly string[]): string[] => ws.filter((w) => !secret.some((n) => w.includes(n)));
   return {
     ...g,
+    ...(g.pulls ? { pulls: g.pulls.filter((pr) => !privRepos.has(pr.repo)) } : {}),
     repos: g.repos.filter((r) => !r.private).map((r) => ({ ...r, warnings: clean(r.warnings) })),
     packages: g.packages.filter((p) => !privPkgs.has(p.name)),
     importers,

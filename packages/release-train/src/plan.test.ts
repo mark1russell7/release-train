@@ -342,7 +342,7 @@ describe("the version gate", () => {
     expect(p.actions.map((a) => [a.id, a.blocked])).toEqual([["release:core-repo", true]]);
     expect(p.actions[0]?.blockers[0]).toContain("npm has @ex/core@1.5.0 already");
     expect(p.counts.taken).toBe(1);
-    expect(p.taken).toEqual([expect.objectContaining({ name: "@ex/core", repo: "core-repo", version: "1.5.0" })]);
+    expect(p.taken).toEqual([expect.objectContaining({ name: "@ex/core", repo: "core-repo", version: "1.5.0", pulls: [] })]);
     expect(p.nodes.find((n) => n.id === "@ex/core")?.status).toBe("blocked");
   });
 
@@ -385,5 +385,39 @@ describe("the version gate", () => {
     const p = mono({ "@ex/conv": "^0.40.0" }, ["0.5.2", "0.5.3"]);
     expect(p.actions[0]?.packages.find((x) => x.name === "@ex/report")?.to).toBe("0.5.4");
     expect(p.counts.taken).toBe(0);
+  });
+});
+
+describe("the versions of the open pull requests", () => {
+  const withPulls = (snap: RepoSnapshot, pulls: { number: number; path?: string; version: string }[]): RepoSnapshot => ({
+    ...snap,
+    pulls: pulls.map((pr) => ({ path: "", ...pr })),
+  });
+
+  it("finds two pull requests that set one version, also of a private package", () => {
+    // The live case: two pull requests of a private tool both set the next PATCH
+    const p = run([withPulls(repo("tool-repo", { "": { name: "tool", private: true, version: "0.2.14" } }), [{ number: 139, version: "0.2.15" }, { number: 136, version: "0.2.15" }])], {});
+    expect(p.counts.taken).toBe(1);
+    expect(p.taken).toEqual([expect.objectContaining({ name: "tool", repo: "tool-repo", version: "0.2.15", pulls: [136, 139] })]);
+    expect(p.taken[0]?.why).toContain("The pull requests #136, #139 all set 0.2.15.");
+  });
+
+  it("finds a version that main or npm has already, and passes a free version", () => {
+    const core = repo("core-repo", { "": { name: "@ex/core", version: "1.4.0" } });
+    const registry = { "@ex/core": { ...npm("1.4.0"), versions: ["1.4.0", "1.6.0"] } };
+    const p = run([withPulls(core, [{ number: 1, version: "1.4.0" }, { number: 2, version: "1.6.0" }, { number: 3, version: "1.5.0" }])], registry);
+    expect(p.taken.map((t) => [t.version, t.pulls])).toEqual([["1.4.0", [1]], ["1.6.0", [2]]]);
+    expect(p.taken[0]?.why).toContain("main has 1.4.0, so 1.4.0 is not new.");
+    expect(p.taken[1]?.why).toContain("npm has @ex/core@1.6.0 already.");
+    // No open pull request or a snapshot from before the field: nothing is taken
+    expect(run([withPulls(core, [{ number: 3, version: "1.5.0" }])], registry).counts.taken).toBe(0);
+    expect(run([core], registry).counts.taken).toBe(0);
+  });
+
+  it("keeps the pull requests of a private repository out of the public view", () => {
+    const snap = withPulls(repo("tool-repo", { "": { name: "tool", version: "0.1.0" } }, { private: true }), [{ number: 1, version: "0.1.1" }]);
+    const g = buildGraph({ owner: "example-owner", repos: [snap], npm: {}, now: new Date("2026-01-01T00:00:00Z") });
+    expect(g.pulls).toEqual([{ number: 1, path: "", version: "0.1.1", repo: "tool-repo" }]);
+    expect(publicView(g).pulls).toEqual([]);
   });
 });
