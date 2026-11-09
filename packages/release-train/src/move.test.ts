@@ -76,6 +76,7 @@ describe("the repository of a package.json", () => {
       "git+ssh://git@github.com/ex-org/new-home.git",
       "git@github.com:ex-org/new-home.git",
       { type: "git", url: "https://github.com/ex-org/new-home/" },
+      `https://github.com/ex-org/new-home${"/".repeat(100_000)}`,
     ]) {
       expect(repositoryOf(v)).toBe(NEW);
     }

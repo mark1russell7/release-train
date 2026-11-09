@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { attestationsUrl, workflowProvenance, type Attestations } from "./attest.ts";
 import type { FetchFn } from "./collect.ts";
+import { withoutEndSlashes } from "./parse.ts";
 import { tarFiles } from "./release.ts";
 import type { Provenance } from "./types.ts";
 
@@ -72,7 +73,7 @@ export function integrityMatches(bytes: Uint8Array, sri: string): boolean {
 export function repositoryOf(field: unknown): string | null {
   const raw = typeof field === "string" ? field : typeof field === "object" && field !== null ? (field as { url?: unknown }).url : undefined;
   if (typeof raw !== "string") return null;
-  const text = raw.trim().replace(/\.git$/, "").replace(/\/+$/, "");
+  const text = withoutEndSlashes(raw.trim().replace(/\.git$/, ""));
   const m =
     /^(?:github:)?([\w.-]+)\/([\w.-]+)$/.exec(text) ??
     /^(?:git\+)?(?:https?|git|ssh):\/\/(?:[^@/]+@)?github\.com[:/]([\w.-]+)\/([\w.-]+)$/.exec(text) ??
@@ -226,7 +227,7 @@ export function isTarballPath(to: string): boolean {
  */
 export async function moveCheck(opts: MoveCheckOptions): Promise<MoveReport> {
   const f = opts.fetch ?? fetch;
-  const registry = (opts.registry ?? "https://registry.npmjs.org").replace(/\/+$/, "");
+  const registry = withoutEndSlashes(opts.registry ?? "https://registry.npmjs.org");
   const headers = { "user-agent": "release-train" };
   const encoded = opts.name.replaceAll("/", "%2f");
   const download = async (version: string): Promise<Uint8Array> => {

@@ -37,15 +37,19 @@ export function parseSpec(name: string, spec: string): ParsedSpec {
   return { target: name, kind: "registry", range: s };
 }
 
-/**
- * This function removes a `./` at the start of a workspace glob and each `/` at its end. A loop removes the end
- * slashes: the expression /\/+$/ backtracks in polynomial time on a long run of slashes.
- */
+/** This function removes a `./` at the start of a workspace glob and each `/` at its end. */
 function cleanGlob(glob: string): string {
-  const start = glob.startsWith("./") ? 2 : 0;
-  let end = glob.length;
-  while (end > start && glob.charAt(end - 1) === "/") end -= 1;
-  return glob.slice(start, end);
+  return withoutEndSlashes(glob.startsWith("./") ? glob.slice(2) : glob);
+}
+
+/**
+ * This function removes each `/` at the end of a text. A loop removes them: the expression /\/+$/ backtracks in
+ * polynomial time on a long run of slashes (CodeQL js/polynomial-redos).
+ */
+export function withoutEndSlashes(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charAt(end - 1) === "/") end -= 1;
+  return text.slice(0, end);
 }
 
 /**
