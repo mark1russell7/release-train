@@ -1,7 +1,7 @@
 // All repository and package names in these tests are made up.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BUSY_LIMIT, RUN_MS, TRAIN_LABEL, apply, applySummary, bodyFingerprint, busyRunners, publicReport, syncPrBody } from "./apply.ts";
 import type { Updater } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
@@ -26,7 +26,7 @@ import {
 } from "./sync.ts";
 import type { RepoFiles, RunFacts, SyncFacts, SyncJob, SyncPush, SyncUpdater } from "./sync.ts";
 import type { RepoSnapshot } from "./types.ts";
-import { gitUpdater } from "./workspace.ts";
+import { CREDENTIAL_NAME, gitUpdater, needsGitAuth } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 const OWNER = "example-owner";
@@ -707,6 +707,35 @@ describe("gitUpdater sync", () => {
     expect(seen.pkg).toContain('"package": "template package"');
     expect(cmds.filter((c) => c.startsWith("pnpm install"))).toEqual(["pnpm install --lockfile-only", "pnpm install --lockfile-only --frozen-lockfile"]);
     expect(cmds).toContain(`git push --quiet --force origin HEAD:refs/heads/${SYNC_BRANCH}`);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("gives the token only to git clone, fetch and push of a sync, and no secret to any command", async () => {
+    vi.stubEnv("GH_TOKEN", "ghs_parent");
+    vi.stubEnv("RELEASE_TRAIN_HASH_KEY", "label-key");
+    vi.stubEnv("GIT_CONFIG_COUNT", "1");
+    const calls: { line: string; cmd: string; args: readonly string[]; env: NodeJS.ProcessEnv }[] = [];
+    const run: RunFn = async (cmd, args, opts) => {
+      calls.push({ line: `${cmd} ${args.join(" ")}`, cmd, args, env: opts.env ?? {} });
+      if (cmd === "git" && args[0] === "clone") clone(opts.cwd);
+      if (cmd === "git" && args[0] === "fetch") return { code: 128, stdout: "", stderr: "no branch" };
+      if (cmd === "git" && args[0] === "ls-files") return { code: 0, stdout: tracked, stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: " M package.json\n", stderr: "" };
+      return { code: 0, stdout: cmd === "pnpm" ? "12.0.0\n" : "sha1\n", stderr: "" };
+    };
+    const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run });
+    const r = await up.sync({ repo: "demo-repo", facts: facts(), workflows: false }, { defaultBranch: "main", rebuild: false });
+    expect(r.status).toBe("pushed");
+    expect(calls.map((c) => c.line)).toContain("pnpm install --lockfile-only");
+    for (const c of calls) {
+      expect(Object.keys(c.env).some((key) => key.startsWith("GIT_CONFIG_")), c.line).toBe(needsGitAuth(c.cmd, c.args));
+      expect(Object.keys(c.env).filter((key) => CREDENTIAL_NAME.test(key)), c.line).toEqual([]);
+      expect(Object.values(c.env).join("\n"), c.line).not.toContain("ghs_parent");
+    }
+    expect(calls.filter((c) => needsGitAuth(c.cmd, c.args)).map((c) => c.args[0]).sort()).toEqual(["clone", "fetch", "push"]);
   });
 
   it("gives workflows-denied when GitHub refuses the push of a workflow change", async () => {

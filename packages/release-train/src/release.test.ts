@@ -2,7 +2,7 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { apply, dispatchOnly, prBody, selectUpdates } from "./apply.ts";
 import type { RepoUpdate, Updater } from "./apply.ts";
 import { gitHub } from "./github.ts";
@@ -11,7 +11,7 @@ import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import { addChangelogSection, awaitRelease, changesetText, decideBump, decisionBreaks, namesModule, setManifestVersion, typedFiles } from "./release.ts";
 import type { Manifest, NpmInfo, RepoSnapshot } from "./types.ts";
-import { changesetName, gitUpdater, UPDATE_SCRIPT } from "./workspace.ts";
+import { changesetName, CREDENTIAL_NAME, gitUpdater, needsGitAuth, UPDATE_SCRIPT } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 /** This function makes a gzip tar file with the given files. */
@@ -109,7 +109,24 @@ describe("cascade selection", () => {
   });
 });
 
+describe("needsGitAuth", () => {
+  it("gives the token to git clone, fetch and push only", () => {
+    for (const sub of ["clone", "fetch", "push"]) expect(needsGitAuth("git", [sub, "x"]), sub).toBe(true);
+    for (const [cmd, args] of [["git", ["commit", "-m", "x"]], ["git", ["status"]], ["git", []], ["pnpm", ["install"]], ["npm", ["run", "version"]], ["pnpm", ["dlx", "clone"]], ["node", ["push"]]] as const)
+      expect(needsGitAuth(cmd, args), `${cmd} ${args.join(" ")}`).toBe(false);
+  });
+
+  it("names tokens, secrets, keys and the settings of the train", () => {
+    for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "ACTIONS_RUNTIME_TOKEN", "NPM_SECRET", "RELEASE_TRAIN_APP_KEY", "RELEASE_TRAIN_HASH_KEY", "SSH_KEY"]) expect(CREDENTIAL_NAME.test(name), name).toBe(true);
+    for (const name of ["PATH", "HOME", "CI", "GITHUB_REPOSITORY", "KEYBOARD", "NODE_OPTIONS"]) expect(CREDENTIAL_NAME.test(name), name).toBe(false);
+  });
+});
+
 describe("gitUpdater with a cascade release", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   const types = tgz({ "package/dist/index.d.ts": 'import type { C } from "@ex/core";' });
   const fetchFn: FetchFn = async (url) => {
     if (url.endsWith(".tgz")) return new Response(types, { status: 200 });
@@ -308,6 +325,37 @@ describe("gitUpdater with a cascade release", () => {
     const failed = await go(2);
     expect(failed.r).toMatchObject({ status: "failed", error: expect.stringContaining(`The script ${UPDATE_SCRIPT} of package.json failed (exit 2): the engine is missing`) });
     expect(failed.cmds.some((c) => c.includes("commit"))).toBe(false);
+  });
+
+  it("gives the token only to git clone, fetch and push, and no secret to any command", async () => {
+    vi.stubEnv("GH_TOKEN", "ghs_parent");
+    vi.stubEnv("RELEASE_TRAIN_HASH_KEY", "label-key");
+    vi.stubEnv("NPM_SECRET", "s");
+    const u = { ...(selectUpdates(cascadePlan()).ready.find((x) => x.repo === "pub-repo") as RepoUpdate), lockKind: "pnpm" as const };
+    const calls: { line: string; cmd: string; args: readonly string[]; env: NodeJS.ProcessEnv }[] = [];
+    const run: RunFn = async (cmd, args, opts) => {
+      calls.push({ line: `${cmd} ${args.join(" ")}`, cmd, args, env: opts.env ?? {} });
+      if (cmd === "git" && args[0] === "clone")
+        writeFileSync(join(opts.cwd, "package.json"), `{\n  "name": "@ex/pub",\n  "version": "0.2.0",\n  "scripts": { "version": "node scripts/sync.ts", "${UPDATE_SCRIPT}": "node scripts/data.ts", "typecheck": "tsc" },\n  "dependencies": { "@ex/core": "^1.0.0" }\n}\n`);
+      if (cmd === "pnpm" && args[0] === "install")
+        writeFileSync(join(opts.cwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      '@ex/core':\n        specifier: ^2.0.0\n        version: 2.0.0\n");
+      if (cmd === "git" && args[0] === "fetch") return { code: 128, stdout: "", stderr: "no branch" };
+      const out = cmd === "pnpm" && args[0] === "--version" ? "10.0.0\n" : cmd === "git" && args[0] === "status" ? " M package.json\n" : "";
+      return { code: 0, stdout: out, stderr: "" };
+    };
+    const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: fetchFn });
+    const r = await up.update(u, { defaultBranch: "main", rebuild: false });
+    expect(r.status).toBe("pushed");
+    const lines = calls.map((c) => c.line);
+    for (const want of ["pnpm install --lockfile-only", "pnpm run version", `pnpm run ${UPDATE_SCRIPT}`]) expect(lines).toContain(want);
+    for (const c of calls) {
+      const git = Object.keys(c.env).filter((key) => key.startsWith("GIT_CONFIG_"));
+      expect(git.length > 0, c.line).toBe(needsGitAuth(c.cmd, c.args));
+      expect(Object.keys(c.env).filter((key) => CREDENTIAL_NAME.test(key)), c.line).toEqual([]);
+      expect(Object.values(c.env).join("\n"), c.line).not.toContain("ghs_parent");
+    }
+    expect(calls.filter((c) => needsGitAuth(c.cmd, c.args)).map((c) => c.args[0]).sort()).toEqual(["clone", "fetch", "push"]);
+    expect(calls.find((c) => c.args[0] === "clone")?.env["GIT_CONFIG_VALUE_0"]).toBe(`AUTHORIZATION: basic ${Buffer.from("x-access-token:t").toString("base64")}`);
   });
 
   it("writes a changeset in a repository with changesets and keeps the version", async () => {

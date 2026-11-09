@@ -2,7 +2,7 @@ import { retry, retryAfterDelay, type Clock } from "@mark1russell7/service";
 import type { Backoff } from "@mark1russell7/service/backoff";
 import { attestationsUrl, workflowProvenance, type Attestations } from "./attest.ts";
 import { DEP_TYPES } from "./types.ts";
-import type { LockKind, Manifest, ManifestFile, NpmInfo, Provenance, RepoSnapshot } from "./types.ts";
+import type { DepType, LockKind, Manifest, ManifestFile, NpmInfo, Provenance, RepoSnapshot } from "./types.ts";
 import { manifestWorkspaces, matchWorkspaces, parseNpmLock, parsePnpmLock, parsePnpmWorkspace } from "./parse.ts";
 
 /** The `fetch` function that the collector uses. Tests give a mock. */
@@ -55,6 +55,18 @@ class BusyAnswer extends Error {
     super(`HTTP ${response.status} for ${url}`);
     this.response = response;
   }
+}
+
+/** This function gives the runtime ranges of one version document of npm. It keeps only the ranges that are strings. */
+export function runtimeRanges(doc: Partial<Record<DepType, unknown>> | undefined): Partial<Record<DepType, Record<string, string>>> {
+  const out: Partial<Record<DepType, Record<string, string>>> = {};
+  for (const t of DEP_TYPES) {
+    const section = doc?.[t];
+    if (t === "devDependencies" || !section || typeof section !== "object") continue;
+    const ranges = Object.entries(section).filter((e): e is [string, string] => typeof e[1] === "string");
+    if (ranges.length > 0) out[t] = Object.fromEntries(ranges);
+  }
+  return out;
 }
 
 /** The data that `collect` gives to the graph builder. */
@@ -352,10 +364,11 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
       warnings.push(`npm gave HTTP ${res.status} for ${n}.`);
       return [n, { exists: true, latest: null }];
     }
-    const doc = (await res.json()) as { "dist-tags"?: Record<string, string> };
+    const doc = (await res.json()) as { "dist-tags"?: Record<string, string>; versions?: Record<string, Partial<Record<DepType, unknown>>> };
     const latest = doc["dist-tags"]?.["latest"] ?? null;
     const foreign = latest ? await isForeign(n, latest) : false;
-    return [n, { exists: true, latest, foreign, ...(latest && !foreign ? { provenance: await provenanceOf(n, latest) } : {}) }];
+    const known = doc.versions && typeof doc.versions === "object" ? { versions: Object.keys(doc.versions).sort(), latestDeps: runtimeRanges(latest ? doc.versions[latest] : undefined) } : {};
+    return [n, { exists: true, latest, foreign, ...known, ...(latest && !foreign ? { provenance: await provenanceOf(n, latest) } : {}) }];
   });
   log(`packages: ${names.length}`);
   return { repos: snaps.map((s) => s.snap), npm: Object.fromEntries(infos), warnings };

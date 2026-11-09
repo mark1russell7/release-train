@@ -103,6 +103,25 @@ export interface Cycle {
   runtime: boolean;
 }
 
+/** A version on main that npm has already. Its release fails at the publish, so the plan blocks it. */
+export interface TakenVersion {
+  name: string;
+  repo: string;
+  version: string;
+  why: string;
+}
+
+/** A published package whose range on npm does not cover the next version of a package of its own repository. */
+export interface BehindRange {
+  name: string;
+  repo: string;
+  dep: string;
+  /** The range of `dep` in the latest version of `name` on npm. */
+  range: string;
+  /** The next version of `dep`. */
+  version: string;
+}
+
 /** The plan: the actions in order and the state of each node and edge. */
 export interface Plan {
   owner: string;
@@ -115,6 +134,10 @@ export interface Plan {
     edges: number;
     flags: number;
     blockingFlags: number;
+    /** The count of the versions on main that npm has already. The gate keeps it at 0. */
+    taken: number;
+    /** The count of the published workspace ranges that do not cover the next version. Each gets a cascade release. */
+    behind: number;
   };
   actions: Action[];
   nodes: NodeState[];
@@ -122,6 +145,10 @@ export interface Plan {
   cycles: Cycle[];
   actionCycles: string[][];
   flags: EdgeState[];
+  /** The versions on main that npm has already, one for each package. */
+  taken: TakenVersion[];
+  /** The published workspace ranges that do not cover the next version. The plan gives each dependent a cascade release. */
+  behind: BehindRange[];
   repos: RepoInfo[];
   reposWithoutPnpmLock: string[];
   warnings: string[];
@@ -266,6 +293,7 @@ export function plan(g: Graph): Plan {
   const target = new Map<string, string | null>();
   const publishBy = new Map<string, string>();
   const pendingBump = new Set<string>();
+  const taken = new Map<string, TakenVersion>();
   for (const p of g.packages) {
     const main = valid(p.version);
     const latest = valid(p.npm.latest);
@@ -275,6 +303,10 @@ export function plan(g: Graph): Plan {
       publishBy.set(p.name, `new:${p.name}`);
     } else if (main && latest && semver.gt(main, latest)) {
       pendingBump.add(p.name);
+      if (p.npm.versions?.includes(main)) {
+        const why = `npm has ${p.name}@${main} already, under a tag that is not latest. The release fails at the publish. Set the next free version on main.`;
+        taken.set(p.name, { name: p.name, repo: p.repo, version: main, why });
+      }
       publishBy.set(p.name, `release:${p.repo}`);
       target.set(p.name, isStable(main) ? main : latest);
     } else {
@@ -287,6 +319,7 @@ export function plan(g: Graph): Plan {
 
   // 2. The cascade: a breaking adoption in a runtime section of a published dependent makes it release.
   const cascade = new Map<string, Bump>();
+  const behind = new Map<string, BehindRange>();
   const outside = (t: string | null, range: string | null): boolean =>
     Boolean(t && range && semver.validRange(range) && !semver.satisfies(t, range) && semver.gtr(t, range));
   for (let round = 0; round <= g.packages.length + 1; round++) {
@@ -296,13 +329,21 @@ export function plan(g: Graph): Plan {
       if (pendingBump.has(name) || !p.npm.exists) continue;
       const from = valid(p.npm.latest) ?? valid(p.version);
       if (!from) continue;
-      target.set(name, bumpVersion(from, b));
+      // The train sets this number, so it takes the first free one. npm can have a newer version under another tag.
+      let to = bumpVersion(from, b);
+      while (p.npm.versions?.includes(to)) to = bumpVersion(to, "patch");
+      target.set(name, to);
       publishBy.set(name, `release:${p.repo}`);
     }
     for (const e of g.edges) {
-      if (e.kind !== "registry" || !isRuntime(e.type)) continue;
+      if ((e.kind !== "registry" && e.kind !== "workspace") || !isRuntime(e.type)) continue;
       const dep = pkgOfImporter(importers.get(e.from));
-      if (!dep || !outside(target.get(e.to) ?? null, e.range)) continue;
+      // A workspace range has its real range only on npm: pnpm wrote it at the last publish of the dependent.
+      const range = e.kind === "workspace" ? (dep?.npm.latestDeps?.[e.type]?.[e.to] ?? null) : e.range;
+      if (!dep || !outside(target.get(e.to) ?? null, range)) continue;
+      if (e.kind === "workspace") {
+        behind.set(`${dep.name} ${e.to}`, { name: dep.name, repo: dep.repo, dep: e.to, range: range as string, version: target.get(e.to) as string });
+      }
       const need: Bump = e.type === "peerDependencies" ? "major" : "patch";
       const have = cascade.get(dep.name);
       if (have === undefined || RANK[need] > RANK[have]) {
@@ -414,6 +455,11 @@ export function plan(g: Graph): Plan {
       ? `main has ${p.version}, npm has ${p.npm.latest}. The bump is not released.`
       : `A dependency of ${p.name} changes its range, so users need a new version (at least a ${bump === "major" ? "breaking" : "patch"} release).`;
     a.packages.push({ name: p.name, path: p.path, from: p.npm.latest, to, bump: pending ? null : (bump ?? null), why });
+    const t = taken.get(p.name);
+    if (t) {
+      a.blocked = true;
+      a.blockers.push(`${p.name}: ${t.why}`);
+    }
   }
   for (const a of actions.values()) {
     if (a.kind !== "release") continue;
@@ -534,6 +580,8 @@ export function plan(g: Graph): Plan {
   const nodeStatus = (out: EdgeState[], p: PackageNode | null): [NodeStatus, string] => {
     const blocked = out.filter((e) => e.status === "blocked" && (p ? isRuntime(e.type) : true));
     if (blocked.length > 0) return ["blocked", blocked.map((e) => e.why).join(" ")];
+    const t = p ? taken.get(p.name) : undefined;
+    if (t) return ["blocked", t.why];
     if (p && !p.npm.exists) return ["new-package", `${p.name} is not on npm yet. Mark must make it one time.`];
     if (p && (pendingBump.has(p.name) || cascade.has(p.name))) {
       return ["release", pendingBump.has(p.name) ? `main has ${p.version}, npm has ${p.npm.latest}.` : `It needs a new release after a dependency range change.`];
@@ -611,6 +659,8 @@ export function plan(g: Graph): Plan {
       edges: edges.length,
       flags: flags.length,
       blockingFlags: flags.filter((f) => f.blocking).length,
+      taken: taken.size,
+      behind: behind.size,
     },
     actions: ordered,
     nodes,
@@ -618,6 +668,8 @@ export function plan(g: Graph): Plan {
     cycles,
     actionCycles,
     flags,
+    taken: [...taken.values()].sort((x, y) => x.name.localeCompare(y.name)),
+    behind: [...behind.values()].sort((x, y) => x.name.localeCompare(y.name) || x.dep.localeCompare(y.dep)),
     repos: g.repos,
     reposWithoutPnpmLock: g.repos.filter((r) => r.lockKind !== "pnpm" && r.importers > 0).map((r) => r.name),
     warnings,

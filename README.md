@@ -9,7 +9,7 @@ Stage 1 only reads. Stage 2 (`apply`) opens a pull request for each update of th
 - The repositories of the account. It skips archived repositories and forks.
 - The root `package.json` of each repository, and each workspace package of `pnpm-workspace.yaml`.
 - `pnpm-lock.yaml` or `package-lock.json`, for the resolved versions.
-- The `latest` version of each package on the npm registry.
+- The `latest` version of each package on the npm registry, each version under each tag, and the runtime ranges of `latest`.
 
 A package is a `package.json` with a name and without `"private": true`. An edge is a dependency on a package of the account.
 
@@ -23,6 +23,15 @@ A package is a `package.json` with a name and without `"private": true`. An edge
 | `adopt-breaking` | The newest version is outside the range. The range must change. |
 
 Each repository gets one combined action of each kind. The plan puts the actions in a topological sequence and shows each cycle.
+
+### The version gate
+
+- A version on `main` that npm has already, under a tag that is not `latest`, is taken. Its publish fails, so the plan blocks the release.
+- The plan counts each taken version in `counts.taken` and gives the reason in `taken`. The gate keeps the count at 0.
+- pnpm writes a real range in place of `workspace:^` at the publish. The plan reads that range from the latest version on npm.
+- When that range does not cover the next version of the dependency, the dependent gets a cascade release in the same plan.
+- The plan counts each such range in `counts.behind` and lists it in `behind`.
+- A cascade release takes the first free version. npm can have a newer version under another tag.
 
 ## Use
 
@@ -290,6 +299,8 @@ GitHub refuses a change to a workflow file from an App without the permission Wo
 
 `train.yml` starts every 30 minutes, on a manual start and on the `released` event of `repository_dispatch`. It makes a token of the GitHub App `mark1russell7-release-train` with `actions/create-github-app-token`. Pull requests with that token start CI in the repositories.
 
+- Only `git clone`, `git fetch` and `git push` get the token of the App. The package managers, the scripts of the repositories and the other git commands get no token.
+- The train removes each variable with `TOKEN`, `SECRET` or `_KEY` in its name from the environment of each command. It also removes the settings `RELEASE_TRAIN_*`.
 - A manual start has the inputs `dry-run` (default true), `only`, `cascade` and `urgent`. Give only public names to `only`, `cascade` and `urgent`, because GitHub shows the inputs.
 - The schedule and `repository_dispatch` change repositories only when `LIVE` in `train.yml` is `"true"`. It is `"true"` since 2026-10-25. Set it to `"false"` to stop the train.
 - The log, the step summary and the artifact `apply` give each private repository only as a count or a hash. The run also masks each private name in the log.

@@ -214,7 +214,10 @@ export function summary(p: Plan, progress: Readonly<Record<string, Progress>> = 
     `Actions: ${c.actions["new-package"]} new-package, ${c.actions.release} release, ${c.actions["adopt-breaking"]} adopt-breaking, ${c.actions["adopt-in-range"]} adopt-in-range`,
     `Nodes: ${Object.entries(c.nodes).map(([k, v]) => `${v} ${k}`).join(", ")}`,
     `Flags: ${c.flags} git/file/link specifiers, ${c.blockingFlags} block a release`,
+    `Versions: ${c.taken} on main and on npm already, ${c.behind} published ranges behind`,
   ];
+  for (const t of p.taken) lines.push(`taken: ${t.name}@${t.version} (${t.repo}). ${t.why}`);
+  for (const b of p.behind) lines.push(`behind: ${b.name} has ${b.dep}@${b.range} on npm, but ${b.dep} goes to ${b.version}. ${b.name} gets a cascade release in ${b.repo}.`);
   if (p.cycles.length > 0) lines.push(`Cycles: ${p.cycles.map((cy) => `${cy.packages.join(" <-> ")}${cy.runtime ? " (runtime)" : " (dev)"}`).join("; ")}`);
   if (p.actionCycles.length > 0) lines.push(`Action cycles: ${p.actionCycles.map((cy) => cy.join(" <-> ")).join("; ")}`);
   if (p.reposWithoutPnpmLock.length > 0) lines.push(`No pnpm lockfile: ${p.reposWithoutPnpmLock.join(", ")}`);
