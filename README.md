@@ -241,6 +241,32 @@ A release can wait on purpose. Without a hold, the gate then stays red, and a ne
 - `lag-flip.ts` is the flip test. In one job, a new package over the limit fails while another is held. A date in the past fails, and a held row alone passes. The workflows `lag.yml` and `lag-holds.yml` start it.
 - `--from-report <file>` reads a saved report in place of the repositories, and `--now <time>` sets the time of the run. The flip test uses both.
 
+## The gate of a move
+
+A package can move to another repository with its npm name. The command `move-check` examines the release after the move against the last release before it.
+
+```sh
+node packages/release-train/src/bin.ts move-check --package @scope/name --from 0.1.8 --to 0.1.9 --repo owner/new-home
+node packages/release-train/src/bin.ts move-check --package @scope/name --from 0.1.8 --to out/name-0.1.9.tgz --repo owner/new-home --json --out move.json
+```
+
+The move passes only when each line is true:
+
+- Each file of the tarball has the same bytes, except `package.json`. A changed, added or removed file is a fault.
+- In `package.json`, only `version`, `repository`, `gitHead`, `homepage` and `bugs` change. The command compares the values, not the order of the keys.
+- The `repository` of the new `package.json` names `--repo`. The command reads the `owner/name`, `github:`, https, git and ssh forms.
+- The SLSA provenance of the new release on npm names `--repo`.
+
+More rules:
+
+- The command downloads each release from npm and examines its `sha512` integrity. A tarball that does not agree stops the command.
+- For a trial before the release, `--to` can name a tarball file. The name of the file ends in `.tgz`.
+- npm has no provenance of a file. So the report lists that check as not done.
+- `--allow-field <field>` and `--allow-file <path>` accept one more change. Use each option once for each name. The report lists each accepted change.
+- The report gives the version, the repository, the integrity and the provenance of each side, the files and the faults. `--json` and `--out <file>` give it as JSON.
+- The exit code is 0 on a pass, 1 on a fault or an error, and 2 on a missing option.
+- The command does not compare the test results. The new repository starts its tests and its API report in its own CI.
+
 ## Stage 3: template sync
 
 The template sync keeps the files from the repository `template` current in each other repository. Each rule is data in `SYNC_RULES` (`src/sync.ts`): an id, a reason and a check that gives the edits. To add a rule, add an object to this list.

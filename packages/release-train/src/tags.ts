@@ -1,6 +1,7 @@
 import { releaseNotes, tagName } from "@mark1russell7/conventions";
 import { runCommand } from "@procedures/shell/command";
 import semver from "semver";
+import { slsaStatements, type Attestations } from "./attest.ts";
 import { pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import type { PackageNode, RepoSnapshot } from "./types.ts";
@@ -49,32 +50,12 @@ export function validDate(text: string): boolean {
   return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === text;
 }
 
-interface Attestations {
-  attestations?: { predicateType?: string; bundle?: { dsseEnvelope?: { payload?: string } } }[];
-}
-
-interface Statement {
-  predicate?: {
-    buildDefinition?: {
-      internalParameters?: { github?: { repository_id?: unknown } };
-      resolvedDependencies?: { digest?: { gitCommit?: unknown } }[];
-    };
-  };
-}
-
 /**
  * This function gives the commit of an npm attestations document, or null.
  * The statement must name the repository by its ID, the same as the job `tag` of the release workflow.
  */
 export function provenanceCommit(doc: Attestations, repositoryId: string): string | null {
-  for (const a of doc.attestations ?? []) {
-    if (!a.predicateType?.startsWith("https://slsa.dev/provenance/")) continue;
-    let statement: Statement;
-    try {
-      statement = JSON.parse(Buffer.from(a.bundle?.dsseEnvelope?.payload ?? "", "base64").toString("utf8")) as Statement;
-    } catch {
-      continue;
-    }
+  for (const statement of slsaStatements(doc)) {
     const build = statement.predicate?.buildDefinition;
     if (String(build?.internalParameters?.github?.repository_id) !== repositoryId) continue;
     const commit = build?.resolvedDependencies?.[0]?.digest?.gitCommit;

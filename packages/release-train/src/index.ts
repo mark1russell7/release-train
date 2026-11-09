@@ -13,3 +13,5 @@ export * from "./sync.ts";
 export * from "./tags.ts";
 export * from "./holds.ts";
 export * from "./lag.ts";
+export * from "./attest.ts";
+export * from "./move.ts";

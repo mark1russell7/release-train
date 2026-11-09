@@ -8,12 +8,12 @@ export type ReleaseType = "patch" | "minor" | "major";
 const TYPED = [".d.ts", ".d.mts", ".d.cts", ".ts", ".mts", ".cts", ".tsx"];
 
 /**
- * This function reads the typed files of an npm tarball (a gzip tar file). It gives the path and the text of each file.
- * It reads only the files with a type suffix and skips the test files.
+ * This function reads each regular file of an npm tarball (a gzip tar file). It gives the path and the bytes of each file,
+ * in the order of the tarball. A long name (type `L`) names the next file.
  */
-export function typedFiles(tgz: Uint8Array, maxBytes = 50_000_000): Map<string, string> {
+export function tarFiles(tgz: Uint8Array, maxBytes = 50_000_000): Map<string, Uint8Array> {
   const tar = gunzipSync(tgz, { maxOutputLength: maxBytes });
-  const out = new Map<string, string>();
+  const out = new Map<string, Uint8Array>();
   let pos = 0;
   let longName: string | null = null;
   while (pos + 512 <= tar.length) {
@@ -31,10 +31,20 @@ export function typedFiles(tgz: Uint8Array, maxBytes = 50_000_000): Map<string, 
     longName = null;
     const body = tar.subarray(pos + 512, pos + 512 + size);
     if (type === "L") longName = body.toString("utf8").split("\0")[0] ?? null;
-    else if ((type === "0" || type === "") && TYPED.some((s) => name.endsWith(s)) && !name.includes(".test.") && !name.includes(".spec.")) {
-      out.set(name, body.toString("utf8"));
-    }
+    else if (type === "0" || type === "") out.set(name, new Uint8Array(body));
     pos += 512 + Math.ceil(size / 512) * 512;
+  }
+  return out;
+}
+
+/**
+ * This function reads the typed files of an npm tarball (a gzip tar file). It gives the path and the text of each file.
+ * It reads only the files with a type suffix and skips the test files.
+ */
+export function typedFiles(tgz: Uint8Array, maxBytes = 50_000_000): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const [name, body] of tarFiles(tgz, maxBytes)) {
+    if (TYPED.some((s) => name.endsWith(s)) && !name.includes(".test.") && !name.includes(".spec.")) out.set(name, Buffer.from(body).toString("utf8"));
   }
   return out;
 }

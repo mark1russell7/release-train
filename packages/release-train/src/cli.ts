@@ -11,6 +11,7 @@ import { buildGraph, publicView } from "./graph.ts";
 import { plan } from "./plan.ts";
 import type { Plan } from "./plan.ts";
 import { type GitHub, gitHub } from "./github.ts";
+import { moveCheck, moveSummary } from "./move.ts";
 import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
 import { awaitRelease } from "./release.ts";
@@ -69,6 +70,18 @@ export interface CliOptions {
   before?: string;
   /** `lag` and `holds`: the time of the run, for a test. */
   now?: Date;
+  /** `move-check`: the npm name of the package that moves. */
+  packageName?: string;
+  /** `move-check`: the version on npm before the move. */
+  from?: string;
+  /** `move-check`: the version on npm after the move, or the path of a tarball file. */
+  to?: string;
+  /** `move-check`: the repository after the move, as `owner/name`. */
+  repo?: string;
+  /** `move-check`: more fields of `package.json` that the move can change. */
+  allowFields: string[];
+  /** `move-check`: the files whose bytes the move can change. */
+  allowFiles: string[];
 }
 
 /** This function reads the arguments of the command line. */
@@ -97,6 +110,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     since: defaultSince(),
     write: false,
     gate: false,
+    allowFields: [],
+    allowFiles: [],
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -126,6 +141,12 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--holds") o.holds = value();
     else if (a === "--from-report") o.fromReport = value();
     else if (a === "--before") o.before = value();
+    else if (a === "--package") o.packageName = value();
+    else if (a === "--from") o.from = value();
+    else if (a === "--to") o.to = value();
+    else if (a === "--repo") o.repo = value();
+    else if (a === "--allow-field") o.allowFields.push(value());
+    else if (a === "--allow-file") o.allowFiles.push(value());
     else if (a === "--now") {
       const v = new Date(value());
       if (Number.isNaN(v.getTime())) throw new Error("--now needs a time.");
@@ -250,8 +271,9 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (o.command === "tags") return runTags(o);
   if (o.command === "lag") return runLag(o);
   if (o.command === "holds") return runHolds(o);
+  if (o.command === "move-check") return runMoveCheck(o);
   if (o.command !== "plan" && o.command !== "apply") {
-    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply", "await-release", "tags", "lag" and "holds".\n`);
+    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply", "await-release", "tags", "lag", "holds" and "move-check".\n`);
     return 2;
   }
   return o.command === "apply" ? runApply(o) : runPlan(o);
@@ -461,6 +483,27 @@ async function runTags(o: CliOptions): Promise<number> {
     return report.rows.some((r) => r.state === "failed" || r.state === "error") ? 1 : 0;
   } catch (e) {
     process.stderr.write(`${redact(e instanceof Error ? e.message : String(e))}\n`);
+    return 1;
+  }
+}
+
+/**
+ * The move-check command: the gate of a move of a package to another repository. It exits with 1 on a fault,
+ * and with 2 on a missing option.
+ */
+export async function runMoveCheck(o: CliOptions, check: typeof moveCheck = moveCheck): Promise<number> {
+  if (!o.packageName || !o.from || !o.to || !o.repo) {
+    process.stderr.write("move-check needs --package <name> --from <version> --to <version or file.tgz> --repo <owner/name>.\n");
+    return 2;
+  }
+  try {
+    const report = await check({ name: o.packageName, from: o.from, to: o.to, repo: o.repo, allowFields: o.allowFields, allowFiles: o.allowFiles });
+    const json = `${JSON.stringify(report, null, 2)}\n`;
+    if (o.out) writeFileSync(o.out, json);
+    process.stdout.write(o.json ? json : `${moveSummary(report)}\n`);
+    return report.pass ? 0 : 1;
+  } catch (e) {
+    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
     return 1;
   }
 }
