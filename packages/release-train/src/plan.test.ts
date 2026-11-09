@@ -330,3 +330,60 @@ describe("privacy", () => {
     expect(JSON.stringify(plan(g))).toContain("secret-repo");
   });
 });
+
+describe("the version gate", () => {
+  it("blocks a release whose version on main npm has already, under a tag that is not latest", () => {
+    const repos = [repo("core-repo", { "": { name: "@ex/core", version: "1.5.0" } })];
+    const free = run(repos, { "@ex/core": { ...npm("1.4.0"), versions: ["1.4.0"] } });
+    expect(free.actions.map((a) => [a.id, a.blocked])).toEqual([["release:core-repo", false]]);
+    expect(free.counts.taken).toBe(0);
+
+    const p = run(repos, { "@ex/core": { ...npm("1.4.0"), versions: ["1.4.0", "1.5.0"] } });
+    expect(p.actions.map((a) => [a.id, a.blocked])).toEqual([["release:core-repo", true]]);
+    expect(p.actions[0]?.blockers[0]).toContain("npm has @ex/core@1.5.0 already");
+    expect(p.counts.taken).toBe(1);
+    expect(p.taken).toEqual([expect.objectContaining({ name: "@ex/core", repo: "core-repo", version: "1.5.0" })]);
+    expect(p.nodes.find((n) => n.id === "@ex/core")?.status).toBe("blocked");
+  });
+
+  // The case that started it: conventions took a new MINOR, and the published api-report kept conventions ^0.40.0
+  const mono = (deps: Record<string, string> | undefined, reportVersions: string[] = ["0.5.2"]) =>
+    run(
+      [
+        repo("mono-repo", {
+          "": { name: "mono", private: true },
+          "packages/conv": { name: "@ex/conv", version: "0.41.0" },
+          "packages/report": { name: "@ex/report", version: "0.5.2", dependencies: { "@ex/conv": "workspace:^" } },
+        }),
+      ],
+      {
+        "@ex/conv": { ...npm("0.40.0"), versions: ["0.40.0"] },
+        "@ex/report": { ...npm("0.5.2"), versions: reportVersions, ...(deps ? { latestDeps: { dependencies: deps } } : {}) },
+      },
+    );
+
+  it("gives a PATCH to a dependent whose published workspace range does not cover the new version", () => {
+    const p = mono({ "@ex/conv": "^0.40.0" });
+    expect(p.actions.map((a) => a.id)).toEqual(["release:mono-repo"]);
+    expect(p.actions[0]?.packages.map((x) => [x.name, x.to, x.bump])).toEqual([
+      ["@ex/conv", "0.41.0", null],
+      ["@ex/report", "0.5.3", "patch"],
+    ]);
+    expect(p.counts.behind).toBe(1);
+    expect(p.behind).toEqual([{ name: "@ex/report", repo: "mono-repo", dep: "@ex/conv", range: "^0.40.0", version: "0.41.0" }]);
+    expect(p.nodes.find((n) => n.id === "@ex/report")?.next).toBe("0.5.3");
+  });
+
+  it("gives no PATCH when the published range covers the new version, or when npm gave no ranges", () => {
+    for (const p of [mono({ "@ex/conv": "^0.41.0" }), mono(undefined)]) {
+      expect(p.actions[0]?.packages.map((x) => x.name)).toEqual(["@ex/conv"]);
+      expect(p.counts.behind).toBe(0);
+    }
+  });
+
+  it("takes the first free version for a cascade release", () => {
+    const p = mono({ "@ex/conv": "^0.40.0" }, ["0.5.2", "0.5.3"]);
+    expect(p.actions[0]?.packages.find((x) => x.name === "@ex/report")?.to).toBe("0.5.4");
+    expect(p.counts.taken).toBe(0);
+  });
+});
