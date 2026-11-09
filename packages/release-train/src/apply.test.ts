@@ -990,6 +990,21 @@ describe("helpers", () => {
     expect(editManifest(text, [{ type: "devDependencies", dep: "@ex/core", range: "^1.0.0", newRange: "^2.0.0" }]).failed).toEqual(["@ex/core"]);
   });
 
+  it("edits only own keys, so a name such as __proto__ does not change Object.prototype", () => {
+    // JSON.parse makes "__proto__" an own key, so the guard of the names is necessary as well as the own-key check.
+    const text = '{\n  "dependencies": {\n    "__proto__": "^1.0.0",\n    "@ex/core": "^1.0.0"\n  }\n}\n';
+    const edits = [
+      { type: "dependencies", dep: "__proto__", range: "^1.0.0", newRange: "^2.0.0" },
+      { type: "__proto__", dep: "toString", range: "^1.0.0", newRange: "^2.0.0" },
+      { type: "dependencies", dep: "constructor", range: "^1.0.0", newRange: "^2.0.0" },
+    ];
+    const out = editManifest(text, edits);
+    expect(out.failed).toEqual(["__proto__", "toString", "constructor"]);
+    expect(out.text).toBe(text);
+    expect(({} as Record<string, unknown>)["^2.0.0"]).toBeUndefined();
+    expect(typeof Object.prototype.toString).toBe("function");
+  });
+
   it("lists the lockfile changes and marks the intended ones", () => {
     const c = lockChanges({ "": { a: "1.0.0", b: "1.0.0" } }, { "": { a: "1.1.0", b: "1.0.0", c: "1.0.0" } }, new Set(["|a"]));
     expect(c).toEqual([
