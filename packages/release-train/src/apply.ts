@@ -17,6 +17,16 @@ export const TRAIN_BRANCH = "release-train/update";
 export const TRAIN_LABEL = "release-train";
 /** The label of a pull request of the release train with a failed CI. */
 export const BLOCKED_LABEL = "release-train:blocked";
+/**
+ * The label of a pull request of another author that only the train merges, for example a Renovate pin of a workflow action.
+ * The train merges it on green CI with the holds of its own pull requests. A branch that is behind the default branch
+ * waits for a rebase. A change of a workflow file waits while a release run of the default branch is not done.
+ */
+export const MERGE_LABEL = "train-merge";
+/** The kind of the result of a pull request with the label `MERGE_LABEL`. */
+export const MERGE_KIND = "train-merge";
+/** The unchecked rebase box of a Renovate pull request body. A tick asks Renovate to rebase the branch. */
+export const RENOVATE_REBASE_BOX = "- [ ] <!-- rebase-check -->";
 /** The last line of each pull request body of the release train. */
 export const CLAUDE_LINE = "🤖 Generated with [Claude Code](https://claude.com/claude-code)";
 
@@ -489,9 +499,10 @@ interface Pull {
   merged_at?: string | null;
   mergeable?: boolean | null;
   auto_merge?: unknown;
-  head: { sha: string; ref: string };
+  head: { sha: string; ref: string; repo?: { full_name: string } | null };
   base: { ref: string };
   labels?: { name: string }[];
+  draft?: boolean;
 }
 
 interface RepoMeta {
@@ -732,7 +743,7 @@ export function publicReport(r: ApplyReport, key = ""): ApplyReport {
 export function applySummary(r: ApplyReport): string {
   const lines = [`Release train apply for ${r.owner} at ${r.at}${r.dryRun ? " (dry run)" : ""}`];
   const prStates = new Set<RepoState>(["planned", "opened", "updated", "unchanged", "merged", "blocked"]);
-  const isPr = (x: RepoResult): boolean => prStates.has(x.state) && x.kind !== SYNC_KIND;
+  const isPr = (x: RepoResult): boolean => prStates.has(x.state) && x.kind !== SYNC_KIND && x.kind !== MERGE_KIND;
   const waves = [...new Set(r.results.filter(isPr).map((x) => x.wave ?? 0))].sort((a, b) => a - b);
   for (const w of waves) {
     const xs = r.results.filter((x) => isPr(x) && (x.wave ?? 0) === w);
@@ -743,6 +754,12 @@ export function applySummary(r: ApplyReport): string {
   if (sync.length > 0) {
     const pub = sync.filter((x) => !x.private).map((x) => x.repo);
     lines.push(`Template sync: ${sync.length} pull requests. Public: ${pub.join(", ") || "none"}. Count of private repositories: ${sync.length - pub.length}.`);
+  }
+  const labeled = r.results.filter((x) => x.kind === MERGE_KIND);
+  if (labeled.length > 0) {
+    const pub = labeled.filter((x) => !x.private).map((x) => x.repo);
+    const merged = labeled.filter((x) => x.state === "merged").length;
+    lines.push(`Label ${MERGE_LABEL}: ${labeled.length} pull requests, ${merged} merged. Public: ${pub.join(", ") || "none"}. Count of private repositories: ${labeled.length - pub.length}.`);
   }
   const wait = r.results.filter((x) => x.state === "waiting" && !x.paced);
   if (wait.length > 0) {
@@ -770,7 +787,7 @@ export function applySummary(r: ApplyReport): string {
     const pr = x.pr ? ` ${x.pr.url}` : "";
     const am = x.autoMerge ? ` merge=${x.autoMerge}` : "";
     const ci = x.ci ? ` ci=${x.ci}` : "";
-    const kind = x.kind === SYNC_KIND ? " [template sync]" : "";
+    const kind = x.kind === SYNC_KIND ? " [template sync]" : x.kind === MERGE_KIND ? ` [${MERGE_LABEL}]` : "";
     lines.push(`- ${x.repo}${kind}: ${x.state}${x.wave === null ? "" : ` (wave ${x.wave})`}${pr}${am}${ci}. ${x.detail}`);
   }
   // The problems of the template sync that a person must correct. A private repository gives only a count.
@@ -918,7 +935,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    * This function merges a green pull request, or labels a red one. It gives the new state. It merges only a branch that
    * has each commit of the default branch, so CI ran on the current base. A branch that is behind waits for a new build.
    */
-  const settle = async (repo: string, pr: Pull, meta: RepoMeta | null, branch: string = TRAIN_BRANCH): Promise<{ state: RepoState; ci: CiState; detail: string }> => {
+  const settle = async (repo: string, pr: Pull, meta: RepoMeta | null, branch: string = TRAIN_BRANCH, deleteBranch = true): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number }> => {
     const ci = await ciOf(repo, pr.head.sha);
     if (ci === "failed") {
       if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
@@ -934,7 +951,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       const cmp = await compareOf(repo, pr.head.sha, main);
       if (cmp === null) return { state: "unchanged", ci, detail: `CI is green, but GitHub did not compare the branch with ${main}. The train does not merge it now.` };
       if (cmp.behind > 0) {
-        return { state: "unchanged", ci, detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.` };
+        return { state: "unchanged", ci, behind: cmp.behind, detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.` };
       }
       // A release run tags the commit of its version. When a merge changes a workflow file before the tag, GitHub refuses the
       // tag (HTTP 403): the token of a workflow cannot write workflow files. So a change of a workflow file waits for the run.
@@ -947,7 +964,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       }
       const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
-        await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);
+        if (deleteBranch) await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);
         return { state: "merged", ci, detail: "CI was green. The train merged the pull request." };
       }
       return { state: "unchanged", ci, detail: `CI is green, but the merge failed (HTTP ${m.status}${m.message ? `: ${m.message}` : ""}).` };
@@ -1051,6 +1068,58 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const publicPackages = new Set(o.plan.nodes.filter((n) => n.kind === "package" && !n.repoPrivate).map((n) => n.name));
   const urgentNames = new Set((o.urgent ?? []).filter((n) => publicPackages.has(n)));
   const isUrgent = (u: RepoUpdate): boolean => u.items.some((i) => urgentNames.has(i.dep));
+
+  /**
+   * This function merges each open pull request with the label MERGE_LABEL in a repository of the plan, through settle.
+   * It takes only a branch of the same repository on the default branch. It does not delete the branch, because the
+   * branch is not of the train. A Renovate branch that is behind gets a tick in its rebase box, so Renovate rebases it and CI runs again.
+   */
+  const mergeLabeled = async (): Promise<void> => {
+    const q = `user:${owner} is:pr is:open label:${MERGE_LABEL}`;
+    const found = await gh.request<{ items?: { number: number; repository_url: string }[] }>("GET", `/search/issues?per_page=100&q=${encodeURIComponent(q)}`);
+    if (!found.ok || !found.data) {
+      log(`GitHub did not search the pull requests with the label ${MERGE_LABEL} (HTTP ${found.status}).`);
+      return;
+    }
+    const inScan = new Set(scan);
+    const metas = new Map<string, RepoMeta | null>();
+    for (const item of found.data.items ?? []) {
+      const repo = item.repository_url.split("/").pop() ?? "";
+      if (!inScan.has(repo)) continue;
+      const base0 = { repo, actionId: `merge:${repo}#${item.number}`, kind: MERGE_KIND, wave: null, items: 0, autoMerge: "train" as const };
+      try {
+        if (!metas.has(repo)) metas.set(repo, (await gh.request<RepoMeta>("GET", `${base}/${repo}`)).data);
+        const meta = metas.get(repo) ?? null;
+        const pr = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${item.number}`)).data;
+        if (!pr || pr.state !== "open") continue;
+        const main = meta?.default_branch ?? "main";
+        // A branch of a fork has a name that can match a branch of this repository, and a merge into another base is not a release path.
+        if (pr.head.repo?.full_name !== `${owner}/${repo}` || pr.base.ref !== main || pr.draft) {
+          result({ ...base0, state: "skipped", pr: prRef(pr), ci: null, detail: `The train merges only a branch of this repository into ${main}, and not a draft.` });
+          continue;
+        }
+        if (o.dryRun) {
+          result({ ...base0, state: "planned", pr: prRef(pr), ci: null, detail: "The run merges the pull request when CI is green." });
+          continue;
+        }
+        await disableAutoMerge(pr);
+        const s = await settle(repo, pr, meta, pr.head.ref, false);
+        let detail = s.detail;
+        if ((s.behind ?? 0) > 0) {
+          const body = pr.body ?? "";
+          if (body.includes(RENOVATE_REBASE_BOX)) {
+            const r = await gh.request("PATCH", `${base}/${repo}/pulls/${pr.number}`, { body: body.replace(RENOVATE_REBASE_BOX, "- [x] <!-- rebase-check -->") });
+            detail += r.ok ? " The train ticked the rebase box, so Renovate rebases the branch." : ` The tick of the rebase box failed (HTTP ${r.status}).`;
+          } else {
+            detail += " The branch has no Renovate rebase box: its author must rebase it.";
+          }
+        }
+        result({ ...base0, state: s.state, pr: prRef(pr), ci: s.ci, detail });
+      } catch (e) {
+        result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
+      }
+    }
+  };
 
   // 1. Close each open pull request of the train that the plan no longer needs.
   for (const [repo, pr] of open) {
@@ -1374,6 +1443,11 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
     }
   }
+
+  // 6. The pull requests of other authors with the label MERGE_LABEL, for example the Renovate pins of workflow actions.
+  // A merge by Renovate or by the auto-merge of GitHub has no hold for a release run, so GitHub can refuse a tag. The train
+  // merges them with the holds of settle. This step comes after the releases, so a release run that this run started holds too.
+  await mergeLabeled();
 
   const changed = new Set(sel.ready.flatMap((u) => u.items.map((i) => i.dep)));
   const urgentUnused = [...new Set(o.urgent ?? [])].filter((n) => !urgentNames.has(n) || !changed.has(n)).length;

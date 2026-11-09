@@ -75,6 +75,7 @@ The site at <https://mark1russell7.github.io/release-train/> is a plan explorer.
 - Before a merge, the train compares the branch with the default branch. A branch that is behind gets a new build from the default branch, with a new install, and CI runs again. A merge of two lockfile changes can give a lockfile with no entry for a version, with no git conflict.
 - A branch can change a file in `.github/workflows/`. Then it does not merge while a run of the release workflow on the default branch is queued, waits or is in progress. The run tags the commit of its version, and GitHub refuses that tag (HTTP 403) when a merge changed a workflow file before it. The train merges in a later run, after the release.
 - When CI fails, the pull request stays open with the label `release-train:blocked`.
+- A pull request of another author with the label `train-merge` (for example a Renovate pin of a workflow action) merges by the same rules. A merge by Renovate or by the auto-merge of GitHub does not wait for a release run, so the train merges these pull requests. It takes only a branch of the same repository into the default branch, and it does not delete the branch. A Renovate branch that is behind gets a tick in its rebase box, so Renovate rebases it and CI runs again. This step comes after the releases of the run.
 - The train closes its pull request when the plan has no update for the repository.
 - The train does not open a pull request again when a person closed one with the same changes.
 
