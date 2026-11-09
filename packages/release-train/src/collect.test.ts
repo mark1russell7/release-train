@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { summary } from "./cli.ts";
 import { retryAfterDelay, type Clock } from "@mark1russell7/service";
-import { collect, HttpError } from "./collect.ts";
+import { collect, HttpError, runtimeRanges } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { docId, writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
@@ -269,6 +269,22 @@ describe("writeDb", () => {
   const dirs: string[] = [];
   afterEach(() => {
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("reads each version on npm and the runtime ranges of the latest version", async () => {
+    const inner = fakeFetch(REPOS, { "@ex/core": "1.4.0", "@ex/fresh": "0.1.0" });
+    const doc = {
+      "dist-tags": { latest: "1.4.0" },
+      versions: { "1.4.0": { dependencies: { "@ex/base": "^2.0.0", odd: 3 }, devDependencies: { vitest: "^5.0.0" } }, "1.5.0": {} },
+    };
+    const f: FetchFn = async (url, init) => (url === `${REG}/@ex%2fcore` ? new Response(JSON.stringify(doc), { status: 200 }) : inner(url, init));
+    const data = await collect({ owner: "example-owner", token: null, fetch: f });
+    expect(data.npm["@ex/core"]).toMatchObject({ latest: "1.4.0", versions: ["1.4.0", "1.5.0"], latestDeps: { dependencies: { "@ex/base": "^2.0.0" } } });
+    // A document with no versions gives no fields, as a snapshot from before them
+    expect(data.npm["@ex/fresh"]).toMatchObject({ exists: true, latest: "0.1.0" });
+    expect(data.npm["@ex/fresh"]).not.toHaveProperty("versions");
+    expect(runtimeRanges(undefined)).toEqual({});
+    expect(runtimeRanges({ peerDependencies: { "@ex/a": "^1.0.0" }, devDependencies: { "@ex/b": "^1.0.0" } })).toEqual({ peerDependencies: { "@ex/a": "^1.0.0" } });
   });
 
   it("writes one document for each node and action, and moves a finished action to done", async () => {
