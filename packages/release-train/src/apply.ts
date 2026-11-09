@@ -8,7 +8,7 @@ import { adoptWhy, moveSets } from "./plan.ts";
 import type { Action, ActionItem, Plan } from "./plan.ts";
 import type { DepType, LockKind } from "./types.ts";
 import { ownScopes } from "./settings.ts";
-import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, apiFiles, renovateDays, syncBody, syncNeeds, syncRepo } from "./sync.ts";
+import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, TEMPLATE_REPO, apiFiles, renovateDays, syncBody, syncNeeds, syncRepo } from "./sync.ts";
 import type { RepoFiles, RunFacts, SyncFacts, SyncPush, SyncResult, SyncRule, SyncUpdater, WorkflowsMode } from "./sync.ts";
 
 /** The branch of each pull request of the release train. */
@@ -468,12 +468,14 @@ export function rotate<T>(list: readonly T[], slot: number): T[] {
  * pull request goes to the end of the next run. Thus a repository far from the start of the rotation also gets a push.
  * The rotation moves one place in each run, but a run pushes up to `MAX_PUSHES` branches.
  *
- * An item with no time goes first, in the order of the list. Each such item gets its pull request in a run,
- * and then it has a time, so it cannot stop the other items for ever.
+ * An item with no open pull request waits from `since`: the time when its need started. For the template sync, that is
+ * the date of the template commit. When the caller does not know it, the run gives its own start, so the new item goes
+ * after the pull requests that wait already. Without `since`, or with a time that does not parse, an item goes first,
+ * in the order of the list.
  */
-export function longestWaitFirst<T>(list: readonly T[], pushedOf: (item: T) => string | undefined): T[] {
+export function longestWaitFirst<T>(list: readonly T[], pushedOf: (item: T) => string | undefined, since?: string): T[] {
   const at = (x: T): number => {
-    const t = pushedOf(x);
+    const t = pushedOf(x) ?? since;
     const ms = t === undefined ? Number.NaN : Date.parse(t);
     return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
   };
@@ -1076,14 +1078,20 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    * of its head commit. A label, a comment or a body edit changes `updated_at` but not this time. Thus an edit with no push
    * keeps the place of the pull request in the order. When the commit is not readable, the time is `updated_at`.
    */
+  /** This function gives the committer date of a commit, or undefined when the commit is not readable. */
+  const commitDate = async (repo: string, sha: string): Promise<string | undefined> => {
+    const res = await gh.request<{ commit?: { committer?: { date?: string } } }>("GET", `${base}/${repo}/commits/${sha}`);
+    return res.data?.commit?.committer?.date;
+  };
   const pushedAt = async (prs: Map<string, Pull>): Promise<Map<string, string | undefined>> => {
     const times = new Map<string, string | undefined>();
     await pool([...prs], o.concurrency ?? 6, async ([repo, pr]) => {
-      const res = await gh.request<{ commit?: { committer?: { date?: string } } }>("GET", `${base}/${repo}/commits/${pr.head.sha}`);
-      times.set(repo, res.data?.commit?.committer?.date ?? pr.updated_at);
+      times.set(repo, (await commitDate(repo, pr.head.sha)) ?? pr.updated_at);
     });
     return times;
   };
+  /** The start of the run. A new item with no known start of its need waits from it. */
+  const runStart = (o.now ?? new Date()).toISOString();
   const slot = Math.floor((o.now ?? new Date()).getTime() / RUN_MS);
   let pushes = 0;
   /** This function gives the reason why a push waits for the limit of pushes, or null when it can push. */
@@ -1197,7 +1205,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const waitedFor = new Set(o.plan.actions.flatMap((a) => a.dependsOn));
     const rank = (u: RepoUpdate): number => (isUrgent(u) ? 0 : waitedFor.has(u.actionId) ? 1 : 2);
     const pushed = pacing ? await pushedAt(open) : new Map<string, string | undefined>();
-    const order = (list: readonly RepoUpdate[]): RepoUpdate[] => longestWaitFirst(rotate(list, slot), (u) => pushed.get(u.repo)).sort((x, y) => rank(x) - rank(y));
+    const order = (list: readonly RepoUpdate[]): RepoUpdate[] => longestWaitFirst(rotate(list, slot), (u) => pushed.get(u.repo), runStart).sort((x, y) => rank(x) - rank(y));
     for (const u of pacing ? order(sel.ready) : sel.ready) {
       const existing = open.get(u.repo) ?? null;
       const urgent = isUrgent(u);
@@ -1311,10 +1319,12 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       : s.facts;
     const syncOpen = await openOf(SYNC_BRANCH);
     const syncPushed = pacing ? await pushedAt(syncOpen) : new Map<string, string | undefined>();
+    // A repository with no open sync pull request waits from the template commit that it needs, not from for ever.
+    const syncSince = pacing ? ((await commitDate(TEMPLATE_REPO, s.facts.templateSha)) ?? runStart) : runStart;
     const pending = pendingVersions(o.plan, o.only ?? null);
     const changesets = new Set(o.plan.repos.filter((r) => (r.pendingChangesets ?? 0) > 0).map((r) => r.name));
     let workflows = s.workflows !== "no";
-    for (const repo of pacing ? longestWaitFirst(rotate(scan, slot), (r) => syncPushed.get(r)) : scan) {
+    for (const repo of pacing ? longestWaitFirst(rotate(scan, slot), (r) => syncPushed.get(r), syncSince) : scan) {
       const isPrivate = privateOf.get(repo) ?? true;
       const existing = syncOpen.get(repo) ?? null;
       const facts: SyncFacts = { ...facts0, repo, releaseInFlight: pending.has(repo) || changesets.has(repo) };
