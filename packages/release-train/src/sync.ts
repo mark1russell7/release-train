@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { FetchFn } from "./collect.ts";
 import type { GitHub } from "./github.ts";
 import { matchWorkspaces, parsePnpmWorkspace } from "./parse.ts";
+import { escapeRegExp as escapeRe } from "@mark1russell7/text";
 
 /** The branch of each template sync pull request of the release train. */
 export const SYNC_BRANCH = "release-train/template";
@@ -112,10 +113,6 @@ export interface SyncResult {
 }
 
 const WORKFLOW_FILE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
-
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
-}
 
 function isComment(line: string): boolean {
   return line.trimStart().startsWith("#");

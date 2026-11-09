@@ -199,6 +199,9 @@ importers:
       '@mark1russell7/service':
         specifier: ^0.7.2
         version: 0.7.2(ws@8.22.1)(zod@4.6.7)
+      '@mark1russell7/text':
+        specifier: ^0.0.2
+        version: 0.0.2
       '@procedures/shell':
         specifier: ^0.52.0
         version: 0.52.0
@@ -580,6 +583,10 @@ packages:
     resolution: {integrity: sha512-OenwEgVEkrt6HjUtIsTgplkJJTBIZLwb0mxiPow533++mbrrJ8BvHK+MsMLFm6X5A8EJZlLgd6IXJspZy3L2og==}
     engines: {node: '>=22.12'}
     hasBin: true
+
+  '@mark1russell7/text@0.0.2':
+    resolution: {integrity: sha512-m1aIB8X+PDekktzr1fYOp1/7gvlh9iL/2M7ktj/GnmPmVrWin0rTADgTm00dKFdWFRzXraCUYkjyCl3jQZHEVg==}
+    engines: {node: '>=22.12'}
 
   '@oxc-project/types@0.155.0':
     resolution: {integrity: sha512-SeE8JPwW1xs1tHeNycjUtUBdhorRa8o4jlvjwk49R7/Z291i+4DQa7JJIgOm/TaYQZx+QrPQbVJ/9c8dMIZN8Q==}
@@ -1386,6 +1393,8 @@ snapshots:
   '@mark1russell7/template-cli@0.1.5':
     dependencies:
       '@clack/prompts': 1.8.1
+
+  '@mark1russell7/text@0.0.2': {}
 
   '@oxc-project/types@0.155.0': {}
 
