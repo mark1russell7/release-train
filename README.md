@@ -126,7 +126,7 @@ One new version of a package that most repositories use changes approximately 35
 - A branch that gets a new commit counts. A branch that has its changes on the current default branch needs no push. It does not wait, and the train merges or blocks its pull request.
 - At the limit, the train does not clone. A repository that waits has no cost, and an open pull request still merges on green or gets the blocked label. The next run reads the plan again, so it pushes the newest versions and skips the versions between.
 - Each item of an update waits for no action, so the pace cannot put a later wave first. An update that another action waits for goes first.
-- The open pull request with the oldest `updated_at` goes first. A push changes that time, so a pushed pull request goes to the end. A repository with no open pull request goes before them.
+- The open pull request with the oldest push goes first. The time of a push is the committer date of the head commit, because each push of the train makes a new commit. A label or a comment does not change that time. A pushed pull request goes to the end. A repository with no open pull request goes before them.
 - In each group, the order moves one place every 30 minutes. A move of one place alone is too slow. A run pushes up to 5 branches, and the first repositories need a new push in each run. The update pushes and the sync pushes go first in turn.
 - `--max-pushes 0` lets a run only merge or block.
 
