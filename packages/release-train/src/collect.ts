@@ -1,5 +1,6 @@
 import { retry, retryAfterDelay, type Clock } from "@mark1russell7/service";
 import type { Backoff } from "@mark1russell7/service/backoff";
+import { attestationsUrl, workflowProvenance, type Attestations } from "./attest.ts";
 import { DEP_TYPES } from "./types.ts";
 import type { LockKind, Manifest, ManifestFile, NpmInfo, Provenance, RepoSnapshot } from "./types.ts";
 import { manifestWorkspaces, matchWorkspaces, parseNpmLock, parsePnpmLock, parsePnpmWorkspace } from "./parse.ts";
@@ -336,22 +337,9 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
 
   // The provenance of a version: the workflow of its SLSA attestation. null when npm has no attestation of it.
   const provenanceOf = async (n: string, version: string): Promise<Provenance | null> => {
-    const res = await f(`${registry}/-/npm/v1/attestations/${n.replaceAll("/", "%2f")}@${encodeURIComponent(version)}`, { headers: { "user-agent": "release-train" } });
+    const res = await f(attestationsUrl(registry, n, version), { headers: { "user-agent": "release-train" } });
     if (!res.ok) return null;
-    const doc = (await res.json()) as { attestations?: { predicateType?: string; bundle?: { dsseEnvelope?: { payload?: string } } }[] };
-    for (const a of doc.attestations ?? []) {
-      if (!a.predicateType?.startsWith("https://slsa.dev/provenance/")) continue;
-      try {
-        const statement = JSON.parse(Buffer.from(a.bundle?.dsseEnvelope?.payload ?? "", "base64").toString("utf8")) as {
-          predicate?: { buildDefinition?: { externalParameters?: { workflow?: { repository?: unknown; path?: unknown } } } };
-        };
-        const w = statement.predicate?.buildDefinition?.externalParameters?.workflow;
-        if (typeof w?.repository === "string" && typeof w.path === "string") return { repository: w.repository, workflow: w.path };
-      } catch {
-        // An attestation that does not parse gives no provenance
-      }
-    }
-    return null;
+    return workflowProvenance((await res.json()) as Attestations);
   };
 
   // Phase 3: the npm state of each package.
