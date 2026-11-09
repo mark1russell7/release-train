@@ -9,7 +9,7 @@ Stage 1 only reads. Stage 2 (`apply`) opens a pull request for each update of th
 - The repositories of the account. It skips archived repositories and forks.
 - The root `package.json` of each repository, and each workspace package of `pnpm-workspace.yaml`.
 - `pnpm-lock.yaml` or `package-lock.json`, for the resolved versions.
-- The `latest` version of each package on the npm registry.
+- The `latest` version of each package on the npm registry, each version under each tag, and the runtime ranges of `latest`.
 
 A package is a `package.json` with a name and without `"private": true`. An edge is a dependency on a package of the account.
 
@@ -23,6 +23,15 @@ A package is a `package.json` with a name and without `"private": true`. An edge
 | `adopt-breaking` | The newest version is outside the range. The range must change. |
 
 Each repository gets one combined action of each kind. The plan puts the actions in a topological sequence and shows each cycle.
+
+### The version gate
+
+- A version on `main` that npm has already, under a tag that is not `latest`, is taken. Its publish fails, so the plan blocks the release.
+- The plan counts each taken version in `counts.taken` and gives the reason in `taken`. The gate keeps the count at 0.
+- pnpm writes a real range in place of `workspace:^` at the publish. The plan reads that range from the latest version on npm.
+- When that range does not cover the next version of the dependency, the dependent gets a cascade release in the same plan.
+- The plan counts each such range in `counts.behind` and lists it in `behind`.
+- A cascade release takes the first free version. npm can have a newer version under another tag.
 
 ## Use
 
