@@ -519,6 +519,7 @@ interface Pull {
   updated_at?: string;
   merged_at?: string | null;
   mergeable?: boolean | null;
+  mergeable_state?: string;
   auto_merge?: unknown;
   head: { sha: string; ref: string; repo?: { full_name: string } | null };
   base: { ref: string };
@@ -953,6 +954,29 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const hasLabel = (pr: Pull, name: string): boolean => (pr.labels ?? []).some((l) => l.name === name);
 
   /**
+   * This function merges the default branch into a branch that is behind, with the update-branch API of GitHub. Then CI
+   * starts again on the current base. It takes only a branch of the same repository with no conflict. A Renovate branch keeps its
+   * rebase box, because Renovate rebases it. The API refuses a change of the head after the read (HTTP 422). The merge
+   * starts CI, so it counts as a push in the limit of the run. The function gives the text to add to the detail.
+   */
+  const catchUp = async (repo: string, pr: Pull, main: string): Promise<string> => {
+    if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX)) return "";
+    if (pr.head.repo === null || (pr.head.repo !== undefined && pr.head.repo.full_name !== `${owner}/${repo}`)) return "";
+    const conflict = ` The branch has a conflict with ${main}: its author must merge ${main} into it.`;
+    const full = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${pr.number}`)).data;
+    if (full?.mergeable === false || full?.mergeable_state === "dirty") return conflict;
+    // The merge starts CI as a push does, so it counts in the limit of pushes of the run.
+    const wait = limitWait();
+    if (wait !== null) return ` The merge of ${main} into the branch waits: ${wait}`;
+    const r = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/update-branch`, { expected_head_sha: pr.head.sha });
+    if (r.ok) {
+      pushes += 1;
+      return ` The train merged ${main} into the branch, so CI runs again.`;
+    }
+    return r.status === 422 ? conflict : ` The update of the branch failed (HTTP ${r.status}).`;
+  };
+
+  /**
    * This function merges a green pull request, or labels a red one. It gives the new state. It merges only a branch that
    * has each commit of the default branch, so CI ran on the current base. A branch that is behind waits for a new build.
    */
@@ -972,7 +996,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       const cmp = await compareOf(repo, pr.head.sha, main);
       if (cmp === null) return { state: "unchanged", ci, detail: `CI is green, but GitHub did not compare the branch with ${main}. The train does not merge it now.` };
       if (cmp.behind > 0) {
-        return { state: "unchanged", ci, behind: cmp.behind, detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.` };
+        const caught = await catchUp(repo, pr, main);
+        return { state: "unchanged", ci, behind: cmp.behind, detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.${caught}` };
       }
       // A release run tags the commit of its version. When a merge changes a workflow file before the tag, GitHub refuses the
       // tag (HTTP 403): the token of a workflow cannot write workflow files. So a change of a workflow file waits for the run.
@@ -1113,6 +1138,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    * This function merges each open pull request with the label MERGE_LABEL in a repository of the plan, through settle.
    * It takes only a branch of the same repository on the default branch. It does not delete the branch, because the
    * branch is not of the train. A Renovate branch that is behind gets a tick in its rebase box, so Renovate rebases it and CI runs again.
+ * Another branch that is behind gets the default branch merged in by settle.
    */
   const mergeLabeled = async (): Promise<void> => {
     const q = `user:${owner} is:pr is:open label:${MERGE_LABEL}`;
@@ -1147,11 +1173,10 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         let detail = s.detail;
         if ((s.behind ?? 0) > 0) {
           const body = pr.body ?? "";
+          // settle merges the default branch into a branch with no rebase box.
           if (body.includes(RENOVATE_REBASE_BOX)) {
             const r = await gh.request("PATCH", `${base}/${repo}/pulls/${pr.number}`, { body: body.replace(RENOVATE_REBASE_BOX, "- [x] <!-- rebase-check -->") });
             detail += r.ok ? " The train ticked the rebase box, so Renovate rebases the branch." : ` The tick of the rebase box failed (HTTP ${r.status}).`;
-          } else {
-            detail += " The branch has no Renovate rebase box: its author must rebase it.";
           }
         }
         result({ ...base0, state: s.state, pr: prRef(pr), ci: s.ci, detail });
