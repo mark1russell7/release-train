@@ -87,6 +87,7 @@ function fakeGh(answers: Record<string, ReturnType<typeof ok>> = {}): FakeGh {
   const defaults: Record<string, ReturnType<typeof ok>> = {
     "git/matching-refs/tags/": ok(""),
     "/compare/": ok("behind\n"),
+    "/actions/workflows/release.yml/runs": ok(""),
     "/contents/.github/workflows/release.yml": ok("uses: ex/template/.github/workflows/reusable-release-tag.yml@abc"),
     "/CHANGELOG.md": bad("gh: Not Found (HTTP 404)"),
     "release create": ok("https://example.test/release"),
@@ -328,6 +329,24 @@ describe("backfillTags", () => {
     const r = await run({ gh: f.gh, write: true, fetch: registry({ "@ex/one": { "1.0.0": { gitHead: SHA_A, time } } }) });
     expect(r.rows[0]).toMatchObject({ state: "young", commit: null });
     expect(writes(f.calls)).toEqual([]);
+  });
+
+  it("does not wait for a young version when each release run of its commit is done, so a refused tag gets made at once", async () => {
+    const time = new Date(NOW.getTime() - MIN_AGE_MS + 1000).toISOString();
+    const at = async (runs: ReturnType<typeof ok>) => {
+      const f = fakeGh({ "/actions/workflows/release.yml/runs": runs });
+      const r = await run({ gh: f.gh, write: true, fetch: registry({ "@ex/one": { "1.0.0": { gitHead: SHA_A, time } } }) });
+      return { r, f };
+    };
+    const done = await at(ok("completed\ncompleted\n"));
+    expect(done.r.rows[0]).toMatchObject({ state: "created", commit: SHA_A });
+    expect(done.f.calls.some((c) => c.join(" ").includes(`runs?head_sha=${SHA_A}`))).toBe(true);
+    // A run that is not done, no run yet, or an error of the read: the version waits.
+    for (const runs of [ok("completed\nqueued\n"), ok(""), bad("gh: Server Error (HTTP 502)")]) {
+      const w = await at(runs);
+      expect(w.r.rows[0]).toMatchObject({ state: "young", commit: null });
+      expect(writes(w.f.calls)).toEqual([]);
+    }
   });
 
   it("makes no tag in a repository with no tag job, or with no release.yml", async () => {

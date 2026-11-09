@@ -185,7 +185,7 @@ The command reads the packages of the plan, their versions on npm and the tags o
 | `failed` | The run did not make the release. The line tells the reason. |
 | `no-commit` | npm names no commit, or npm names two different commits. The version gets no tag. |
 | `off-branch` | The commit is not on the default branch. The version gets no tag. |
-| `young` | The version is younger than one hour, so its release run can still make the tag. |
+| `young` | The version is younger than one hour, and a release run of its commit is not done, so that run can still make the tag. When each release run of the commit is done (for example, GitHub refused its tag), the version does not wait. |
 | `no-tag-job` | The `release.yml` of the repository has no tag job. Such a repository makes no tags on purpose. |
 | `error` | A read failed, so the version has no decision. The exit code is 1. |
 

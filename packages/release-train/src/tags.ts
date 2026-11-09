@@ -26,6 +26,7 @@ export function checkWriteWindow(since: string, now: Date = new Date()): void {
 /**
  * The youngest age of a version that `tags` examines, in milliseconds. A younger version can wait for the job `tag` of
  * its release run. That job skips a tag that exists, so an early backfill stops the job before it sets the latest release.
+ * When each release run of the commit of the version is done, no run can make the tag, so the version does not wait.
  */
 export const MIN_AGE_MS: number = 60 * 60 * 1000;
 
@@ -250,6 +251,14 @@ export async function backfillTags(i: TagsInput): Promise<TagsReport> {
       return tagJob;
     };
 
+    // The release runs of a commit. True when there is one or more, and each one is done: then no run makes the tag later.
+    const releaseRunsDone = async (commit: string): Promise<boolean> => {
+      const r = await gh(["api", `repos/${slug}/actions/workflows/release.yml/runs?head_sha=${commit}&per_page=20`, "--jq", ".workflow_runs[].status"]);
+      if (r.code !== 0) return false;
+      const states = r.stdout.split(/\r?\n/).filter(Boolean);
+      return states.length > 0 && states.every((x) => x === "completed");
+    };
+
     const readChangelog = async (path: string, commit: string): Promise<string | undefined> => {
       const file = [...(path ? path.split("/") : []), "CHANGELOG.md"].map(encodeURIComponent).join("/");
       const r = await gh(["api", "-H", RAW, `repos/${slug}/contents/${file}?ref=${commit}`]);
@@ -316,16 +325,20 @@ export async function backfillTags(i: TagsInput): Promise<TagsReport> {
           rows.push({ ...r, state: "error", detail: "The tag has a character that is not correct." });
           continue;
         }
+        let early: CommitAnswer | null = null;
         if (now - at < minAge) {
-          rows.push({ ...r, state: "young", detail: "The release run can still make this tag." });
-          continue;
+          early = await commitOf(p.name, version, doc.versions?.[version] ?? {});
+          if (!("commit" in early) || !(await releaseRunsDone(early.commit))) {
+            rows.push({ ...r, state: "young", detail: "The release run can still make this tag." });
+            continue;
+          }
         }
         const job = await readTagJob();
         if (job !== true) {
           rows.push(job === false ? { ...r, state: "no-tag-job", detail: "The release.yml of this repository has no tag job." } : { ...r, state: "error", detail: job });
           continue;
         }
-        const answer = await commitOf(p.name, version, doc.versions?.[version] ?? {});
+        const answer = early ?? (await commitOf(p.name, version, doc.versions?.[version] ?? {}));
         if ("state" in answer) {
           rows.push({ ...r, state: answer.state, detail: answer.detail });
           continue;
