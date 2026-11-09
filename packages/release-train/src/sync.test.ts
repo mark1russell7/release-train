@@ -581,6 +581,56 @@ describe("apply with the template sync", () => {
     });
   });
 
+  describe("when a new template commit arrives while old sync pull requests wait", () => {
+    // old-a, old-b and old-c have a sync pull request with its last push on 11-08 and a conflict. The template commit of
+    // 11-09 20:00Z gives a sync to the five repositories with no pull request. The run starts at 20:40Z, in a sync slot.
+    const olds = ["old-a", "old-b", "old-c"];
+    const news = ["new-1", "new-2", "new-3", "new-4", "new-5"];
+    const all = [...news, ...olds];
+    const at = Date.parse("2026-11-09T20:40:00Z");
+    const syncSlot = Math.floor(at / RUN_MS) % 2 === 1 ? Math.floor(at / RUN_MS) : Math.floor(at / RUN_MS) + 1;
+    const snaps = (): RepoSnapshot[] => all.map((name) => ({ name, private: false, defaultBranch: "main", manifests: [{ path: "", manifest: { name, private: true } }], lockKind: "pnpm", resolved: {}, warnings: [] }));
+    const run = async (pushed: Record<string, string>, maxPushes: number, templateDate: string | null) => {
+      const routes: Record<string, Handler> = {};
+      for (const repo of all) Object.assign(routes, repoRoutes(repo));
+      olds.forEach((repo, i) => {
+        const n = 20 + i;
+        const pr = { number: n, html_url: `u${n}`, node_id: `PR_${n}`, title: "t", body: "x <!-- release-train:fingerprint=000000000000 -->", state: "open", auto_merge: null, updated_at: "2026-11-09T20:30:00Z", head: { sha: `h${n}`, ref: SYNC_BRANCH }, base: { ref: "main" }, labels: [{ name: TRAIN_LABEL }] };
+        routes[`GET ${base}/${repo}/pulls`] = (_b, u) => [200, u.searchParams.get("state") === "open" ? [pr] : []];
+        routes[`GET ${base}/${repo}/pulls/${n}`] = () => [200, { ...pr, mergeable: false }];
+        routes[`GET ${base}/${repo}/commits/h${n}`] = () => [200, { commit: { committer: { date: pushed[repo] } } }];
+      });
+      if (templateDate) routes[`GET ${base}/template/commits/${NEW}`] = () => [200, { commit: { committer: { date: templateDate } } }];
+      const { gh } = server(routes);
+      const up = syncer([]);
+      const p = plan(buildGraph({ owner: OWNER, repos: snaps(), npm: {}, now: new Date("2026-01-01T00:00:00Z") }));
+      await apply({ owner: OWNER, plan: p, gh, updater: noUpdates, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes, now: new Date(syncSlot * RUN_MS) });
+      return up.jobs.map((j) => j.repo);
+    };
+    const old = "2026-11-08T11:38:00Z";
+
+    it("pushes the old pull requests first, and the new repositories after them", async () => {
+      const first = await run({ "old-a": old, "old-b": old, "old-c": old }, 5, "2026-11-09T20:00:00Z");
+      expect(first.slice(0, 3).sort()).toEqual(olds);
+      expect(first).toHaveLength(5);
+      expect(first.slice(3).every((r) => news.includes(r))).toBe(true);
+    });
+
+    it("gives each old pull request its push within 2 runs, with 2 pushes in each run", async () => {
+      const first = await run({ "old-a": old, "old-b": "2026-11-08T11:39:00Z", "old-c": "2026-11-08T11:40:00Z" }, 2, "2026-11-09T20:00:00Z");
+      expect(first).toEqual(["old-a", "old-b"]);
+      // The next run: old-a and old-b have the push of the first run. The five new repositories still have no pull request.
+      const later = new Date((syncSlot + 2) * RUN_MS - RUN_MS).toISOString();
+      const second = await run({ "old-a": later, "old-b": later, "old-c": "2026-11-08T11:40:00Z" }, 2, "2026-11-09T20:00:00Z");
+      expect(second[0]).toBe("old-c");
+    });
+
+    it("puts a new repository after the old pull requests also when the template commit is not readable", async () => {
+      const first = await run({ "old-a": old, "old-b": old, "old-c": old }, 3, null);
+      expect(first.sort()).toEqual(olds);
+    });
+  });
+
   it("gives the same waiting state in a dry run, and pushes nothing", async () => {
     const { gh, calls } = server(repoRoutes("demo-repo"));
     const up = syncer([]);

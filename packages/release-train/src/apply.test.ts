@@ -887,6 +887,8 @@ describe("the pace of the update pushes", () => {
     // An item with no pull request, or with no time that parses, goes first in the order of the list.
     expect(longestWaitFirst(["x", "y", "z", "w"], (k) => times[k])).toEqual(["y", "w", "z", "x"]);
     expect(longestWaitFirst([], () => undefined)).toEqual([]);
+    // With since, an item with no pull request waits from that time: after z and before x.
+    expect(longestWaitFirst(["x", "y", "z"], (k) => times[k], "2026-01-01T12:00:00Z")).toEqual(["z", "y", "x"]);
   });
 
   it("keeps the place of a pull request that gets a label or an edit with no push", async () => {
