@@ -242,6 +242,33 @@ function token(): string | null {
   }
 }
 
+/**
+ * This function gives the key of the hashes of the private names, from the environment.
+ * It refuses a PEM private key, because a public hash must not depend on the key that signs the app tokens.
+ * In GitHub Actions, it refuses an empty key: a hash with no key gives each private name to a dictionary attack.
+ */
+export function hashKey(env: Readonly<Record<string, string | undefined>> = process.env): string {
+  const key = env["RELEASE_TRAIN_HASH_KEY"] ?? "";
+  if (/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(key)) {
+    throw new Error("RELEASE_TRAIN_HASH_KEY holds a PEM private key. Give it a separate random key.");
+  }
+  if (key === "" && env["GITHUB_ACTIONS"] === "true") {
+    throw new Error("RELEASE_TRAIN_HASH_KEY is empty. In GitHub Actions, the hashes of the private names need a secret key.");
+  }
+  return key;
+}
+
+/** This function gives the hash key for a run, or null after it writes the reason. A run that shows the private names needs no key. */
+function runKey(o: Pick<CliOptions, "showPrivate">): string | null {
+  if (o.showPrivate) return "";
+  try {
+    return hashKey();
+  } catch (e) {
+    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
+    return null;
+  }
+}
+
 /** This function reads an author of the form "Name <email>". */
 export function parseAuthor(text: string | null): { name: string; email: string } {
   const lt = text?.indexOf("<") ?? -1;
@@ -326,7 +353,8 @@ async function runApply(o: CliOptions): Promise<number> {
     return 2;
   }
   const inActions = process.env["GITHUB_ACTIONS"] === "true";
-  const key = process.env["RELEASE_TRAIN_HASH_KEY"] ?? "";
+  const key = runKey(o);
+  if (key === null) return 2;
   const secrets = new Set<string>();
   const hide = (names: Iterable<string>): void => {
     for (const n of names) {
@@ -453,7 +481,8 @@ async function readLag(o: CliOptions): Promise<LagReport> {
 }
 
 async function runTags(o: CliOptions): Promise<number> {
-  const key = process.env["RELEASE_TRAIN_HASH_KEY"] ?? "";
+  const key = runKey(o);
+  if (key === null) return 2;
   const secrets = new Set<string>();
   const redact = (text: string): string => (o.showPrivate ? text : redactNames(text, secrets, key));
   const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);

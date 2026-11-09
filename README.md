@@ -293,6 +293,7 @@ GitHub refuses a change to a workflow file from an App without the permission Wo
 - A manual start has the inputs `dry-run` (default true), `only`, `cascade` and `urgent`. Give only public names to `only`, `cascade` and `urgent`, because GitHub shows the inputs.
 - The schedule and `repository_dispatch` change repositories only when `LIVE` in `train.yml` is `"true"`. It is `"true"` since 2026-10-25. Set it to `"false"` to stop the train.
 - The log, the step summary and the artifact `apply` give each private repository only as a count or a hash. The run also masks each private name in the log.
+- The hash uses the secret `RELEASE_TRAIN_HASH_KEY`, a separate random key. In Actions, the run stops when the key is empty. It also stops on a PEM private key.
 - After `apply`, the step "Wait for a release" waits up to 15 minutes for a version in flight.
 - `CASCADE` in `train.yml` gives the value of `--cascade`.
 - The run starts release workflows only when `RELEASE_DISPATCH` in `train.yml` is `"true"`.

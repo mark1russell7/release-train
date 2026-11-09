@@ -94,7 +94,7 @@ jobs:
         id: apply
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_APP_KEY }}
+          RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_HASH_KEY }}
           EVENT: ${{ github.event_name }}
           INPUT_DRY: ${{ inputs.dry-run }}
           ONLY: ${{ inputs.only }}
