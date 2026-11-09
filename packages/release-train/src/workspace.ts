@@ -178,6 +178,9 @@ export const FIX_SINCE = "0.8.2";
 /** The root script that checks the API reports, and the report of a package when the repository names no other file. */
 export const API_SCRIPT = "check:api";
 
+/** The root script that the train starts after the install of each update. Its file changes go into the train commit. */
+export const UPDATE_SCRIPT = "release-train:update";
+
 /**
  * This function gives the arguments of `api-report` that write the reports that the script `check:api` compares.
  * A script `api-report check <folders and options>` gives `update` with the same folders and options. With no
@@ -499,6 +502,23 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
   };
 
   /**
+   * This function starts the root script `release-train:update` of the repository, after the install of the update. There a
+   * repository writes again the files that come from its installed dependencies. The version script starts only for a package
+   * with a new version, so an update inside the range wrote no such file (layout-contract #280, 11-09: a committed data file of
+   * the packing engine). The function gives the new files of the script, or the first error.
+   */
+  const updateScript = async (dir: string, u: RepoUpdate, e: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<{ ran: boolean; added: string[]; error: string | null }> => {
+    if (typeof readScripts(join(dir, "package.json"))?.[UPDATE_SCRIPT] !== "string") return { ran: false, added: [], error: null };
+    const untracked = async (): Promise<string[]> =>
+      (await run("git", ["ls-files", "--others", "--exclude-standard"], { cwd: dir, env: e })).stdout.split("\n").filter((file) => file !== "");
+    const known = new Set(await untracked());
+    await install();
+    const r = await run(u.lockKind === "npm" ? "npm" : "pnpm", ["run", UPDATE_SCRIPT], { cwd: dir, env: e });
+    if (r.code !== 0) return { ran: true, added: [], error: `The script ${UPDATE_SCRIPT} of package.json failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}` };
+    return { ran: true, added: (await untracked()).filter((file) => !known.has(file)), error: null };
+  };
+
+  /**
    * This function gives each file that the train changed the format of the repository, when the repository uses Prettier, so
    * its format check passes (crawler, 11-02: a line that conventions fix wrote was longer than the print width). Prettier reads
    * the configuration and the ignore file of the repository. The lockfiles do not change.
@@ -688,6 +708,10 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
         if (hooks.error !== null) return fail(hooks.error);
         if (hooks.ran.length > 0 && u.lockKind === "pnpm") await sh("pnpm", ["install", "--lockfile-only"], "pnpm install --lockfile-only");
         if (hooks.ran.length > 0 && u.lockKind === "npm") await sh("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], "npm install --package-lock-only");
+        // The root script release-train:update writes again the files that come from the installed dependencies.
+        const own = await updateScript(dir, u, fixEnv, install);
+        if (own.error !== null) return fail(own.error);
+        added.push(...own.added);
 
         // 3. A new version of conventions brings the fixes of its rules. The train writes them in the same commit, so a new
         // rule does not block the update for a break that a script can fix. CI of the pull request checks the result.
@@ -719,6 +743,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           ...u.items.map((i) => `- ${i.dep} in ${i.path || "."}: ${i.newRange ? `${i.range} -> ${i.newRange}` : i.range}, lockfile -> ${after[i.path]?.[i.dep] ?? i.to}`),
           ...releases.map((r) => `- release ${r.name}: ${r.from} -> ${r.to} (${r.type}, ${r.via === "changeset" ? "changeset" : "package.json"})`),
           ...(hooks.ran.length > 0 ? [`- version script: ${hooks.ran.map((p) => `${p}/package.json`).join(", ")}`] : []),
+          ...(own.ran ? [`- script ${UPDATE_SCRIPT} of package.json`] : []),
           ...(settingsChanged ? [`- pnpm-workspace.yaml: ${[...(u.ageScopes ?? []), ...urgentAge].join(", ")} in minimumReleaseAgeExclude`] : []),
           ...(fixed.length > 0 ? [`- conventions fix: ${fixed.join(", ")}`] : []),
           ...(reverted.length > 0 ? [`- conventions fix removed, it broke ${fixStep ?? "typecheck"}: ${reverted.join(", ")}`] : []),
