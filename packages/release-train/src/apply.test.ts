@@ -6,6 +6,7 @@ import {
   BLOCKED_LABEL,
   BUSY_LIMIT,
   CLAUDE_LINE,
+  COMPARE_FILES_MAX,
   RUN_MS,
   TRAIN_BRANCH,
   TRAIN_LABEL,
@@ -415,6 +416,48 @@ describe("apply", () => {
     const unknown = await run(() => [404, { message: "Not Found" }]);
     expect(unknown.r.results[0]?.detail).toMatch(/did not compare the branch with main/);
     expect(unknown.calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  it("waits with a green merge that changes workflow files while a release run of main is not done, so GitHub does not refuse the tag", async () => {
+    const run = async (files: { filename: string }[], releaseRuns: Handler | null) => {
+      const s = server({
+        ...green,
+        [`GET ${base}/secret-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo")] : []],
+        [`GET ${base}/secret-repo/pulls/7`]: () => [200, { ...pull(7, "secret-repo"), mergeable: true }],
+        [`PATCH ${base}/secret-repo/pulls/7`]: (b) => [200, { ...pull(7, "secret-repo"), ...b }],
+        [`GET ${base}/secret-repo`]: meta,
+        [`POST ${base}/secret-repo/labels`]: () => [201, {}],
+        [`GET ${base}/secret-repo/compare/main...sha7`]: () => [200, { behind_by: 0, files }],
+        ...(releaseRuns ? { [`GET ${base}/secret-repo/actions/workflows/release.yml/runs`]: releaseRuns } : {}),
+        [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
+        [`DELETE ${base}/secret-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+      });
+      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"] });
+      return { r, calls: s.calls };
+    };
+    const wf = [{ filename: ".github/workflows/ci.yml" }];
+    const runs = (...status: string[]): Handler => (_b, u) => [200, { workflow_runs: u.searchParams.get("branch") === "main" ? status.map((x) => ({ status: x })) : [] }];
+    // A queued release run holds the merge.
+    const queued = await run(wf, runs("queued", "completed"));
+    expect(queued.r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+    expect(queued.r.results[0]?.detail).toMatch(/1 release run\(s\) of main are not done/);
+    expect(queued.calls.some((c) => c.method === "PUT")).toBe(false);
+    // A run that waits for an approval holds it too.
+    expect((await run(wf, runs("waiting"))).calls.some((c) => c.method === "PUT")).toBe(false);
+    // An error of the read holds it for this run.
+    const unread = await run(wf, () => [500, { message: "Server Error" }]);
+    expect(unread.r.results[0]?.detail).toMatch(/did not list the release runs/);
+    expect(unread.calls.some((c) => c.method === "PUT")).toBe(false);
+    // Each run done, or no release workflow: the merge goes.
+    expect((await run(wf, runs("completed"))).r.results[0]).toMatchObject({ state: "merged" });
+    expect((await run(wf, null)).r.results[0]).toMatchObject({ state: "merged" });
+    // A full file list of the compare API can hide a workflow file, so it holds too.
+    const many = Array.from({ length: COMPARE_FILES_MAX }, (_, i) => ({ filename: `src/f${i}.ts` }));
+    expect((await run(many, runs("in_progress"))).calls.some((c) => c.method === "PUT")).toBe(false);
+    // No workflow file: the release runs are not read, and the merge goes.
+    const plain = await run([{ filename: "package.json" }, { filename: "pnpm-lock.yaml" }], runs("queued"));
+    expect(plain.r.results[0]).toMatchObject({ state: "merged" });
+    expect(plain.calls.some((c) => c.path.endsWith("/actions/workflows/release.yml/runs"))).toBe(false);
   });
 
   it("waits with a green merge while a workflow run of another branch is not done, but not longer than YIELD_MAX_HOURS", async () => {

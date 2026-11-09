@@ -30,6 +30,12 @@ const CLOSED_MARK = "<!-- release-train:closed-by-train -->";
  */
 export const YIELD_MAX_HOURS = 24;
 
+/** The folder of the workflow files. A merge that changes a file in it waits while a release run of the repository is not done. */
+export const WORKFLOWS_DIR = ".github/workflows/";
+
+/** The most files that the compare API of GitHub lists. A list of this length can leave out files. */
+export const COMPARE_FILES_MAX = 300;
+
 /** One dependency change of an update. */
 export interface UpdateItem {
   path: string;
@@ -862,9 +868,24 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    * This function gives the number of commits of the default branch that are not in `sha`, or null when GitHub does not
    * answer. A branch that is behind has CI on an old base. A merge then can give a lockfile with no entry for a version.
    */
-  const behindBy = async (repo: string, sha: string, defaultBranch: string): Promise<number | null> => {
-    const res = await gh.request<{ behind_by: number }>("GET", `${base}/${repo}/compare/${encodeURIComponent(defaultBranch)}...${sha}`);
-    return typeof res.data?.behind_by === "number" ? res.data.behind_by : null;
+  const compareOf = async (repo: string, sha: string, defaultBranch: string): Promise<{ behind: number; workflows: boolean } | null> => {
+    const res = await gh.request<{ behind_by: number; files?: { filename: string }[] }>("GET", `${base}/${repo}/compare/${encodeURIComponent(defaultBranch)}...${sha}`);
+    if (typeof res.data?.behind_by !== "number") return null;
+    const files = res.data.files ?? [];
+    // GitHub gives at most COMPARE_FILES_MAX files. A longer list can hide a workflow file, so it counts as one.
+    return { behind: res.data.behind_by, workflows: files.length >= COMPARE_FILES_MAX || files.some((f) => f.filename.startsWith(WORKFLOWS_DIR)) };
+  };
+  const behindBy = async (repo: string, sha: string, defaultBranch: string): Promise<number | null> => (await compareOf(repo, sha, defaultBranch))?.behind ?? null;
+
+  /**
+   * This function counts the runs of the release workflow on the default branch that are not done (queued, waiting or in
+   * progress), or gives null when GitHub does not answer. A repository without a release workflow has none.
+   */
+  const releaseRunsOpen = async (repo: string, defaultBranch: string): Promise<number | null> => {
+    const res = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(defaultBranch)}&per_page=10`);
+    if (res.status === 404) return 0;
+    if (!res.ok || !res.data) return null;
+    return (res.data.workflow_runs ?? []).filter((r) => r.status !== "completed").length;
   };
 
   const ciOf = async (repo: string, sha: string): Promise<CiState> => {
@@ -910,10 +931,19 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         return { state: "unchanged", ci, detail: `CI is green, but ${others} workflow run(s) of other branches are not done. The train merges in a later run, so their result stays valid.` };
       }
       const main = meta?.default_branch ?? "main";
-      const behind = await behindBy(repo, pr.head.sha, main);
-      if (behind === null) return { state: "unchanged", ci, detail: `CI is green, but GitHub did not compare the branch with ${main}. The train does not merge it now.` };
-      if (behind > 0) {
-        return { state: "unchanged", ci, detail: `CI is green, but the branch is ${behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.` };
+      const cmp = await compareOf(repo, pr.head.sha, main);
+      if (cmp === null) return { state: "unchanged", ci, detail: `CI is green, but GitHub did not compare the branch with ${main}. The train does not merge it now.` };
+      if (cmp.behind > 0) {
+        return { state: "unchanged", ci, detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.` };
+      }
+      // A release run tags the commit of its version. When a merge changes a workflow file before the tag, GitHub refuses the
+      // tag (HTTP 403): the token of a workflow cannot write workflow files. So a change of a workflow file waits for the run.
+      if (cmp.workflows) {
+        const open = await releaseRunsOpen(repo, main);
+        if (open === null) return { state: "unchanged", ci, detail: `CI is green and the branch changes workflow files, but GitHub did not list the release runs of ${main}. The train does not merge it now.` };
+        if (open > 0) {
+          return { state: "unchanged", ci, detail: `CI is green, but the branch changes workflow files and ${open} release run(s) of ${main} are not done. The train merges after the release, so GitHub does not refuse its tag.` };
+        }
       }
       const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {

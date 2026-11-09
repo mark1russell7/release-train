@@ -61,6 +61,7 @@ The site at <https://mark1russell7.github.io/release-train/> is a plan explorer.
 - The body of the pull request tells each change, the reason, and each other lockfile change. It has the label `release-train`.
 - Only the train merges its pull requests. It turns off the native auto-merge of GitHub, and it merges a green pull request in a later run.
 - Before a merge, the train compares the branch with the default branch. A branch that is behind gets a new build from the default branch, with a new install, and CI runs again. A merge of two lockfile changes can give a lockfile with no entry for a version, with no git conflict.
+- A branch can change a file in `.github/workflows/`. Then it does not merge while a run of the release workflow on the default branch is queued, waits or is in progress. The run tags the commit of its version, and GitHub refuses that tag (HTTP 403) when a merge changed a workflow file before it. The train merges in a later run, after the release.
 - When CI fails, the pull request stays open with the label `release-train:blocked`.
 - The train closes its pull request when the plan has no update for the repository.
 - The train does not open a pull request again when a person closed one with the same changes.
