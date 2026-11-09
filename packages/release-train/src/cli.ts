@@ -16,7 +16,7 @@ import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
 import { awaitRelease } from "./release.ts";
 import { takeReplaced } from "./urgent.ts";
-import { SYNC_RULES, apiFiles, syncFacts, syncRepo, syncSummary } from "./sync.ts";
+import { SYNC_RULES, apiFiles, renovateDays, syncFacts, syncRepo, syncSummary } from "./sync.ts";
 import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
 import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tagsSummary, validDate } from "./tags.ts";
 import { gitUpdater } from "./workspace.ts";
@@ -308,11 +308,14 @@ async function planSync(p: Plan, tok: string | null, workflows: WorkflowsMode, l
     return null;
   }
   const pending = pendingVersions(p);
+  const read = await pool(p.repos, 6, async (r) => ({ repo: r.name, files: await apiFiles(gh, p.owner, r.name) }));
+  const filesOf = new Map(read.map((x) => [x.repo, x.files]));
+  const runFacts = { ...facts, renovateDay: await renovateDays(read, facts) };
   const items = await pool(p.repos, 6, async (r): Promise<SyncPlanItem | null> => {
-    const files = await apiFiles(gh, p.owner, r.name);
+    const files = filesOf.get(r.name) ?? null;
     if (!files) return null;
     const releaseInFlight = pending.has(r.name) || (r.pendingChangesets ?? 0) > 0;
-    const result = await syncRepo(files, { ...facts, repo: r.name, releaseInFlight }, SYNC_RULES, workflows !== "no");
+    const result = await syncRepo(files, { ...runFacts, repo: r.name, releaseInFlight }, SYNC_RULES, workflows !== "no");
     return { repo: r.name, private: r.private, result };
   });
   return items.filter((i): i is SyncPlanItem => i !== null);

@@ -18,6 +18,8 @@ import {
   pinSurface,
   pinsOf,
   pinsStale,
+  renovateDays,
+  renovateInput,
   syncFacts,
   syncRepo,
   workflowsRefused,
@@ -319,6 +321,50 @@ describe("callers", () => {
     expect(outcome(r, "callers")).toMatchObject({ state: "report", changes: [] });
     expect(outcome(r, "callers")?.needs).toHaveLength(2);
     expect(r.fingerprint).toBe("");
+  });
+});
+
+describe("renovate-day", () => {
+  const PRESET = `github>${OWNER}/template//renovate/default`;
+  const renovate = (extra: Record<string, unknown> = {}) => `${JSON.stringify({ $schema: "s", extends: [PRESET], ...extra }, null, 2)}\n`;
+
+  it("writes the day of the run into renovate.json, after extends", async () => {
+    const files = mem({ "renovate.json": renovate({ labels: ["deps"] }) });
+    const r = await syncRepo(files, facts({ renovateDay: () => "thursday" }));
+    expect(outcome(r, "renovate-day")?.state).toBe("applied");
+    const text = r.writes["renovate.json"] ?? "";
+    expect(Object.keys(JSON.parse(text) as object)).toEqual(["$schema", "extends", "schedule", "labels"]);
+    expect(JSON.parse(text)).toMatchObject({ schedule: ["before 6am on thursday"] });
+    expect(text.endsWith("}\n")).toBe(true);
+  });
+
+  it("changes nothing when the day is already there, with no day, or for a schedule of another form", async () => {
+    const day = facts({ renovateDay: () => "monday" });
+    expect(outcome(await syncRepo(mem({ "renovate.json": renovate({ schedule: ["before 6am on monday"] }) }), day), "renovate-day")).toBeUndefined();
+    expect(outcome(await syncRepo(mem({ "renovate.json": renovate() }), facts()), "renovate-day")).toBeUndefined();
+    expect(outcome(await syncRepo(mem({ "renovate.json": renovate({ schedule: ["every weekend"] }) }), day), "renovate-day")).toBeUndefined();
+    expect(outcome(await syncRepo(mem({ "renovate.json": `{"extends": ["config:recommended"]}\n` }), day), "renovate-day")).toBeUndefined();
+    expect(outcome(await syncRepo(mem({ "renovate.json": renovate() }), facts({ repo: "template", renovateDay: () => "friday" })), "renovate-day")).toBeUndefined();
+  });
+
+  it("weighs a repository by the jobs of one pull request, with the shared workflows of the template", async () => {
+    const shared = "on: workflow_call\njobs:\n  checks:\n    strategy:\n      matrix:\n        os: [a, b]\n  changesets: {}\n";
+    const f = facts({ readTemplate: async (p) => (p === ".github/workflows/reusable-ci.yml" ? shared : null) });
+    const files = mem({ "renovate.json": renovate(), ".github/workflows/ci.yml": `on: pull_request\n${ci(NEW)}` });
+    expect(await renovateInput("demo-repo", files, f)).toEqual({ repo: "demo-repo", weight: 3, current: null });
+    expect(await renovateInput("template", files, f)).toEqual({ repo: "template", weight: 3, current: "monday", fixed: true });
+    expect(await renovateInput("demo-repo", mem({ ".github/workflows/ci.yml": ci(NEW) }), f)).toBeNull();
+  });
+
+  it("spreads the repositories of a run over the days", async () => {
+    const repos = Array.from({ length: 14 }, (_, i) => ({
+      repo: `repo-${i}`,
+      files: mem({ "renovate.json": renovate(), ".github/workflows/ci.yml": "on: pull_request\njobs:\n  a: {}\n" }),
+    }));
+    const dayOf = await renovateDays([...repos, { repo: "empty-repo", files: null }], facts());
+    const days = repos.map((r) => dayOf(r.repo));
+    expect(new Set(days).size).toBe(7);
+    expect(dayOf("empty-repo")).toBeNull();
   });
 });
 
