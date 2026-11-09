@@ -879,7 +879,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
 
   /**
    * This function counts the runs of the release workflow on the default branch that are not done (queued, waiting or in
-   * progress), or gives null when GitHub does not answer. A repository without a release workflow has none.
+   * progress). It gives null when GitHub does not answer. A repository without a release workflow has none.
    */
   const releaseRunsOpen = async (repo: string, defaultBranch: string): Promise<number | null> => {
     const res = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(defaultBranch)}&per_page=10`);
