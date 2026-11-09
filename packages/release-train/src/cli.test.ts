@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { applyHolding, paceOptions, parseArgs } from "./cli.ts";
+import { applyHolding, hashKey, paceOptions, parseArgs } from "./cli.ts";
 
 const workflow = readFileSync(new URL("../../../.github/workflows/train.yml", import.meta.url), "utf8");
 
@@ -90,5 +90,23 @@ describe("the urgent input of train.yml", () => {
 
   it("gives a run from the schedule or a released event no urgent names", () => {
     for (const EVENT of ["schedule", "repository_dispatch"]) expect(parseArgs(argsOfStep({ EVENT })).urgent).toBeNull();
+  });
+});
+
+describe("the key of the private-name hashes", () => {
+  it("comes from its own secret, not from the private key of the app", () => {
+    expect(workflow).toContain("RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_HASH_KEY }}");
+    expect(workflow).not.toContain("RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_APP_KEY }}");
+  });
+
+  it("refuses an empty key in GitHub Actions and a PEM key everywhere", () => {
+    expect(hashKey({ RELEASE_TRAIN_HASH_KEY: "a-random-key", GITHUB_ACTIONS: "true" })).toBe("a-random-key");
+    // A local run can hash with no key: its output stays on the machine
+    expect(hashKey({})).toBe("");
+    expect(() => hashKey({ GITHUB_ACTIONS: "true" })).toThrow("RELEASE_TRAIN_HASH_KEY is empty");
+    expect(() => hashKey({ GITHUB_ACTIONS: "true", RELEASE_TRAIN_HASH_KEY: "" })).toThrow("RELEASE_TRAIN_HASH_KEY is empty");
+    const pem = ["-----BEGIN RSA PRIVATE KEY-----", "MIIE", "-----END RSA PRIVATE KEY-----"].join("\n");
+    expect(() => hashKey({ RELEASE_TRAIN_HASH_KEY: pem })).toThrow("PEM private key");
+    expect(() => hashKey({ RELEASE_TRAIN_HASH_KEY: pem.replace(" RSA", "") })).toThrow("PEM private key");
   });
 });
