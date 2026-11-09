@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { FetchFn } from "./collect.ts";
 import type { GitHub } from "./github.ts";
+import { matchWorkspaces, parsePnpmWorkspace } from "./parse.ts";
 
 /** The branch of each template sync pull request of the release train. */
 export const SYNC_BRANCH = "release-train/template";
@@ -259,6 +260,7 @@ interface RootManifest {
   name?: string;
   private?: boolean;
   scripts?: Record<string, string>;
+  dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
 }
 
@@ -382,13 +384,62 @@ const templateCliRule: SyncRule = {
   },
 };
 
-/** The callers of the shared workflows that each repository must have. Rule 4 reports each one that is not correct. */
+/** The coverage provider of Vitest that the action `coverage` of the template needs. */
+export const COVERAGE_PROVIDER = "@vitest/coverage-v8";
+
+/**
+ * Rule 4: a pnpm repository can have a package with a test script that starts Vitest. Then the root `devDependencies`
+ * get the coverage provider, at the range of its Vitest. The action `coverage` of the template finds the provider in the package
+ * or in the root. Without it, the action skips each package, and main has no coverage report (atlas CA19, 11-09).
+ */
+const coverageRule: SyncRule = {
+  id: "coverage",
+  why: "The action `coverage` of the shared CI measures a package only when `@vitest/coverage-v8` is installed.",
+  except: [TEMPLATE_REPO],
+  async check(files) {
+    if (!files.paths.includes("pnpm-lock.yaml")) return null;
+    const root = await readJson(files, "package.json");
+    if (!root) return null;
+    const has = (m: RootManifest): boolean => Boolean(m.devDependencies?.[COVERAGE_PROVIDER] ?? m.dependencies?.[COVERAGE_PROVIDER]);
+    if (has(root.value)) return null;
+    const vitestOf = (m: RootManifest): string | undefined => m.devDependencies?.["vitest"] ?? m.dependencies?.["vitest"];
+    const ws = await files.read("pnpm-workspace.yaml");
+    const dirs = files.paths.filter((p) => p.endsWith("/package.json")).map((p) => p.slice(0, -"/package.json".length));
+    const manifests = ["package.json", ...matchWorkspaces(ws === null ? [] : parsePnpmWorkspace(ws), dirs).map((d) => `${d}/package.json`)];
+    const users: { path: string; vitest: string | undefined; has: boolean }[] = [];
+    for (const path of manifests) {
+      const m = path === "package.json" ? root : await readJson(files, path);
+      if (m && /\bvitest\b/.test(m.value.scripts?.["test"] ?? "")) users.push({ path, vitest: vitestOf(m.value), has: has(m.value) });
+    }
+    if (users.length === 0 || users.every((u) => u.has)) return null;
+    const ranges = [...new Set([vitestOf(root.value), ...users.map((u) => u.vitest)].filter((r): r is string => typeof r === "string"))];
+    const range = vitestOf(root.value) ?? (ranges.length === 1 ? ranges[0] : undefined);
+    if (range === undefined) {
+      const why = ranges.length === 0 ? "no package.json names a range of `vitest`" : `the packages name ${ranges.length} ranges of \`vitest\` (${ranges.join(", ")})`;
+      return { changes: [], needs: [`\`${COVERAGE_PROVIDER}\` is not added, because ${why}. Add it at the range of Vitest.`] };
+    }
+    if (!/^[\^~]?\d/.test(range)) return { changes: [], needs: [`\`${COVERAGE_PROVIDER}\` is not added, because the range of \`vitest\` is \`${range}\`, not a version range.`] };
+    const m = structuredClone(root.value);
+    const dev = m.devDependencies ?? {};
+    const keys = Object.keys(dev);
+    const sorted = keys.every((k, i) => i === 0 || (keys[i - 1] as string).localeCompare(k) <= 0);
+    dev[COVERAGE_PROVIDER] = range;
+    m.devDependencies = sorted ? Object.fromEntries(Object.entries(dev).sort(([a], [b]) => a.localeCompare(b))) : dev;
+    const count = users.filter((u) => !u.has).length;
+    return {
+      changes: [`The root \`devDependencies\` get \`${COVERAGE_PROVIDER}@${range}\`, the range of Vitest, for ${count} ${count === 1 ? "package" : "packages"} with Vitest tests. The lockfile changes.`],
+      edit: { write: { "package.json": formatJson(root.text, m) }, install: true },
+    };
+  },
+};
+
+/** The callers of the shared workflows that each repository must have. Rule 5 reports each one that is not correct. */
 export const CALLERS: readonly { file: string; shared: string }[] = [
   { file: "release.yml", shared: "reusable-release-build.yml" },
   { file: "ci.yml", shared: "reusable-ci.yml" },
 ];
 
-/** Rule 4: a report of each workflow of `CALLERS` that does not use its shared workflow. It changes no file. */
+/** Rule 5: a report of each workflow of `CALLERS` that does not use its shared workflow. It changes no file. */
 const callersRule: SyncRule = {
   id: "callers",
   why: "The standard workflows call the shared workflows of the template (`CI.md` of the template).",
@@ -405,7 +456,7 @@ const callersRule: SyncRule = {
 };
 
 /** The sync rules, in the sequence of their application. A later rule reads the files after the changes of the earlier rules. */
-export const SYNC_RULES: readonly SyncRule[] = [pinsRule, releaseScriptsRule, templateCliRule, callersRule];
+export const SYNC_RULES: readonly SyncRule[] = [pinsRule, releaseScriptsRule, templateCliRule, coverageRule, callersRule];
 
 function isWorkflowPath(p: string): boolean {
   return p === ".github" || p === ".github/workflows" || p.startsWith(".github/workflows/");
