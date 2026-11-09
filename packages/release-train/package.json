@@ -15,7 +15,7 @@
     "@mark1russell7/cue": "github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8",
     "@types/node": "^26.6.4",
     "@types/semver": "^7.8.0",
-    "@vitest/coverage-v8": "5.0.5",
+    "@vitest/coverage-v8": "5.1.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"
   },
