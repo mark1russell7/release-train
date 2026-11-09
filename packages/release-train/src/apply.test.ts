@@ -17,6 +17,7 @@ import {
   bodyFingerprint,
   ciState,
   latestRuns,
+  longestWaitFirst,
   prBody,
   publicReport,
   rotate,
@@ -681,6 +682,8 @@ const slot = (n: number): Date => new Date(n * RUN_MS);
 /** A GitHub that remembers the open pull requests of the train, so one run sees the pull requests of an earlier run. */
 function memory(names: readonly string[]) {
   const prs = new Map<string, ReturnType<typeof pull>>();
+  /** The committer date of the head commit of each pull request. A repository with no date gives HTTP 404. */
+  const pushed = new Map<string, string>();
   const routes: Record<string, Handler> = {};
   names.forEach((name, i) => {
     const n = 10 + i;
@@ -701,8 +704,12 @@ function memory(names: readonly string[]) {
     routes[`GET ${base}/${name}/compare/main...sha${n}`] = () => [200, { behind_by: 0 }];
     routes[`GET ${base}/${name}/commits/sha${n}/check-runs`] = () => [200, { check_runs: [{ status: "in_progress", conclusion: null }] }];
     routes[`GET ${base}/${name}/commits/sha${n}/status`] = () => [200, { state: "pending", total_count: 0 }];
+    routes[`GET ${base}/${name}/commits/sha${n}`] = () => {
+      const date = pushed.get(name);
+      return date ? [200, { commit: { committer: { date } } }] : [404, { message: "Not Found" }];
+    };
   });
-  return { ...server(routes), prs };
+  return { ...server(routes), prs, pushed };
 }
 
 /** An updater that pushes a branch one time. After it, the branch has the changes, as with the real updater. */
@@ -864,6 +871,39 @@ describe("the pace of the update pushes", () => {
     expect(up.seen.map((u) => u.repo).sort()).toEqual(names);
     expect(rotate(["a", "b", "c"], 4)).toEqual(["b", "c", "a"]);
     expect(rotate([], 4)).toEqual([]);
+  });
+
+  it("pushes first the open pull requests that waited longest, not only the start of the rotation", async () => {
+    const m = memory(names);
+    // a-repo has the newest push and e-repo the oldest. The rotation of slot 0 starts at a-repo.
+    names.forEach((name, i) => {
+      m.prs.set(name, pull(10 + i, name));
+      m.pushed.set(name, `2026-01-0${9 - i}T00:00:00Z`);
+    });
+    const up = updater();
+    await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 2, now: slot(0) });
+    expect(up.seen.map((u) => u.repo)).toEqual(["e-repo", "d-repo"]);
+    const times: Record<string, string> = { x: "2026-01-02T00:00:00Z", z: "2026-01-01T00:00:00Z", w: "not a time" };
+    // An item with no pull request, or with no time that parses, goes first in the order of the list.
+    expect(longestWaitFirst(["x", "y", "z", "w"], (k) => times[k])).toEqual(["y", "w", "z", "x"]);
+    expect(longestWaitFirst([], () => undefined)).toEqual([]);
+  });
+
+  it("keeps the place of a pull request that gets a label or an edit with no push", async () => {
+    const m = memory(names);
+    // e-repo has the oldest push. An edit with no push (a label, the auto-merge switch) gave it the newest updated_at.
+    names.forEach((name, i) => {
+      m.prs.set(name, pull(10 + i, name, { updated_at: name === "e-repo" ? "2026-02-01T00:00:00Z" : "2026-01-20T00:00:00Z" }));
+      m.pushed.set(name, name === "e-repo" ? "2026-01-01T00:00:00Z" : "2026-01-05T00:00:00Z");
+    });
+    const up = updater();
+    await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 1, now: slot(0) });
+    expect(up.seen.map((u) => u.repo)).toEqual(["e-repo"]);
+    // With no readable commit, the time is updated_at. Then e-repo is the last.
+    m.pushed.clear();
+    up.seen.length = 0;
+    await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 1, now: slot(0) });
+    expect(up.seen.map((u) => u.repo)).toEqual(["a-repo"]);
   });
 
   describe("and the waves", () => {

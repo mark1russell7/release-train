@@ -463,6 +463,24 @@ export function rotate<T>(list: readonly T[], slot: number): T[] {
 }
 
 /**
+ * This function puts first the items whose open pull request had its last push longest ago. The caller gives that time:
+ * the train uses the committer date of the head commit, because the train makes a new commit for each push. A pushed
+ * pull request goes to the end of the next run. Thus a repository far from the start of the rotation also gets a push.
+ * The rotation moves one place in each run, but a run pushes up to `MAX_PUSHES` branches.
+ *
+ * An item with no time goes first, in the order of the list. Each such item gets its pull request in a run,
+ * and then it has a time, so it cannot stop the other items for ever.
+ */
+export function longestWaitFirst<T>(list: readonly T[], pushedOf: (item: T) => string | undefined): T[] {
+  const at = (x: T): number => {
+    const t = pushedOf(x);
+    const ms = t === undefined ? Number.NaN : Date.parse(t);
+    return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
+  };
+  return list.map((x, i) => ({ x, i, t: at(x) })).sort((a, b) => a.t - b.t || a.i - b.i).map((e) => e.x);
+}
+
+/**
  * This function gives a counter of the jobs that run on the runners of the account. It counts the jobs `in_progress` of
  * each run `in_progress` of the repositories. It keeps a count for `ttlMs`, and gives null for a list that it cannot read.
  */
@@ -496,6 +514,7 @@ interface Pull {
   body: string | null;
   state: string;
   created_at?: string;
+  updated_at?: string;
   merged_at?: string | null;
   mergeable?: boolean | null;
   auto_merge?: unknown;
@@ -1052,6 +1071,19 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   };
 
   const pacing = o.maxPushes !== undefined || o.runnersBusy !== undefined;
+  /**
+   * This function gives the time of the last push of each open pull request of the train. That time is the committer date
+   * of its head commit. A label, a comment or a body edit changes `updated_at` but not this time. Thus an edit with no push
+   * keeps the place of the pull request in the order. When the commit is not readable, the time is `updated_at`.
+   */
+  const pushedAt = async (prs: Map<string, Pull>): Promise<Map<string, string | undefined>> => {
+    const times = new Map<string, string | undefined>();
+    await pool([...prs], o.concurrency ?? 6, async ([repo, pr]) => {
+      const res = await gh.request<{ commit?: { committer?: { date?: string } } }>("GET", `${base}/${repo}/commits/${pr.head.sha}`);
+      times.set(repo, res.data?.commit?.committer?.date ?? pr.updated_at);
+    });
+    return times;
+  };
   const slot = Math.floor((o.now ?? new Date()).getTime() / RUN_MS);
   let pushes = 0;
   /** This function gives the reason why a push waits for the limit of pushes, or null when it can push. */
@@ -1160,10 +1192,13 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    */
   async function updateAll(): Promise<void> {
     // A ready adoption waits for no action, so it is in wave 0, and the pace cannot put a later wave first. But a later wave
-    // can wait for it, so an adoption that another action waits for goes first, after the urgent adoptions. The other adoptions turn.
+    // can wait for it, so an adoption that another action waits for goes first, after the urgent adoptions. The other adoptions turn,
+    // and in each rank the open pull request that waited longest goes first.
     const waitedFor = new Set(o.plan.actions.flatMap((a) => a.dependsOn));
     const rank = (u: RepoUpdate): number => (isUrgent(u) ? 0 : waitedFor.has(u.actionId) ? 1 : 2);
-    for (const u of pacing ? rotate(sel.ready, slot).sort((x, y) => rank(x) - rank(y)) : sel.ready) {
+    const pushed = pacing ? await pushedAt(open) : new Map<string, string | undefined>();
+    const order = (list: readonly RepoUpdate[]): RepoUpdate[] => longestWaitFirst(rotate(list, slot), (u) => pushed.get(u.repo)).sort((x, y) => rank(x) - rank(y));
+    for (const u of pacing ? order(sel.ready) : sel.ready) {
       const existing = open.get(u.repo) ?? null;
       const urgent = isUrgent(u);
       const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length, ...(urgent ? { urgent } : {}), ...(u.held ? { held: u.held.items } : {}) };
@@ -1275,10 +1310,11 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         }
       : s.facts;
     const syncOpen = await openOf(SYNC_BRANCH);
+    const syncPushed = pacing ? await pushedAt(syncOpen) : new Map<string, string | undefined>();
     const pending = pendingVersions(o.plan, o.only ?? null);
     const changesets = new Set(o.plan.repos.filter((r) => (r.pendingChangesets ?? 0) > 0).map((r) => r.name));
     let workflows = s.workflows !== "no";
-    for (const repo of pacing ? rotate(scan, slot) : scan) {
+    for (const repo of pacing ? longestWaitFirst(rotate(scan, slot), (r) => syncPushed.get(r)) : scan) {
       const isPrivate = privateOf.get(repo) ?? true;
       const existing = syncOpen.get(repo) ?? null;
       const facts: SyncFacts = { ...facts0, repo, releaseInFlight: pending.has(repo) || changesets.has(repo) };
