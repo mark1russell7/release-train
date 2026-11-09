@@ -4,6 +4,7 @@ import { attestationsUrl, workflowProvenance, type Attestations } from "./attest
 import { DEP_TYPES } from "./types.ts";
 import type { DepType, LockKind, Manifest, ManifestFile, NpmInfo, Provenance, PullVersion, RepoSnapshot } from "./types.ts";
 import { manifestWorkspaces, matchWorkspaces, parseNpmLock, parsePnpmLock, parsePnpmWorkspace } from "./parse.ts";
+import type { NpmTimes } from "./state.ts";
 
 /** The `fetch` function that the collector uses. Tests give a mock. */
 export type FetchFn = (url: string, init?: RequestInit) => Promise<Response>;
@@ -26,6 +27,11 @@ export interface CollectOptions {
   onRepos?: (repos: readonly { name: string; private: boolean }[]) => void;
   /** These options control the retries of the GitHub reads. */
   retry?: RetryOptions;
+  /**
+   * The publish times of the last run, by npm name. The collector reads the full npm document of a package only when its
+   * `modified` time is not the time here. Absent: the collector reads each full document.
+   */
+  npmTimes?: Readonly<Record<string, NpmTimes>>;
 }
 
 /** The options of the retries of a GitHub read. Each time is in milliseconds. */
@@ -89,6 +95,10 @@ export interface Collected {
   repos: RepoSnapshot[];
   npm: Record<string, NpmInfo>;
   warnings: string[];
+  /** The publish times of each package that npm has, for the `npmTimes` option of the next run. */
+  npmTimes?: Record<string, NpmTimes>;
+  /** The count of the full npm documents that the collector read. */
+  fullReads?: number;
 }
 
 interface GhRepo {
@@ -390,6 +400,27 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     return workflowProvenance((await res.json()) as Attestations);
   };
 
+  // The publish times of a package. The abbreviated document has no times, so a changed package costs one full read.
+  const npmTimes: Record<string, NpmTimes> = {};
+  let fullReads = 0;
+  const timesOf = async (n: string, url: string, modified: string | null): Promise<Record<string, string> | undefined> => {
+    const known = modified === null ? undefined : opts.npmTimes?.[n];
+    if (known !== undefined && known.modified === modified) {
+      npmTimes[n] = known;
+      return Object.keys(known.times).length > 0 ? known.times : undefined;
+    }
+    fullReads++;
+    const res = await f(url, { headers: { accept: "application/json", "user-agent": "release-train" } });
+    if (!res.ok) {
+      warnings.push(`npm gave HTTP ${res.status} for the full document of ${n}.`);
+      return undefined;
+    }
+    const time = ((await res.json()) as { time?: Record<string, unknown> }).time ?? {};
+    const times = Object.fromEntries(Object.entries(time).filter((e): e is [string, string] => typeof e[1] === "string" && e[0] !== "created" && e[0] !== "modified"));
+    if (modified !== null) npmTimes[n] = { modified, times };
+    return Object.keys(times).length > 0 ? times : undefined;
+  };
+
   // Phase 3: the npm state of each package.
   const names = [...owned].sort();
   const infos = await pool(names, limit, async (n): Promise<[string, NpmInfo]> => {
@@ -400,12 +431,13 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
       warnings.push(`npm gave HTTP ${res.status} for ${n}.`);
       return [n, { exists: true, latest: null }];
     }
-    const doc = (await res.json()) as { "dist-tags"?: Record<string, string>; versions?: Record<string, Partial<Record<DepType, unknown>>> };
+    const doc = (await res.json()) as { "dist-tags"?: Record<string, string>; modified?: unknown; versions?: Record<string, Partial<Record<DepType, unknown>>> };
     const latest = doc["dist-tags"]?.["latest"] ?? null;
     const foreign = latest ? await isForeign(n, latest) : false;
     const known = doc.versions && typeof doc.versions === "object" ? { versions: Object.keys(doc.versions).sort(), latestDeps: runtimeRanges(latest ? doc.versions[latest] : undefined) } : {};
-    return [n, { exists: true, latest, foreign, ...known, ...(latest && !foreign ? { provenance: await provenanceOf(n, latest) } : {}) }];
+    const times = await timesOf(n, url, typeof doc.modified === "string" ? doc.modified : null);
+    return [n, { exists: true, latest, foreign, ...known, ...(latest && !foreign ? { provenance: await provenanceOf(n, latest) } : {}), ...(times ? { times } : {}) }];
   });
-  log(`packages: ${names.length}`);
-  return { repos: snaps.map((s) => s.snap), npm: Object.fromEntries(infos), warnings };
+  log(`packages: ${names.length}, full npm documents read: ${fullReads}`);
+  return { repos: snaps.map((s) => s.snap), npm: Object.fromEntries(infos), warnings, npmTimes, fullReads };
 }

@@ -89,6 +89,8 @@ export interface NpmInfo {
    * pnpm writes a real range in place of `workspace:` at the publish. Not set: a snapshot from before the field.
    */
   latestDeps?: Partial<Record<DepType, Record<string, string>>>;
+  /** The publish time of each version on npm, by version. Not set: npm gave no times, or a snapshot from before the field. */
+  times?: Record<string, string>;
 }
 
 /** The repository and the workflow file that built a version, from its provenance. */

@@ -16,6 +16,7 @@ import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
 import { awaitRelease } from "./release.ts";
 import { takeReplaced } from "./urgent.ts";
+import { needStarts, readState } from "./state.ts";
 import { SYNC_RULES, apiFiles, renovateDays, syncFacts, syncRepo, syncSummary } from "./sync.ts";
 import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
 import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tagsSummary, validDate } from "./tags.ts";
@@ -64,6 +65,8 @@ export interface CliOptions {
   gate: boolean;
   /** `lag`, `holds` and `apply`: the file of the holds. */
   holds?: string;
+  /** `apply`: the state file of the train. The run reads it at the start and writes it at the end. */
+  state?: string;
   /** `lag`: a saved report. The command then reads no repository. */
   fromReport?: string;
   /** `holds`: the earlier file of the holds. */
@@ -139,6 +142,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--write") o.write = true;
     else if (a === "--gate") o.gate = true;
     else if (a === "--holds") o.holds = value();
+    else if (a === "--state") o.state = value();
     else if (a === "--from-report") o.fromReport = value();
     else if (a === "--before") o.before = value();
     else if (a === "--package") o.packageName = value();
@@ -374,15 +378,20 @@ async function runApply(o: CliOptions): Promise<number> {
   };
   const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);
   try {
+    const read = o.state === undefined ? null : readState(o.state);
+    if (read?.note) log(read.note);
     const data = await collect({
       owner: o.owner,
       token: tok,
       log,
       onRepos: (repos) => hide(repos.filter((r) => r.private).map((r) => r.name)),
+      ...(read ? { npmTimes: read.state.npm } : {}),
     });
     const graph = buildGraph({ owner: o.owner, repos: data.repos, npm: data.npm, warnings: data.warnings });
     hide(graph.importers.filter((i) => i.repoPrivate).map((i) => i.name ?? ""));
     const p = plan(graph);
+    // Without a state file the train keeps no first sight of a need, so the run gives no start for a need with no publish time.
+    const starts = read ? needStarts(data.npm, read.state.seen, (o.now ?? new Date()).toISOString(), (k) => hashName(k, key)) : null;
     const gh = gitHub({ token: tok });
     const updater = gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author) });
     const report = await apply({
@@ -406,7 +415,13 @@ async function runApply(o: CliOptions): Promise<number> {
       holds: applyHolding(o, log),
       log,
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
+      ...(starts ? { needSince: (u) => starts.since(u.repo, u.items) } : {}),
     });
+    if (o.state !== undefined && starts) {
+      writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen() })}\n`);
+      const c = starts.counts();
+      log(`need starts: ${c.npm} from npm, ${c.state} from the state`);
+    }
     const out = o.showPrivate ? report : publicReport(report, key);
     const text = redact(applySummary(out));
     if (o.report) writeFileSync(o.report, `${redact(JSON.stringify(out, null, 2))}\n`);

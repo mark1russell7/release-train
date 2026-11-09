@@ -90,6 +90,15 @@ jobs:
         run: |
           id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
           echo "author=${SLUG}[bot] <${id}+${SLUG}[bot]@users.noreply.github.com>" >> "$GITHUB_OUTPUT"
+      # The state of the train: the npm publish times and the first sight of each need with no publish time
+      # (packages/release-train/src/state.ts). Each run saves a new cache, and the next run restores the newest one.
+      # The state has no private name. The runs of the group train do not overlap, so two runs do not write the state together.
+      - name: Restore the state of the train
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: train-state.json
+          key: train-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: train-state-
       - name: Plan and apply
         id: apply
         env:
@@ -105,7 +114,7 @@ jobs:
           WORKFLOWS: ${{ steps.wf.outcome == 'success' && 'yes' || 'no' }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ]; then dry=false; else dry=true; fi
-          args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR" --holds lag-holds.json)
+          args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR" --holds lag-holds.json --state train-state.json)
           if [ "$dry" != "false" ]; then args+=(--dry-run); else args+=(--take-replaced); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
           if [ -n "$URGENT" ]; then args+=(--urgent "$URGENT"); fi
@@ -113,6 +122,12 @@ jobs:
           args+=(--cascade "${INPUT_CASCADE:-$CASCADE}")
           if [ "$SYNC" = "true" ]; then args+=(--workflows "$WORKFLOWS"); else args+=(--no-sync); fi
           node packages/release-train/src/bin.ts "${args[@]}"
+      - name: Save the state of the train
+        if: always() && hashFiles('train-state.json') != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: train-state.json
+          key: train-state-${{ github.run_id }}-${{ github.run_attempt }}
       # When npm has a version in flight, the next wave starts at once with the released event.
       - name: Wait for a release
         if: steps.apply.outcome == 'success'
