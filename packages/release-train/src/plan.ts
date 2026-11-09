@@ -103,12 +103,18 @@ export interface Cycle {
   runtime: boolean;
 }
 
-/** A version on main that npm has already. Its release fails at the publish, so the plan blocks it. */
+/**
+ * A version that is not free. It is a version on `main` that npm has already, or a version of an open pull request.
+ * That version is on `main` or npm already, or another open pull request sets it too.
+ * The plan blocks a release of a taken version on `main`.
+ */
 export interface TakenVersion {
   name: string;
   repo: string;
   version: string;
   why: string;
+  /** The open pull requests that set this version. Empty: the version is on main. */
+  pulls: number[];
 }
 
 /** A published package whose range on npm does not cover the next version of a package of its own repository. */
@@ -134,7 +140,7 @@ export interface Plan {
     edges: number;
     flags: number;
     blockingFlags: number;
-    /** The count of the versions on main that npm has already. The gate keeps it at 0. */
+    /** The count of the versions that are not free, on main and in the open pull requests. The gate keeps it at 0. */
     taken: number;
     /** The count of the published workspace ranges that do not cover the next version. Each gets a cascade release. */
     behind: number;
@@ -145,7 +151,7 @@ export interface Plan {
   cycles: Cycle[];
   actionCycles: string[][];
   flags: EdgeState[];
-  /** The versions on main that npm has already, one for each package. */
+  /** The versions that are not free, on main and in the open pull requests. */
   taken: TakenVersion[];
   /** The published workspace ranges that do not cover the next version. The plan gives each dependent a cascade release. */
   behind: BehindRange[];
@@ -305,7 +311,7 @@ export function plan(g: Graph): Plan {
       pendingBump.add(p.name);
       if (p.npm.versions?.includes(main)) {
         const why = `npm has ${p.name}@${main} already, under a tag that is not latest. The release fails at the publish. Set the next free version on main.`;
-        taken.set(p.name, { name: p.name, repo: p.repo, version: main, why });
+        taken.set(p.name, { name: p.name, repo: p.repo, version: main, why, pulls: [] });
       }
       publishBy.set(p.name, `release:${p.repo}`);
       target.set(p.name, isStable(main) ? main : latest);
@@ -314,6 +320,31 @@ export function plan(g: Graph): Plan {
         warnings.push(`main of ${p.repo} has ${p.name}@${main}, but npm has ${latest}.`);
       }
       target.set(p.name, latest ?? main);
+    }
+  }
+
+  // 1b. The versions of the open pull requests. A version must be new, and only one pull request can set it.
+  const clashes: TakenVersion[] = [];
+  const setBy = new Map<string, Map<string, number[]>>();
+  for (const pr of g.pulls ?? []) {
+    const v = valid(pr.version);
+    if (!v) continue;
+    const id = `${pr.repo}:${pr.path || "."}`;
+    const versions = setBy.get(id) ?? new Map<string, number[]>();
+    versions.set(v, [...new Set([...(versions.get(v) ?? []), pr.number])].sort((x, y) => x - y));
+    setBy.set(id, versions);
+  }
+  for (const [id, versions] of setBy) {
+    const imp = importers.get(id);
+    if (!imp?.name) continue;
+    const main = valid(imp.version);
+    const own = pkgOfImporter(imp);
+    for (const [v, numbers] of versions) {
+      const why: string[] = [];
+      if (numbers.length > 1) why.push(`The pull requests ${numbers.map((n) => `#${n}`).join(", ")} all set ${v}.`);
+      if (main && !semver.gt(v, main)) why.push(`main has ${main}, so ${v} is not new.`);
+      if (own?.npm.versions?.includes(v)) why.push(`npm has ${imp.name}@${v} already.`);
+      if (why.length > 0) clashes.push({ name: imp.name, repo: imp.repo, version: v, pulls: numbers, why: `${why.join(" ")} Set the next free version before the merge.` });
     }
   }
 
@@ -659,7 +690,7 @@ export function plan(g: Graph): Plan {
       edges: edges.length,
       flags: flags.length,
       blockingFlags: flags.filter((f) => f.blocking).length,
-      taken: taken.size,
+      taken: taken.size + clashes.length,
       behind: behind.size,
     },
     actions: ordered,
@@ -668,7 +699,7 @@ export function plan(g: Graph): Plan {
     cycles,
     actionCycles,
     flags,
-    taken: [...taken.values()].sort((x, y) => x.name.localeCompare(y.name)),
+    taken: [...taken.values(), ...clashes].sort((x, y) => x.name.localeCompare(y.name) || x.version.localeCompare(y.version) || x.pulls.length - y.pulls.length),
     behind: [...behind.values()].sort((x, y) => x.name.localeCompare(y.name) || x.dep.localeCompare(y.dep)),
     repos: g.repos,
     reposWithoutPnpmLock: g.repos.filter((r) => r.lockKind !== "pnpm" && r.importers > 0).map((r) => r.name),
