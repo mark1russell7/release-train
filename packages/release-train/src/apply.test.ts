@@ -728,7 +728,7 @@ function memory(names: readonly string[]) {
       return date ? [200, { commit: { committer: { date } } }] : [404, { message: "Not Found" }];
     };
   });
-  return { ...server(routes), prs, pushed };
+  return { ...server(routes), prs, pushed, routes };
 }
 
 /** An updater that pushes a branch one time. After it, the branch has the changes, as with the real updater. */
@@ -794,6 +794,50 @@ describe("the pace of the update pushes", () => {
     expect(pushedBy).toEqual([2, 2, 1]);
     expect([...up.pushed].sort()).toEqual(names);
     expect(Object.values(last).includes("waiting")).toBe(false);
+  });
+
+  describe("a labeled pull request that is behind", () => {
+    const L = "tool-repo";
+    /** This function adds a green labeled pull request of another author in `tool-repo`, 1 commit behind, with its last push at `date`. */
+    const labeled = (m: ReturnType<typeof memory>, date: string) => {
+      m.routes["GET /search/issues"] = (_b, u) => [200, { items: u.searchParams.get("q")?.includes(`label:${MERGE_LABEL}`) ? [{ number: 9, repository_url: `https://api.github.com/repos/${OWNER}/${L}` }] : [] }];
+      m.routes[`GET ${base}/${L}`] = meta;
+      m.routes[`GET ${base}/${L}/pulls/9`] = () => [200, pull(9, L, { body: "a person's pull request", head: { sha: "sha9", ref: "feature", repo: { full_name: `${OWNER}/${L}` } }, labels: [{ name: MERGE_LABEL }], mergeable: true })];
+      m.routes[`GET ${base}/${L}/commits/sha9/check-runs`] = () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }];
+      m.routes[`GET ${base}/${L}/commits/sha9/status`] = () => [200, { state: "pending", total_count: 0 }];
+      m.routes[`GET ${base}/${L}/commits/sha9`] = () => [200, { commit: { committer: { date } } }];
+      m.routes[`GET ${base}/${L}/compare/main...sha9`] = () => [200, { behind_by: 1, files: [] }];
+      m.routes[`PUT ${base}/${L}/pulls/9/update-branch`] = () => [202, { message: "Updating pull request branch." }];
+    };
+    const updates = (m: ReturnType<typeof memory>) => m.calls.filter((c) => c.method === "PUT" && c.path.endsWith(`/${L}/pulls/9/update-branch`)).length;
+
+    it("gets its update within 2 runs at the limit, in the same longest-wait order as the pushes", async () => {
+      // 5 updates and a limit of 2: each run is at the limit. The labeled branch waited longer than each update, so a push yields its turn.
+      const m = memory(names);
+      labeled(m, "1969-12-31T00:00:00Z");
+      const up = once();
+      const first = await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 2, now: slot(0) });
+      expect(up.pushed).toEqual(["a-repo"]);
+      expect(updates(m)).toBe(1);
+      expect(first.results.find((x) => x.kind === "train-merge")?.detail).toContain("The train merged main into the branch, so CI runs again.");
+      const b = first.results.find((x) => x.repo === "b-repo");
+      expect(b).toMatchObject({ state: "waiting", paced: true });
+      expect(b?.detail).toContain("keeps 1 turn(s) for an older merge of the default branch");
+    });
+
+    it("waits behind pushes that waited longer, and gets its turn when they are done", async () => {
+      const m = memory(names);
+      labeled(m, "1970-01-01T02:30:00Z");
+      const up = once();
+      const first = await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 2, now: slot(0) });
+      expect(up.pushed).toEqual(["a-repo", "b-repo"]);
+      expect(updates(m)).toBe(0);
+      expect(first.results.find((x) => x.kind === "train-merge")?.detail).toContain("The merge of main into the branch waits: This run pushed 2 branches");
+      // In slot 6 the updates with no pull request wait from 03:00, so the labeled branch is older and goes first.
+      await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 2, now: slot(6) });
+      expect(up.pushed).toEqual(["a-repo", "b-repo", "c-repo"]);
+      expect(updates(m)).toBe(1);
+    });
   });
 
   it("pushes the newest versions when a repository that waited gets its turn", async () => {
