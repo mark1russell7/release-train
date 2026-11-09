@@ -17,6 +17,7 @@ import {
   bodyFingerprint,
   ciState,
   latestRuns,
+  longestWaitFirst,
   prBody,
   publicReport,
   rotate,
@@ -864,6 +865,19 @@ describe("the pace of the update pushes", () => {
     expect(up.seen.map((u) => u.repo).sort()).toEqual(names);
     expect(rotate(["a", "b", "c"], 4)).toEqual(["b", "c", "a"]);
     expect(rotate([], 4)).toEqual([]);
+  });
+
+  it("pushes first the open pull requests that waited longest, not only the start of the rotation", async () => {
+    const m = memory(names);
+    // a-repo has the newest pull request and e-repo the oldest. The rotation of slot 0 starts at a-repo.
+    names.forEach((name, i) => m.prs.set(name, pull(10 + i, name, { updated_at: `2026-01-0${9 - i}T00:00:00Z` })));
+    const up = updater();
+    await apply({ owner: OWNER, plan: fan(names), gh: m.gh, updater: up, dryRun: false, maxPushes: 2, now: slot(0) });
+    expect(up.seen.map((u) => u.repo)).toEqual(["e-repo", "d-repo"]);
+    const times: Record<string, string> = { x: "2026-01-02T00:00:00Z", z: "2026-01-01T00:00:00Z", w: "not a time" };
+    // An item with no pull request, or with no time that parses, goes first in the order of the list.
+    expect(longestWaitFirst(["x", "y", "z", "w"], (k) => times[k])).toEqual(["y", "w", "z", "x"]);
+    expect(longestWaitFirst([], () => undefined)).toEqual([]);
   });
 
   describe("and the waves", () => {
