@@ -3,6 +3,7 @@ import type { FetchFn } from "./collect.ts";
 import type { GitHub } from "./github.ts";
 import { matchWorkspaces, parsePnpmWorkspace } from "./parse.ts";
 import { escapeRegExp as escapeRe } from "@mark1russell7/text";
+import { assignDays, configDay, pullRequestJobs, PRESET_DAY, renovateSchedule, usesSharedPreset, withSchedule, type DayInput, type RenovateConfig, type RenovateDay } from "./renovate.ts";
 
 /** The branch of each template sync pull request of the release train. */
 export const SYNC_BRANCH = "release-train/template";
@@ -49,6 +50,11 @@ export interface RunFacts {
   changedSince?(sha: string): Promise<string[] | null>;
   /** This function reads a file of the template at `templateSha`, or gives null. Without it, each old pin moves. */
   readTemplate?(path: string): Promise<string | null>;
+  /**
+   * This function gives the Renovate day of a repository for this run, from `renovateDays`, or null. Without it, the rule
+   * `renovate-day` changes nothing.
+   */
+  renovateDay?(repo: string): RenovateDay | null;
 }
 
 /** The facts that the rules read for one repository. */
@@ -452,8 +458,87 @@ const callersRule: SyncRule = {
   },
 };
 
+/** The Renovate config file of a repository that the rule `renovate-day` reads and changes. */
+export const RENOVATE_FILE = "renovate.json";
+
+/** This function reads the Renovate config of a repository, or gives null when the file is not there or is not a JSON object. */
+async function readRenovate(files: RepoFiles): Promise<{ text: string; value: RenovateConfig } | null> {
+  if (!files.paths.includes(RENOVATE_FILE)) return null;
+  const text = await files.read(RENOVATE_FILE);
+  if (text === null) return null;
+  try {
+    const value: unknown = JSON.parse(text);
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? { text, value: value as RenovateConfig } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Rule 6: a repository with the shared Renovate preset gets the day of `RunFacts.renovateDay` in its `renovate.json`.
+ * The shared preset gives each repository the same morning. Then the pull requests of all repositories wait for the same runners.
+ * A schedule of another form stays.
+ */
+const renovateDayRule: SyncRule = {
+  id: "renovate-day",
+  why: "Each repository opens its weekly Renovate pull requests on its own day, so the pull requests of all repositories do not wait for the same runners.",
+  except: [TEMPLATE_REPO],
+  async check(files, f) {
+    const day = f.renovateDay?.(f.repo) ?? null;
+    if (day === null) return null;
+    const config = await readRenovate(files);
+    if (!config || !usesSharedPreset(config.value, f.owner, TEMPLATE_REPO)) return null;
+    const now = configDay(config.value);
+    if (now === "own" || now === day) return null;
+    return {
+      changes: [`\`${RENOVATE_FILE}\` gets the schedule \`${renovateSchedule(day)}\`. The weekly Renovate pull requests of this repository start on that day.`],
+      edit: { write: { [RENOVATE_FILE]: formatJson(config.text, withSchedule(config.value, day)) } },
+    };
+  },
+};
+
 /** The sync rules, in the sequence of their application. A later rule reads the files after the changes of the earlier rules. */
-export const SYNC_RULES: readonly SyncRule[] = [pinsRule, releaseScriptsRule, templateCliRule, coverageRule, callersRule];
+export const SYNC_RULES: readonly SyncRule[] = [pinsRule, releaseScriptsRule, templateCliRule, coverageRule, callersRule, renovateDayRule];
+
+/** This function gives the file of a `uses:` value for the job count. The file is a local workflow or a shared workflow of the template. */
+function usesReader(files: RepoFiles, f: RunFacts): (uses: string) => Promise<string | null> {
+  const shared = new RegExp(`^${escapeRe(f.owner)}/${TEMPLATE_REPO}/(\\.github/workflows/[^@]+)@`, "i");
+  return async (uses) => {
+    if (uses.startsWith("./")) return files.read(uses.slice(2));
+    const m = shared.exec(uses);
+    if (m?.[1] && f.readTemplate) return f.readTemplate(m[1]);
+    return null;
+  };
+}
+
+/**
+ * This function gives the facts of one repository for `assignDays`, or null when the rule `renovate-day` does not manage it.
+ * The weight is the count of the jobs that one pull request starts. The template keeps the day of the preset.
+ */
+export async function renovateInput(repo: string, files: RepoFiles, f: RunFacts): Promise<DayInput | null> {
+  const config = await readRenovate(files);
+  if (!config || !usesSharedPreset(config.value, f.owner, TEMPLATE_REPO)) return null;
+  const current = configDay(config.value);
+  if (current === "own") return null;
+  const weight = await pullRequestJobs(files.paths, (p) => files.read(p), usesReader(files, f));
+  if (repo === TEMPLATE_REPO) return { repo, weight, current: current ?? PRESET_DAY, fixed: true };
+  return { repo, weight, current };
+}
+
+/**
+ * This function gives the Renovate day of each repository of a run, for `RunFacts.renovateDay`. It reads the files of all
+ * repositories, so the assignment sees the load of each day. A repository that is not readable is not in the assignment.
+ */
+export async function renovateDays(repos: readonly { repo: string; files: RepoFiles | null }[], f: RunFacts): Promise<(repo: string) => RenovateDay | null> {
+  const inputs: DayInput[] = [];
+  for (const r of repos) {
+    if (!r.files) continue;
+    const input = await renovateInput(r.repo, r.files, f).catch(() => null);
+    if (input) inputs.push(input);
+  }
+  const days = assignDays(inputs);
+  return (repo) => days.get(repo) ?? null;
+}
 
 function isWorkflowPath(p: string): boolean {
   return p === ".github" || p === ".github/workflows" || p.startsWith(".github/workflows/");

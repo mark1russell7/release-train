@@ -16,7 +16,7 @@ import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
 import { awaitRelease } from "./release.ts";
 import { takeReplaced } from "./urgent.ts";
-import { SYNC_RULES, apiFiles, syncFacts, syncRepo, syncSummary } from "./sync.ts";
+import { SYNC_RULES, apiFiles, renovateDays, syncFacts, syncRepo, syncSummary } from "./sync.ts";
 import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
 import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tagsSummary, validDate } from "./tags.ts";
 import { gitUpdater } from "./workspace.ts";
@@ -214,9 +214,9 @@ export function summary(p: Plan, progress: Readonly<Record<string, Progress>> = 
     `Actions: ${c.actions["new-package"]} new-package, ${c.actions.release} release, ${c.actions["adopt-breaking"]} adopt-breaking, ${c.actions["adopt-in-range"]} adopt-in-range`,
     `Nodes: ${Object.entries(c.nodes).map(([k, v]) => `${v} ${k}`).join(", ")}`,
     `Flags: ${c.flags} git/file/link specifiers, ${c.blockingFlags} block a release`,
-    `Versions: ${c.taken} on main and on npm already, ${c.behind} published ranges behind`,
+    `Versions: ${c.taken} not free, ${c.behind} published ranges behind`,
   ];
-  for (const t of p.taken) lines.push(`taken: ${t.name}@${t.version} (${t.repo}). ${t.why}`);
+  for (const t of p.taken) lines.push(`taken: ${t.name}@${t.version} (${[t.repo, ...t.pulls.map((n) => `#${n}`)].join(" ")}). ${t.why}`);
   for (const b of p.behind) lines.push(`behind: ${b.name} has ${b.dep}@${b.range} on npm, but ${b.dep} goes to ${b.version}. ${b.name} gets a cascade release in ${b.repo}.`);
   if (p.cycles.length > 0) lines.push(`Cycles: ${p.cycles.map((cy) => `${cy.packages.join(" <-> ")}${cy.runtime ? " (runtime)" : " (dev)"}`).join("; ")}`);
   if (p.actionCycles.length > 0) lines.push(`Action cycles: ${p.actionCycles.map((cy) => cy.join(" <-> ")).join("; ")}`);
@@ -241,6 +241,33 @@ function token(): string | null {
   try {
     return execFileSync("gh", ["auth", "token"], { encoding: "utf8" }).trim() || null;
   } catch {
+    return null;
+  }
+}
+
+/**
+ * This function gives the key of the hashes of the private names, from the environment.
+ * It refuses a PEM private key, because a public hash must not depend on the key that signs the app tokens.
+ * In GitHub Actions, it refuses an empty key: a hash with no key gives each private name to a dictionary attack.
+ */
+export function hashKey(env: Readonly<Record<string, string | undefined>> = process.env): string {
+  const key = env["RELEASE_TRAIN_HASH_KEY"] ?? "";
+  if (/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(key)) {
+    throw new Error("RELEASE_TRAIN_HASH_KEY holds a PEM private key. Give it a separate random key.");
+  }
+  if (key === "" && env["GITHUB_ACTIONS"] === "true") {
+    throw new Error("RELEASE_TRAIN_HASH_KEY is empty. In GitHub Actions, the hashes of the private names need a secret key.");
+  }
+  return key;
+}
+
+/** This function gives the hash key for a run, or null after it writes the reason. A run that shows the private names needs no key. */
+function runKey(o: Pick<CliOptions, "showPrivate">): string | null {
+  if (o.showPrivate) return "";
+  try {
+    return hashKey();
+  } catch (e) {
+    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
     return null;
   }
 }
@@ -308,11 +335,14 @@ async function planSync(p: Plan, tok: string | null, workflows: WorkflowsMode, l
     return null;
   }
   const pending = pendingVersions(p);
+  const read = await pool(p.repos, 6, async (r) => ({ repo: r.name, files: await apiFiles(gh, p.owner, r.name) }));
+  const filesOf = new Map(read.map((x) => [x.repo, x.files]));
+  const runFacts = { ...facts, renovateDay: await renovateDays(read, facts) };
   const items = await pool(p.repos, 6, async (r): Promise<SyncPlanItem | null> => {
-    const files = await apiFiles(gh, p.owner, r.name);
+    const files = filesOf.get(r.name) ?? null;
     if (!files) return null;
     const releaseInFlight = pending.has(r.name) || (r.pendingChangesets ?? 0) > 0;
-    const result = await syncRepo(files, { ...facts, repo: r.name, releaseInFlight }, SYNC_RULES, workflows !== "no");
+    const result = await syncRepo(files, { ...runFacts, repo: r.name, releaseInFlight }, SYNC_RULES, workflows !== "no");
     return { repo: r.name, private: r.private, result };
   });
   return items.filter((i): i is SyncPlanItem => i !== null);
@@ -329,7 +359,8 @@ async function runApply(o: CliOptions): Promise<number> {
     return 2;
   }
   const inActions = process.env["GITHUB_ACTIONS"] === "true";
-  const key = process.env["RELEASE_TRAIN_HASH_KEY"] ?? "";
+  const key = runKey(o);
+  if (key === null) return 2;
   const secrets = new Set<string>();
   const hide = (names: Iterable<string>): void => {
     for (const n of names) {
@@ -456,7 +487,8 @@ async function readLag(o: CliOptions): Promise<LagReport> {
 }
 
 async function runTags(o: CliOptions): Promise<number> {
-  const key = process.env["RELEASE_TRAIN_HASH_KEY"] ?? "";
+  const key = runKey(o);
+  if (key === null) return 2;
   const secrets = new Set<string>();
   const redact = (text: string): string => (o.showPrivate ? text : redactNames(text, secrets, key));
   const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);

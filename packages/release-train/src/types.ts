@@ -40,6 +40,15 @@ export type LockKind = "pnpm" | "npm" | "yarn" | "none";
 /** The resolved versions of a lockfile: folder of the importer, then dependency name, then version. */
 export type Resolved = Record<string, Record<string, string>>;
 
+/** A version that an open pull request sets in one `package.json`. */
+export interface PullVersion {
+  /** The number of the pull request. */
+  number: number;
+  /** The folder of the `package.json` in the repository. The root folder is the empty string. */
+  path: string;
+  version: string;
+}
+
 /** The data of one repository that the graph builder reads. */
 export interface RepoSnapshot {
   name: string;
@@ -57,6 +66,8 @@ export interface RepoSnapshot {
   pendingChangesets?: number;
   /** The git submodules in the folders of the workspace. A clone of the train has no submodules, so their packages are missing. */
   submodules?: string[];
+  /** The versions that the open pull requests set. Not set: a snapshot from before the field, or a failed read. */
+  pulls?: PullVersion[];
 }
 
 /** The state of one package on the npm registry. */
@@ -146,4 +157,6 @@ export interface Graph {
   importers: Importer[];
   edges: Edge[];
   warnings: string[];
+  /** The versions that the open pull requests set, with the repository of each pull request. */
+  pulls?: (PullVersion & { repo: string })[];
 }
