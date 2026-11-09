@@ -56,15 +56,20 @@ export function replaceRange(spec: string, range: string, newRange: string): str
   return null;
 }
 
+/** The keys that an assignment must not write: they name the prototype of an object, not a dependency. */
+const UNSAFE_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+
 /** This function changes the ranges of the breaking items in the `package.json` text of one folder. It keeps the indent. */
 export function editManifest(text: string, edits: readonly { type: string; dep: string; range: string; newRange: string }[]): { text: string; failed: string[] } {
   const m = JSON.parse(text) as Record<string, Record<string, string> | undefined>;
   const failed: string[] = [];
   for (const e of edits) {
-    const section = m[e.type];
-    const spec = section?.[e.dep];
+    // Only an own key of the manifest is a section or a dependency: a name such as "__proto__" names no dependency, and an
+    // assignment to it would change Object.prototype (CodeQL js/prototype-polluting-assignment).
+    const section = Object.hasOwn(m, e.type) ? m[e.type] : undefined;
+    const spec = section !== undefined && Object.hasOwn(section, e.dep) ? section[e.dep] : undefined;
     const next = spec === undefined ? null : replaceRange(spec, e.range, e.newRange);
-    if (!section || next === null) {
+    if (!section || next === null || UNSAFE_KEYS.has(e.dep)) {
       failed.push(e.dep);
       continue;
     }
