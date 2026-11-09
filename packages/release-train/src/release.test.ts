@@ -11,7 +11,7 @@ import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import { addChangelogSection, awaitRelease, changesetText, decideBump, decisionBreaks, namesModule, setManifestVersion, typedFiles } from "./release.ts";
 import type { Manifest, NpmInfo, RepoSnapshot } from "./types.ts";
-import { changesetName, gitUpdater } from "./workspace.ts";
+import { changesetName, gitUpdater, UPDATE_SCRIPT } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 /** This function makes a gzip tar file with the given files. */
@@ -262,6 +262,52 @@ describe("gitUpdater with a cascade release", () => {
     const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run: runWith(false, cmds, {}, "0.5.0"), fetch: fetchFn });
     await up.update(u, { defaultBranch: "main", rebuild: false });
     expect(cmds.some((c) => c.includes("run version"))).toBe(false);
+    expect(cmds.some((c) => c.includes(UPDATE_SCRIPT))).toBe(false);
+  });
+
+  it("starts the root script release-train:update after the install of each update, and commits its new files", async () => {
+    const u = { ...(selectUpdates(cascadePlan()).ready.find((x) => x.repo === "pub-repo") as RepoUpdate), lockKind: "pnpm" as const };
+    const go = async (code: number) => {
+      const cmds: string[] = [];
+      const seen: { env?: NodeJS.ProcessEnv; message?: string } = {};
+      let wrote = false;
+      const run: RunFn = async (cmd, args, opts) => {
+        cmds.push(`${cmd} ${args.join(" ")}`);
+        // The version on main is already high enough, so no version script starts, and the update script starts all the same.
+        if (cmd === "git" && args[0] === "clone")
+          writeFileSync(join(opts.cwd, "package.json"), `{\n  "name": "@ex/pub",\n  "version": "0.5.0",\n  "scripts": { "version": "node scripts/sync.ts", "${UPDATE_SCRIPT}": "node scripts/data.ts" },\n  "dependencies": { "@ex/core": "^1.0.0" }\n}\n`);
+        if (cmd === "git" && args[0] === "ls-files") return { code: 0, stdout: wrote ? "old.txt\ndata/new.json\n" : "old.txt\n", stderr: "" };
+        if (cmd === "pnpm" && args[0] === "run" && args[1] === UPDATE_SCRIPT) {
+          seen.env = opts.env;
+          wrote = code === 0;
+          return { code, stdout: "", stderr: code === 0 ? "" : "the engine is missing" };
+        }
+        if (cmd === "pnpm" && args[0] === "install")
+          writeFileSync(join(opts.cwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      '@ex/core':\n        specifier: ^2.0.0\n        version: 2.0.0\n");
+        if (cmd === "git" && args.includes("commit")) seen.message = args[args.indexOf("-m") + 1] ?? "";
+        const out = cmd === "pnpm" && args[0] === "--version" ? "10.0.0\n" : cmd === "git" && args[0] === "status" ? " M package.json\n" : "";
+        return { code: cmd === "git" && args[0] === "fetch" ? 1 : 0, stdout: out, stderr: "" };
+      };
+      const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: fetchFn });
+      return { cmds, seen, r: await up.update(u, { defaultBranch: "main", rebuild: false }) };
+    };
+    const { cmds, seen, r } = await go(0);
+    expect(r.status).toBe("pushed");
+    expect(cmds).not.toContain("pnpm run version");
+    // The script starts after the lockfile, with the packages installed and no git credentials
+    const script = cmds.indexOf(`pnpm run ${UPDATE_SCRIPT}`);
+    expect(script).toBeGreaterThan(-1);
+    expect(cmds.slice(0, script)).toContain("pnpm install --lockfile-only --frozen-lockfile");
+    expect(cmds.slice(0, script)).toContain("pnpm install --frozen-lockfile --ignore-scripts");
+    expect(Object.keys(seen.env ?? {}).filter((key) => key.startsWith("GIT_CONFIG_"))).toEqual([]);
+    // Only the new file of the script is staged by name. A file that was untracked before stays out.
+    const staged = cmds.filter((c) => c.startsWith("git add -- ")).join(" ");
+    expect(staged).toContain("data/new.json");
+    expect(staged).not.toContain("old.txt");
+    expect(seen.message).toContain(`- script ${UPDATE_SCRIPT} of package.json`);
+    const failed = await go(2);
+    expect(failed.r).toMatchObject({ status: "failed", error: expect.stringContaining(`The script ${UPDATE_SCRIPT} of package.json failed (exit 2): the engine is missing`) });
+    expect(failed.cmds.some((c) => c.includes("commit"))).toBe(false);
   });
 
   it("writes a changeset in a repository with changesets and keeps the version", async () => {
