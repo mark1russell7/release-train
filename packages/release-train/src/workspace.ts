@@ -181,6 +181,17 @@ export const API_SCRIPT = "check:api";
 /** The root script that the train starts after the install of each update. Its file changes go into the train commit. */
 export const UPDATE_SCRIPT = "release-train:update";
 
+/** The names of the environment variables that no child command gets: tokens, secrets, keys and the settings of the train. */
+export const CREDENTIAL_NAME: RegExp = /TOKEN|SECRET|_KEY$|^RELEASE_TRAIN_/i;
+
+/**
+ * This function tells if a child command gets the token of the train. Only `git clone`, `git fetch` and `git push` get it.
+ * They start no code of the repository. Each other command, and each package manager, gets no token.
+ */
+export function needsGitAuth(cmd: string, args: readonly string[]): boolean {
+  return cmd === "git" && (args[0] === "clone" || args[0] === "fetch" || args[0] === "push");
+}
+
 /**
  * This function gives the arguments of `api-report` that write the reports that the script `check:api` compares.
  * A script `api-report check <folders and options>` gives `update` with the same folders and options. With no
@@ -281,23 +292,27 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     }
   };
   const basic = Buffer.from(`x-access-token:${o.token}`).toString("base64");
+  // Each child command gets the environment of the train with no token, secret or key. The package managers and the
+  // scripts start code of the repository (a pnpmfile, a version script, a build), so they never get the token.
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (/TOKEN|SECRET|_KEY$|^RELEASE_TRAIN_/i.test(k)) continue;
+    if (CREDENTIAL_NAME.test(k) || k.startsWith("GIT_CONFIG_")) continue;
     env[k] = v;
   }
-  Object.assign(env, {
-    CI: "true",
-    GIT_TERMINAL_PROMPT: "0",
+  Object.assign(env, { CI: "true", GIT_TERMINAL_PROMPT: "0" });
+  /** Only `git clone`, `git fetch` and `git push` get the token, in the git config of their own environment. */
+  const gitAuthEnv: NodeJS.ProcessEnv = {
+    ...env,
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
     GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
-  });
+  };
+  const envFor = (cmd: string, args: readonly string[]): NodeJS.ProcessEnv => (needsGitAuth(cmd, args) ? gitAuthEnv : env);
 
   type Sh = (cmd: string, args: string[], what: string) => Promise<RunResult>;
   /** This function gives the command helper of one clone folder. It throws on an exit code that is not 0. */
   const shell = (dir: string): Sh => async (cmd, args, what) => {
-    const r = await run(cmd, args, { cwd: dir, env });
+    const r = await run(cmd, args, { cwd: dir, env: envFor(cmd, args) });
     if (r.code !== 0) throw new Error(`${what} failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}`);
     return r;
   };
@@ -305,7 +320,8 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
   const checkout = async (dir: string, sh: Sh, repo: string, branch: string, defaultBranch: string): Promise<{ remoteRef: string; hasRemote: boolean }> => {
     await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", defaultBranch, `https://github.com/${o.owner}/${repo}.git`, "."], "git clone");
     const remoteRef = `refs/remotes/origin/${branch}`;
-    const fetched = await run("git", ["fetch", "--quiet", "--depth", "2", "origin", `+refs/heads/${branch}:${remoteRef}`], { cwd: dir, env });
+    const fetchArgs = ["fetch", "--quiet", "--depth", "2", "origin", `+refs/heads/${branch}:${remoteRef}`];
+    const fetched = await run("git", fetchArgs, { cwd: dir, env: envFor("git", fetchArgs) });
     return { remoteRef, hasRemote: fetched.code === 0 };
   };
   /** This function pushes the commit to a branch. When the branch already has the same content in the changed files, it does not push. */
@@ -465,10 +481,9 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     return { ...outcome, fixed: [...new Set([...outcome.fixed, ...reports])] };
   };
 
-  /** The environment of a script of the repository: no git credentials, no step summary, and the repository of the clone in GITHUB_REPOSITORY. */
+  /** The environment of a script of the repository: the environment with no token, no step summary, and the repository of the clone in GITHUB_REPOSITORY. */
   const scriptEnv = (repo: string): NodeJS.ProcessEnv => {
     const e: NodeJS.ProcessEnv = { ...env, GITHUB_REPOSITORY: `${o.owner}/${repo}` };
-    for (const key of Object.keys(e)) if (key.startsWith("GIT_CONFIG_")) delete e[key];
     delete e["GITHUB_STEP_SUMMARY"];
     return e;
   };

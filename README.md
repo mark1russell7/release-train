@@ -299,6 +299,8 @@ GitHub refuses a change to a workflow file from an App without the permission Wo
 
 `train.yml` starts every 30 minutes, on a manual start and on the `released` event of `repository_dispatch`. It makes a token of the GitHub App `mark1russell7-release-train` with `actions/create-github-app-token`. Pull requests with that token start CI in the repositories.
 
+- Only `git clone`, `git fetch` and `git push` get the token of the App. The package managers, the scripts of the repositories and the other git commands get no token.
+- The train removes each variable with `TOKEN`, `SECRET` or `_KEY` in its name from the environment of each command. It also removes the settings `RELEASE_TRAIN_*`.
 - A manual start has the inputs `dry-run` (default true), `only`, `cascade` and `urgent`. Give only public names to `only`, `cascade` and `urgent`, because GitHub shows the inputs.
 - The schedule and `repository_dispatch` change repositories only when `LIVE` in `train.yml` is `"true"`. It is `"true"` since 2026-10-25. Set it to `"false"` to stop the train.
 - The log, the step summary and the artifact `apply` give each private repository only as a count or a hash. The run also masks each private name in the log.
