@@ -71,6 +71,13 @@ export interface NpmInfo {
    * Not set: collect did not read it (a snapshot from before the field).
    */
   provenance?: Provenance | null;
+  /** Each version of the package on npm, under each dist-tag. Not set: a snapshot from before the field. */
+  versions?: string[];
+  /**
+   * The runtime ranges of the latest version on npm. Each section maps the name of a dependency to its range.
+   * pnpm writes a real range in place of `workspace:` at the publish. Not set: a snapshot from before the field.
+   */
+  latestDeps?: Partial<Record<DepType, Record<string, string>>>;
 }
 
 /** The repository and the workflow file that built a version, from its provenance. */
