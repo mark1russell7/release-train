@@ -253,6 +253,65 @@ describe("template-cli", () => {
   });
 });
 
+describe("coverage", () => {
+  const lock = { "pnpm-lock.yaml": "lockfileVersion: '9.0'\n", "pnpm-workspace.yaml": "packages:\n  - packages/*\n" };
+  const pkg = (test: string, dev: Record<string, string> = {}) => JSON.stringify({ name: "@demo/a", scripts: { test }, devDependencies: dev });
+  const devOf = (r: Awaited<ReturnType<typeof syncRepo>>) =>
+    (JSON.parse(r.writes["package.json"] ?? "{}") as { devDependencies: Record<string, string> }).devDependencies;
+
+  it("adds the provider to the root at the range of the root Vitest, in sorted order, and asks for a lockfile update", async () => {
+    const files = mem({ ...lock, "package.json": rootPkg({}, { "a-tool": "^1.0.0", vitest: "^3.2.4" }), "packages/a/package.json": pkg("vitest run") });
+    const r = await syncRepo(files, facts());
+    expect(outcome(r, "coverage")?.state).toBe("applied");
+    expect(r.install).toBe(true);
+    expect(Object.entries(devOf(r))).toEqual([
+      ["@vitest/coverage-v8", "^3.2.4"],
+      ["a-tool", "^1.0.0"],
+      ["vitest", "^3.2.4"],
+    ]);
+  });
+
+  it("takes the range of the packages when the root has no Vitest and the packages agree", async () => {
+    const files = mem({
+      ...lock,
+      "package.json": rootPkg({}),
+      "packages/a/package.json": pkg("vitest run", { vitest: "^3.2.4" }),
+      "packages/b/package.json": pkg("vitest run --passWithNoTests", { vitest: "^3.2.4" }),
+    });
+    expect(devOf(await syncRepo(files, facts()))["@vitest/coverage-v8"]).toBe("^3.2.4");
+  });
+
+  it("reports and changes nothing when the packages name different ranges, or a catalog range", async () => {
+    const two = mem({
+      ...lock,
+      "package.json": rootPkg({}),
+      "packages/a/package.json": pkg("vitest run", { vitest: "^3.2.4" }),
+      "packages/b/package.json": pkg("vitest run", { vitest: "^2.1.0" }),
+    });
+    const r = await syncRepo(two, facts());
+    expect(outcome(r, "coverage")).toMatchObject({ state: "report", changes: [] });
+    expect(outcome(r, "coverage")?.needs[0]).toContain("2 ranges");
+    expect(r.writes["package.json"]).toBeUndefined();
+    const catalog = mem({ ...lock, "package.json": rootPkg({}, { vitest: "catalog:" }), "packages/a/package.json": pkg("vitest run") });
+    expect(outcome(await syncRepo(catalog, facts()), "coverage")?.needs[0]).toContain("`catalog:`");
+  });
+
+  it("does nothing when the provider is there, when no test uses Vitest, without a pnpm lockfile, and outside the workspace", async () => {
+    const has = mem({ ...lock, "package.json": rootPkg({}, { "@vitest/coverage-v8": "^3.2.4", vitest: "^3.2.4" }), "packages/a/package.json": pkg("vitest run") });
+    const inPkg = mem({ ...lock, "package.json": rootPkg({}), "packages/a/package.json": pkg("vitest run", { "@vitest/coverage-v8": "^3.2.4", vitest: "^3.2.4" }) });
+    const other = mem({ ...lock, "package.json": rootPkg({}, { vitest: "^3.2.4" }), "packages/a/package.json": pkg("node --test") });
+    const npm = mem({ "package.json": rootPkg({}, { vitest: "^3.2.4" }), "packages/a/package.json": pkg("vitest run") });
+    const data = mem({ ...lock, "package.json": rootPkg({}, { vitest: "^3.2.4" }), "examples/x/package.json": pkg("vitest run") });
+    for (const files of [has, inPkg, other, npm, data]) expect(outcome(await syncRepo(files, facts()), "coverage")).toBeUndefined();
+  });
+
+  it("counts the root when its own test script starts Vitest", async () => {
+    const files = mem({ ...lock, "package.json": rootPkg({ test: "vitest run" }, { vitest: "^3.2.4" }) });
+    const r = await syncRepo(files, facts());
+    expect(outcome(r, "coverage")?.changes[0]).toContain("1 package with Vitest tests");
+  });
+});
+
 describe("callers", () => {
   it("reports a release.yml and a ci.yml that do not call the shared workflows, and changes nothing", async () => {
     const files = mem({ ".github/workflows/release.yml": "jobs:\n  x:\n    runs-on: ubuntu-latest\n", ".github/workflows/ci.yml": `# ${T}/.github/workflows/reusable-ci.yml@x\njobs: {}\n` });
