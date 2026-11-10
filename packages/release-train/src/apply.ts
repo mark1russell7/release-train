@@ -388,6 +388,8 @@ export interface ApplyReport {
   inFlight?: { name: string; version: string }[];
   /** The count of the names of `urgent` that change no ready update. The report has only the count, so it stays public. */
   urgentUnused?: number;
+  /** The count of the updates whose need had no known start, so their wait started at the start of the run. */
+  startFallbacks?: number;
 }
 
 /** The options of `apply`. */
@@ -426,6 +428,11 @@ export interface ApplyOptions {
    * wait for `maxPushes` and does not use its count. All other checks stay. A private package has no effect here.
    */
   urgent?: readonly string[] | null;
+  /**
+   * This function gives the time when the need of an update started (see `needStarts`). An update with no open pull
+   * request waits from this time. Absent, or undefined: the update waits from the start of the run, and the report counts it.
+   */
+  needSince?: (u: RepoUpdate) => string | undefined;
 }
 
 /** The options of the template sync of `apply`. */
@@ -480,6 +487,47 @@ export function longestWaitFirst<T>(list: readonly T[], pushedOf: (item: T) => s
     return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
   };
   return list.map((x, i) => ({ x, i, t: at(x) })).sort((a, b) => a.t - b.t || a.i - b.i).map((e) => e.x);
+}
+
+/** One item of the queue of a run: a push, or a merge of the default branch into a labeled pull request. */
+export interface QueueItem {
+  /** The key of the item: its effective wait (see `inheritedWait`), in milliseconds. A smaller key goes first. */
+  at: number;
+  /** The place of the item in the rotation of the run. It orders the items with the same key. */
+  tie: number;
+}
+
+/**
+ * This function gives the order of the queue of a run: the oldest key first, then the place in the rotation. The run
+ * pushes the items in this order up to its limit. So the pushed items are always a prefix of this order.
+ */
+export function queueOrder<T extends QueueItem>(list: readonly T[]): T[] {
+  // Two keys of minus infinity give NaN, so the tie orders them.
+  return [...list].sort((a, b) => a.at - b.at || a.tie - b.tie);
+}
+
+/**
+ * This function gives the effective wait of an item. That is the oldest of its own wait and the waits of each action
+ * that waits for it, directly or through other actions. `start` holds the ids of the actions of the item. `dependentsOf` gives the
+ * ids of the actions that wait directly for an action. `waitOf` gives the wait of an action, or undefined when it is not
+ * known. Thus a dependency goes first exactly when something old waits for it.
+ *
+ * The key only gets older while the item waits, so the item with the oldest key always comes to the front.
+ */
+export function inheritedWait(own: number, start: readonly string[], dependentsOf: ReadonlyMap<string, readonly string[]>, waitOf: (id: string) => number | undefined): number {
+  let at = own;
+  const seen = new Set<string>();
+  const next = [...start];
+  for (let id = next.pop(); id !== undefined; id = next.pop()) {
+    for (const d of dependentsOf.get(id) ?? []) {
+      if (seen.has(d)) continue;
+      seen.add(d);
+      const w = waitOf(d);
+      if (w !== undefined && w < at) at = w;
+      next.push(d);
+    }
+  }
+  return at;
 }
 
 /**
@@ -802,6 +850,7 @@ export function applySummary(r: ApplyReport): string {
     lines.push(`Urgent: ${urgent.length} (${states}). Public: ${urgent.filter((x) => !x.private).map((x) => x.repo).join(", ") || "none"}. Count of private repositories: ${urgent.filter((x) => x.private).length}.`);
   }
   if (r.urgentUnused) lines.push(`Urgent names with no ready update: ${r.urgentUnused}.`);
+  if (r.startFallbacks) lines.push(`Updates with no known start of their need, which wait from the start of this run: ${r.startFallbacks}.`);
   const counts = new Map<RepoState, number>();
   for (const x of r.results) counts.set(x.state, (counts.get(x.state) ?? 0) + 1);
   lines.push(`States: ${[...counts].map(([k, v]) => `${v} ${k}`).join(", ") || "none"}`, "");
@@ -958,8 +1007,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    * starts again on the current base. It takes only a branch of the same repository with no conflict. A Renovate branch keeps its
    * rebase box, because Renovate rebases it. The API refuses a change of the head after the read (HTTP 422).
    *
-   * The merge starts CI, so it counts as a push in the limit of the run. It takes its turn by the time of the last push of
-   * the head, in the same order as the pushes. The function gives the text to add to the detail.
+   * The merge starts CI, so it counts as a push in the limit of the run. The queue of the run gives it its place (see
+   * `catchUps`). The function gives the text to add to the detail.
    */
   const catchUp = async (repo: string, pr: Pull, main: string): Promise<string> => {
     if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX)) return "";
@@ -968,10 +1017,9 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const full = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${pr.number}`)).data;
     if (full?.mergeable === false || full?.mergeable_state === "dirty") return conflict;
     // The merge starts CI as a push does, so it counts in the limit of pushes of the run.
-    const key = `${repo}#${pr.number}`;
-    const own = turns.has(key) ? turns.get(key) : o.maxPushes === undefined ? undefined : waitMs(await pushTime(repo, pr));
-    turns.delete(key);
-    const wait = limitWait(own);
+    const done = caught.get(`${repo}#${pr.number}`);
+    if (done !== undefined) return done;
+    const wait = limitWait();
     if (wait !== null) return ` The merge of ${main} into the branch waits: ${wait}`;
     const r = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/update-branch`, { expected_head_sha: pr.head.sha });
     if (r.ok) {
@@ -1103,6 +1151,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   };
 
   const pacing = o.maxPushes !== undefined || o.runnersBusy !== undefined;
+  /** A queue item of the run, with the work that it does in its turn. */
+  type Turn = QueueItem & { run: () => Promise<void> };
   /**
    * This function gives the time of the last push of each open pull request of the train. That time is the committer date
    * of its head commit. A label, a comment or a body edit changes `updated_at` but not this time. Thus an edit with no push
@@ -1131,23 +1181,15 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const runStart = (o.now ?? new Date()).toISOString();
   const slot = Math.floor((o.now ?? new Date()).getTime() / RUN_MS);
   let pushes = 0;
+  /** This function gives the reason why a push waits for the limit of pushes, or null when it can push. */
+  const limitWait = (): string | null =>
+    o.maxPushes !== undefined && pushes >= o.maxPushes ? `This run pushed ${pushes} branches, the most of one run, because the runners are shared. A later run pushes this one.` : null;
   /**
-   * The run keeps these turns for a merge of the default branch into a labeled pull request, with `catchUp`. The key is
-   * `repo#number`, and the value is the time of the last push of the head. A push yields to each older turn. Thus the
-   * merges and the pushes have one longest-wait order, and a busy run does not starve a merge.
+   * This map holds the merges of the default branch into labeled pull requests in the queue of this run. The key is
+   * `repo#number`, and the value is the text for the detail. The function catchUp gives this text later, with no second merge.
    */
-  const turns = new Map<string, number>();
-  /**
-   * This function gives the reason why a push waits for the limit of pushes, or null when it can push. `at` is the time
-   * since when the push waits, in milliseconds. Each older turn of `turns` counts in the limit as a push.
-   */
-  const limitWait = (at?: number): string | null => {
-    if (o.maxPushes === undefined) return null;
-    const ahead = at === undefined ? 0 : [...turns.values()].filter((t) => t < at).length;
-    if (pushes + ahead < o.maxPushes) return null;
-    if (ahead === 0) return `This run pushed ${pushes} branches, the most of one run, because the runners are shared. A later run pushes this one.`;
-    return `This run pushed ${pushes} branches and keeps ${ahead} turn(s) for an older merge of the default branch into a labeled pull request. A run pushes at most ${o.maxPushes}, because the runners are shared. A later run pushes this one.`;
-  };
+  const caught = new Map<string, string>();
+  let startFallbacks = 0;
   /** This function gives the reason why a sync push waits for the busy runners, or null when it can push. */
   const busyWait = async (): Promise<string | null> => {
     if (!o.runnersBusy) return null;
@@ -1223,13 +1265,14 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   };
 
   /**
-   * This function keeps a turn in `turns` for each labeled pull request that settle merges `main` into in this run. It
-   * reads the same facts as mergeLabeled, settle and catchUp. The branch is green and behind the default branch, and it is
-   * of the same repository. It has no Renovate rebase box and no conflict, and no run of another branch is open. A turn
-   * that the run does not use (the facts changed) costs at most one push. The next run reads the facts again.
+   * This function gives a queue item for each labeled pull request that settle merges `main` into in this run. It reads
+   * the same facts as mergeLabeled, settle and catchUp. The branch is green and behind the default branch, and it is of
+   * the same repository. It has no Renovate rebase box and no conflict, and no run of another branch is open. Its key is
+   * the time of the last push of the head. It inherits the waits of the actions that wait for the release of its repository. An item that the run does not use (the facts changed) costs at most one push.
    */
-  const keepTurns = async (): Promise<void> => {
-    if (o.maxPushes === undefined || o.dryRun) return;
+  const catchUps = async (tie0: number, inherit: (own: number, start: readonly string[]) => number): Promise<Turn[]> => {
+    if (o.maxPushes === undefined || o.dryRun) return [];
+    const items: Turn[] = [];
     for (const { repo, number } of (await findLabeled()) ?? []) {
       const meta = await metaOf(repo);
       const main = meta?.default_branch ?? "main";
@@ -1241,8 +1284,15 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       if (ageHours < YIELD_MAX_HOURS && (await otherRuns(repo, pr.head.ref, meta)) > 0) continue;
       const cmp = await compareOf(repo, pr.head.sha, main);
       if (cmp === null || cmp.behind === 0) continue;
-      turns.set(`${repo}#${number}`, waitMs(await pushTime(repo, pr)));
+      const releases = o.plan.actions.filter((a) => a.repo === repo && a.kind === "release").map((a) => a.id);
+      const key = `${repo}#${number}`;
+      items.push({
+        at: inherit(waitMs(await pushTime(repo, pr)), releases),
+        tie: tie0 + items.length,
+        run: async () => void caught.set(key, await catchUp(repo, pr, main)),
+      });
     }
+    return items;
   };
 
   // 1. Close each open pull request of the train that the plan no longer needs.
@@ -1271,116 +1321,143 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     result({ ...base0, state: "waiting", pr: pr ? { number: pr.number, url: pr.html_url } : null, ci: null, detail: `It waits for ${w.dependsOn.join(", ") || "the target versions on npm"}.` });
   }
 
-  // 3 and 4. The adoptions of the current wave and the template sync. One limit covers the pushes of both, so with a pace
-  // they go first in turn, and a long queue of one kind does not stop the other kind. An urgent update goes before the sync.
-  const syncFirst = pacing && slot % 2 === 1 && !sel.ready.some(isUrgent);
-  await keepTurns();
-  if (syncFirst && o.sync) await syncAll(o.sync);
-  await updateAll();
-  if (!syncFirst && o.sync) await syncAll(o.sync);
+  // 3 and 4. The adoptions of the current wave, the template sync and the merges of main into labeled pull requests. One
+  // limit covers all of them, so with a pace they are in one queue with one key: the effective wait (see `inheritedWait`).
+  // The wait of an action is the time of the last push of the open pull request of the train in its repository. An urgent
+  // update goes first and does not count in the limit.
+  const trainPushed = pacing ? await pushedAt(open) : new Map<string, string | undefined>();
+  const dependentsOf = new Map<string, string[]>();
+  for (const a of o.plan.actions) for (const d of a.dependsOn) dependentsOf.set(d, [...(dependentsOf.get(d) ?? []), a.id]);
+  const actionRepo = new Map(o.plan.actions.map((a) => [a.id, a.kind === "release" ? null : a.repo]));
+  const waitOf = (id: string): number | undefined => {
+    const repo = actionRepo.get(id);
+    const t = repo ? trainPushed.get(repo) : undefined;
+    const ms = t === undefined ? Number.NaN : Date.parse(t);
+    return Number.isNaN(ms) ? undefined : ms;
+  };
+  const inherit = (own: number, start: readonly string[]): number => inheritedWait(own, start, dependentsOf, waitOf);
+  const updates = updateQueue();
+  const syncs = o.sync ? await syncQueue(o.sync, updates.length) : [];
+  const merges = await catchUps(updates.length + syncs.length, inherit);
+  const queue = [...updates, ...syncs, ...merges];
+  for (const item of pacing ? queueOrder(queue) : queue) await item.run();
 
   /**
-   * This function applies the adoptions of the current wave: one branch and one pull request for each repository. With a
-   * pace, a repository whose push must wait gets no clone. An open pull request still merges on green, or gets the blocked label.
+   * This function gives a queue item for each adoption of the current wave: one branch and one pull request for each
+   * repository. With a pace, a repository whose push must wait gets no clone. An open pull request still merges on green,
+   * or gets the blocked label.
    */
-  async function updateAll(): Promise<void> {
-    // A ready adoption waits for no action, so it is in wave 0, and the pace cannot put a later wave first. But a later wave
-    // can wait for it, so an adoption that another action waits for goes first, after the urgent adoptions. The other adoptions turn,
-    // and in each rank the open pull request that waited longest goes first.
-    const waitedFor = new Set(o.plan.actions.flatMap((a) => a.dependsOn));
-    const rank = (u: RepoUpdate): number => (isUrgent(u) ? 0 : waitedFor.has(u.actionId) ? 1 : 2);
-    const pushed = pacing ? await pushedAt(open) : new Map<string, string | undefined>();
-    const order = (list: readonly RepoUpdate[]): RepoUpdate[] => longestWaitFirst(rotate(list, slot), (u) => pushed.get(u.repo), runStart).sort((x, y) => rank(x) - rank(y));
-    for (const u of pacing ? order(sel.ready) : sel.ready) {
-      const existing = open.get(u.repo) ?? null;
-      const urgent = isUrgent(u);
-      const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length, ...(urgent ? { urgent } : {}), ...(u.held ? { held: u.held.items } : {}) };
-      if (u.lockKind === "yarn") {
-        result({ ...common, state: "skipped", pr: prRef(existing), autoMerge: null, ci: null, detail: "The train cannot update a Yarn lockfile." });
-        continue;
+  function updateQueue(): Turn[] {
+    // A ready adoption waits for no action, so it is in wave 0, and the pace cannot put a later wave first. An adoption that
+    // another action waits for inherits the wait of that action, so it goes first when the action waited long.
+    // An update with no open pull request waits from the start of its need, so its key does not renew in each run.
+    const list = pacing ? rotate(sel.ready, slot) : sel.ready;
+    return list.map((u, tie) => {
+      const need = pacing ? o.needSince?.(u) : undefined;
+      const pushed = trainPushed.get(u.repo);
+      if (pacing && pushed === undefined && need === undefined && !isUrgent(u)) {
+        startFallbacks++;
+        log(`${label(u.repo, u.private)}: the start of the need is not known, so the update waits from the start of this run.`);
       }
-      if (u.submodules?.length) {
-        // Each run would fail the same way: the install in the clone does not find the packages of the submodules
-        const detail = `The workspace has git submodules (${u.submodules.join(", ")}). The clone of the train has no submodules, so the install cannot find their packages. Move the package into the repository or publish it.`;
-        result({ ...common, state: "skipped", pr: prRef(existing), autoMerge: null, ci: null, detail });
-        continue;
+      return {
+        at: isUrgent(u) ? Number.NEGATIVE_INFINITY : inherit(waitMs(pushed ?? need ?? runStart), [u.actionId]),
+        tie,
+        run: () => updateOne(u),
+      };
+    });
+  }
+
+  /** This function applies one adoption: one branch and one pull request for the repository. */
+  async function updateOne(u: RepoUpdate): Promise<void> {
+    const existing = open.get(u.repo) ?? null;
+    const urgent = isUrgent(u);
+    const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length, ...(urgent ? { urgent } : {}), ...(u.held ? { held: u.held.items } : {}) };
+    if (u.lockKind === "yarn") {
+      result({ ...common, state: "skipped", pr: prRef(existing), autoMerge: null, ci: null, detail: "The train cannot update a Yarn lockfile." });
+      return;
+    }
+    if (u.submodules?.length) {
+      // Each run would fail the same way: the install in the clone does not find the packages of the submodules
+      const detail = `The workspace has git submodules (${u.submodules.join(", ")}). The clone of the train has no submodules, so the install cannot find their packages. Move the package into the repository or publish it.`;
+      result({ ...common, state: "skipped", pr: prRef(existing), autoMerge: null, ci: null, detail });
+      return;
+    }
+    try {
+      const metaRes = await gh.request<RepoMeta>("GET", `${base}/${u.repo}`);
+      if (!metaRes.data) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
+      const meta = metaRes.data;
+      if (!existing) {
+        // A person closed a pull request with the same changes: the train does not open it again.
+        const declined = await declinedPr(u.repo, TRAIN_BRANCH, u.fingerprint);
+        if (declined) {
+          result({ ...common, state: "declined", pr: prRef(declined), autoMerge: null, ci: null, detail: "A closed pull request has the same changes. The train does not open it again." });
+          return;
+        }
       }
-      try {
-        const metaRes = await gh.request<RepoMeta>("GET", `${base}/${u.repo}`);
-        if (!metaRes.data) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
-        const meta = metaRes.data;
-        if (!existing) {
-          // A person closed a pull request with the same changes: the train does not open it again.
-          const declined = await declinedPr(u.repo, TRAIN_BRANCH, u.fingerprint);
-          if (declined) {
-            result({ ...common, state: "declined", pr: prRef(declined), autoMerge: null, ci: null, detail: "A closed pull request has the same changes. The train does not open it again." });
-            continue;
-          }
-        }
-        const rebuild = await needsRebuild(u.repo, existing, meta.default_branch);
-        // A branch with these changes on the current default branch needs no push.
-        const due = !existing || rebuild || bodyFingerprint(existing.body) !== u.fingerprint;
-        const wait = urgent ? null : limitWait(waitMs(pushed.get(u.repo) ?? runStart));
-        if (o.dryRun && (wait === null || !due)) {
-          const what = !existing ? "The run opens a pull request" : due ? `The run updates PR #${existing.number}` : `The run keeps PR #${existing.number}`;
-          if (due && !urgent) pushes += 1;
-          result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length === 0 ? "the pnpm settings" : `${u.items.length} ${u.items.length === 1 ? "change" : "changes"}`}${u.items.length > 0 && u.ageScopes ? " and the pnpm settings" : ""}${u.releases?.length ? `, with the release of ${u.releases.map((x) => x.name).join(", ")}` : ""}.` });
-          continue;
-        }
-        if (wait !== null) {
-          // No clone: each clone can push. The next run reads the plan again, so it pushes the newest versions.
-          if (existing && !o.dryRun) await disableAutoMerge(existing);
-          const s = existing && !o.dryRun ? await settle(u.repo, existing, meta) : null;
-          const state: RepoState = !s || (due && s.state === "unchanged") ? "waiting" : s.state;
-          const detail = state === "waiting" ? `${s ? `${s.detail} ` : ""}${wait}` : (s?.detail ?? wait);
-          result({ ...common, state, ...(state === "waiting" ? { paced: true } : {}), pr: prRef(existing), autoMerge: s ? "train" : null, ci: s?.ci ?? null, detail });
-          continue;
-        }
-        const urgentDeps = [...new Set(u.items.map((i) => i.dep).filter((dep) => urgentNames.has(dep)))];
-        const r = await o.updater.update(urgent ? { ...u, urgentDeps } : u, { defaultBranch: meta.default_branch, rebuild });
-        if (r.status === "pushed" && !urgent) pushes += 1;
-        if (r.status === "failed") {
-          result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: `The update failed: ${r.error ?? "unknown error"}` });
-          continue;
-        }
-        if (r.status === "young") {
-          // CI refuses a lockfile with a version younger than the minimumReleaseAge of pnpm. The update waits for its age.
-          const ready = r.young.map((y) => `${y.dep}@${y.version} at ${y.readyAt}`).join(", ");
-          if (existing) await closeTrainPr(u.repo, existing, `its versions are younger than the minimumReleaseAge of pnpm. A later run opens it again (ready: ${ready})`);
-          result({ ...common, state: "waiting", pr: prRef(existing), autoMerge: null, ci: null, detail: `It waits for the minimumReleaseAge of pnpm: ${ready}.${existing ? " The train closed the pull request." : ""}` });
-          continue;
-        }
-        if ((r.status === "no-change" || r.status === "unresolved") && !existing) {
-          const why = r.status === "no-change" ? "The update changes no file." : `The lockfile does not get the target versions (${r.unresolved.join(", ")}).`;
-          result({ ...common, state: "skipped", pr: null, autoMerge: null, ci: null, detail: why });
-          continue;
-        }
-        const shown: RepoUpdate = { ...u, items: u.items.filter((i) => !r.young.some((y) => y.dep === i.dep)) };
-        await publish({
-          common,
-          branch: TRAIN_BRANCH,
-          existing,
-          meta,
-          pushed: r.status === "pushed",
-          sha: r.sha,
-          title: prTitle(shown),
-          body: prBody(shown, r),
-          note: r.unresolved.length > 0 ? ` Unresolved: ${r.unresolved.join(", ")}.` : "",
-        });
-      } catch (e) {
-        result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
+      const rebuild = await needsRebuild(u.repo, existing, meta.default_branch);
+      // A branch with these changes on the current default branch needs no push.
+      const due = !existing || rebuild || bodyFingerprint(existing.body) !== u.fingerprint;
+      const wait = urgent ? null : limitWait();
+      if (o.dryRun && (wait === null || !due)) {
+        const what = !existing ? "The run opens a pull request" : due ? `The run updates PR #${existing.number}` : `The run keeps PR #${existing.number}`;
+        if (due && !urgent) pushes += 1;
+        result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length === 0 ? "the pnpm settings" : `${u.items.length} ${u.items.length === 1 ? "change" : "changes"}`}${u.items.length > 0 && u.ageScopes ? " and the pnpm settings" : ""}${u.releases?.length ? `, with the release of ${u.releases.map((x) => x.name).join(", ")}` : ""}.` });
+        return;
       }
+      if (wait !== null) {
+        // No clone: each clone can push. The next run reads the plan again, so it pushes the newest versions.
+        if (existing && !o.dryRun) await disableAutoMerge(existing);
+        const s = existing && !o.dryRun ? await settle(u.repo, existing, meta) : null;
+        const state: RepoState = !s || (due && s.state === "unchanged") ? "waiting" : s.state;
+        const detail = state === "waiting" ? `${s ? `${s.detail} ` : ""}${wait}` : (s?.detail ?? wait);
+        result({ ...common, state, ...(state === "waiting" ? { paced: true } : {}), pr: prRef(existing), autoMerge: s ? "train" : null, ci: s?.ci ?? null, detail });
+        return;
+      }
+      const urgentDeps = [...new Set(u.items.map((i) => i.dep).filter((dep) => urgentNames.has(dep)))];
+      const r = await o.updater.update(urgent ? { ...u, urgentDeps } : u, { defaultBranch: meta.default_branch, rebuild });
+      if (r.status === "pushed" && !urgent) pushes += 1;
+      if (r.status === "failed") {
+        result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: `The update failed: ${r.error ?? "unknown error"}` });
+        return;
+      }
+      if (r.status === "young") {
+        // CI refuses a lockfile with a version younger than the minimumReleaseAge of pnpm. The update waits for its age.
+        const ready = r.young.map((y) => `${y.dep}@${y.version} at ${y.readyAt}`).join(", ");
+        if (existing) await closeTrainPr(u.repo, existing, `its versions are younger than the minimumReleaseAge of pnpm. A later run opens it again (ready: ${ready})`);
+        result({ ...common, state: "waiting", pr: prRef(existing), autoMerge: null, ci: null, detail: `It waits for the minimumReleaseAge of pnpm: ${ready}.${existing ? " The train closed the pull request." : ""}` });
+        return;
+      }
+      if ((r.status === "no-change" || r.status === "unresolved") && !existing) {
+        const why = r.status === "no-change" ? "The update changes no file." : `The lockfile does not get the target versions (${r.unresolved.join(", ")}).`;
+        result({ ...common, state: "skipped", pr: null, autoMerge: null, ci: null, detail: why });
+        return;
+      }
+      const shown: RepoUpdate = { ...u, items: u.items.filter((i) => !r.young.some((y) => y.dep === i.dep)) };
+      await publish({
+        common,
+        branch: TRAIN_BRANCH,
+        existing,
+        meta,
+        pushed: r.status === "pushed",
+        sha: r.sha,
+        title: prTitle(shown),
+        body: prBody(shown, r),
+        note: r.unresolved.length > 0 ? ` Unresolved: ${r.unresolved.join(", ")}.` : "",
+      });
+    } catch (e) {
+      result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
     }
   }
 
   /**
-   * This function syncs the template files of each repository. A rule that changes workflow files waits when the App
-   * cannot change them. In mode `auto`, the first push that GitHub refuses turns these rules off for the rest of the run.
+   * This function gives a queue item for the template sync of each repository. A rule that changes workflow files waits
+   * when the App cannot change them. In mode `auto`, the first push that GitHub refuses turns these rules off for the rest
+   * of the run.
    */
-  async function syncAll(s: SyncOptions): Promise<void> {
+  async function syncQueue(s: SyncOptions, tie0: number): Promise<Turn[]> {
     if (!s.facts) {
       log("Template sync: the template is not readable, so the sync waits.");
-      return;
+      return [];
     }
     const rules = s.rules ?? SYNC_RULES;
     // The files of each repository, read one time. The Renovate days need the files of all repositories of the plan.
@@ -1409,7 +1486,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const pending = pendingVersions(o.plan, o.only ?? null);
     const changesets = new Set(o.plan.repos.filter((r) => (r.pendingChangesets ?? 0) > 0).map((r) => r.name));
     let workflows = s.workflows !== "no";
-    for (const repo of pacing ? longestWaitFirst(rotate(scan, slot), (r) => syncPushed.get(r), syncSince) : scan) {
+    /** This function syncs the template files of one repository. */
+    const syncOne = async (repo: string): Promise<void> => {
       const isPrivate = privateOf.get(repo) ?? true;
       const existing = syncOpen.get(repo) ?? null;
       const facts: SyncFacts = { ...facts0, repo, releaseInFlight: pending.has(repo) || changesets.has(repo) };
@@ -1425,7 +1503,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       const fail = (detail: string) => result({ repo, private: isPrivate, actionId: `sync:${repo}`, kind: SYNC_KIND, wave: null, items: 0, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail });
       try {
         const files = await filesOf(repo);
-        if (!files) continue;
+        if (!files) return;
         let planned = await syncRepo(files, facts, rules, workflows);
         const applied = (r: SyncResult): string[] => r.outcomes.filter((x) => x.state === "applied").map((x) => x.rule);
         /** This function closes the open sync pull request, or reports the problems of a repository with no change. */
@@ -1440,7 +1518,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         };
         if (applied(planned).length === 0) {
           await nothing(planned);
-          continue;
+          return;
         }
         const metaRes = await gh.request<RepoMeta>("GET", `${base}/${repo}`);
         if (!metaRes.data) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
@@ -1449,21 +1527,21 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           const declined = await declinedPr(repo, SYNC_BRANCH, planned.fingerprint);
           if (declined) {
             result({ ...commonOf(planned), state: "declined", pr: prRef(declined), autoMerge: null, ci: null, detail: "A closed pull request has the same changes. The train does not open it again." });
-            continue;
+            return;
           }
         }
         const rebuild = await needsRebuild(repo, existing, meta.default_branch);
         const same = existing !== null && !rebuild && bodyFingerprint(existing.body) === planned.fingerprint;
-        const wait = same ? null : (limitWait(waitMs(syncPushed.get(repo) ?? syncSince)) ?? (await busyWait()));
+        const wait = same ? null : (limitWait() ?? (await busyWait()));
         if (wait !== null) {
           result({ ...commonOf(planned), state: "waiting", paced: true, pr: prRef(existing), autoMerge: null, ci: null, detail: wait });
-          continue;
+          return;
         }
         if (o.dryRun) {
           const what = existing ? `The run updates PR #${existing.number}` : "The run opens a pull request";
           if (!same) pushes += 1;
           result({ ...commonOf(planned), state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for the template sync: ${applied(planned).join(", ")}.` });
-          continue;
+          return;
         }
         let r: SyncPush;
         if (existing && same) {
@@ -1482,12 +1560,12 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         }
         if (r.status === "failed" || r.status === "workflows-denied") {
           fail(`The template sync failed: ${r.error ?? "unknown error"}`);
-          continue;
+          return;
         }
         const done = r.result ?? planned;
         if (r.status === "no-change" || applied(done).length === 0) {
           await nothing(done);
-          continue;
+          return;
         }
         await publish({
           common: commonOf(done),
@@ -1504,7 +1582,9 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       } catch (e) {
         fail(e instanceof Error ? e.message : String(e));
       }
-    }
+    };
+    const list = pacing ? rotate(scan, slot) : scan;
+    return list.map((repo, i) => ({ at: waitMs(syncPushed.get(repo) ?? syncSince), tie: tie0 + i, run: () => syncOne(repo) }));
   }
 
   // 5. The releases. A public package whose version on main is newer than npm is in flight: its release workflow publishes it.
@@ -1582,7 +1662,15 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
 
   const changed = new Set(sel.ready.flatMap((u) => u.items.map((i) => i.dep)));
   const urgentUnused = [...new Set(o.urgent ?? [])].filter((n) => !urgentNames.has(n) || !changed.has(n)).length;
-  return { owner, at: (o.now ?? new Date()).toISOString(), dryRun: o.dryRun, results, inFlight, ...(urgentUnused > 0 ? { urgentUnused } : {}) };
+  return {
+    owner,
+    at: (o.now ?? new Date()).toISOString(),
+    dryRun: o.dryRun,
+    results,
+    inFlight,
+    ...(urgentUnused > 0 ? { urgentUnused } : {}),
+    ...(startFallbacks > 0 ? { startFallbacks } : {}),
+  };
 }
 
 /** The branch of the version pull request of changesets. */

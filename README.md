@@ -126,13 +126,26 @@ One new version of a package that most repositories use changes approximately 35
 - An update push waits only for `--max-pushes`. A sync push also waits while 30 or more jobs run on the account. The account has so many jobs for most of a day, so that gate on an update push stops the train in silence. When the list of runs is not readable, a sync push waits only for the limit.
 - A branch that gets a new commit counts. A branch that has its changes on the current default branch needs no push. It does not wait, and the train merges or blocks its pull request.
 - At the limit, the train does not clone. A repository that waits has no cost, and an open pull request still merges on green or gets the blocked label. The next run reads the plan again, so it pushes the newest versions and skips the versions between.
-- Each item of an update waits for no action, so the pace cannot put a later wave first. An update that another action waits for goes first.
-- The open pull request with the oldest push goes first. The time of a push is the committer date of the head commit, because each push of the train makes a new commit. A label or a comment does not change that time. A pushed pull request goes to the end.
-- A repository with no open sync pull request waits from the date of the template commit that it needs. A new update with no pull request waits from the start of the run. So a new pull request does not go before a pull request that waits already.
-- In each group, the order moves one place every 30 minutes. A move of one place alone is too slow. A run pushes up to 5 branches, and the first repositories need a new push in each run. The update pushes and the sync pushes go first in turn.
+- The update pushes, the sync pushes and the merges into labeled pull requests are in one queue. The key of each item is the start of its wait, and the oldest key goes first.
+- The key of an open pull request is the time of its last push. That time is the committer date of the head commit, because each push of the train makes a new commit. A label or a comment does not change that time. A pushed pull request goes to the end.
+- A repository with no open sync pull request waits from the date of the template commit that it needs.
+- An update with no pull request waits from the start of its need. That is the npm publish time of the first version above the version in the lockfile. A need with no publish time waits from the first run that saw it (see "The state of the train").
+- An item that another action waits for gets the oldest key of the open pull requests of those actions, direct or indirect. Each item of an update waits for no action, so the pace cannot put a later wave first.
+- Items with the same key take the order of a rotation, which moves one place every 30 minutes.
+- An urgent update goes before each other item, and it does not count in the limit.
+- Each run pushes a prefix of this order. An item with place Q at its arrival goes within floor((Q - 1 + M) / L) + 1 runs. M is the count of later items with an older key, and L is the limit. The tests check both rules with fast-check.
 - `--max-pushes 0` lets a run only merge or block.
 
-At the default, 35 repositories need 7 runs, approximately 3.5 hours, when the sync takes no pushes. A sync with a long queue takes each second run while the account is not busy. Then the 35 repositories need approximately 7 hours. A `released` event adds a run.
+At the default, 35 repositories need 7 runs, approximately 3.5 hours, when the sync takes no pushes. A `released` event adds a run.
+
+### The state of the train
+
+The workflow keeps a state file from one run to the next in the Actions cache (`--state train-state.json`).
+
+- The state has the npm publish times of each package. A run reads the full npm document of a package only when its `modified` time changed. Usually 0 to 3 packages change in 30 minutes, so a run reads 0 to 3 full documents. A run with no state reads all of them once.
+- The state has the first run that saw each need with no publish time. The key of such a need is a hash with the secret key, so the state has no private name.
+- A missing or broken state does not stop a run. The run writes a note in the log and starts the state again.
+- With no state, a need with no publish time waits from the start of the run. The log has a line for each such update, and the summary has their count.
 
 ### An urgent update
 
@@ -300,6 +313,7 @@ The rules do not change the repository `template`. Each repository gets one bran
 GitHub refuses a change to a workflow file from an App without the permission Workflows: write. Until the App has this permission, the rules `pins` and `release-scripts` wait, and the pull request and the summary tell "The change waits for the Workflows permission of the App." The other rules work. The run does not fail.
 
 - `--no-sync` turns off the template sync.
+- `--state <file>` reads the state of the train at the start of the run and writes it at the end.
 - `--workflows auto|yes|no` tells if the App can change workflow files. With `auto` (the default), the train tries, and when GitHub refuses the push, it pushes again without the workflow changes.
 - `plan` lists the sync actions of each repository and the count for each rule.
 

@@ -304,6 +304,35 @@ describe("writeDb", () => {
     expect([manifestFolder("package.json"), manifestFolder("packages/a/package.json"), manifestFolder("README.md")]).toEqual(["", "packages/a", null]);
   });
 
+  it("reads the full npm document of a package only when its modified time changed since the last run", async () => {
+    const inner = fakeFetch(REPOS, { "@ex/core": "1.4.0", "@ex/fresh": "0.1.0" });
+    let modified = "2026-11-09T10:00:00.000Z";
+    const full: string[] = [];
+    const f: FetchFn = async (url, init) => {
+      if (url !== `${REG}/@ex%2fcore`) return inner(url, init);
+      const accept = (init?.headers as Record<string, string> | undefined)?.["accept"] ?? "";
+      if (accept.includes("install-v1")) return new Response(JSON.stringify({ "dist-tags": { latest: "1.4.0" }, modified, versions: { "1.3.0": {}, "1.4.0": {} } }));
+      full.push(url);
+      return new Response(JSON.stringify({ time: { created: "2026-01-01T00:00:00.000Z", modified, "1.3.0": "2026-10-01T00:00:00.000Z", "1.4.0": "2026-11-09T10:00:00.000Z" } }));
+    };
+    const one = await collect({ owner: "example-owner", token: null, fetch: f });
+    expect(one.npm["@ex/core"]?.times).toEqual({ "1.3.0": "2026-10-01T00:00:00.000Z", "1.4.0": "2026-11-09T10:00:00.000Z" });
+    expect(one.npmTimes?.["@ex/core"]).toEqual({ modified, times: one.npm["@ex/core"]?.times });
+    expect(full).toHaveLength(1);
+    // The same modified time: the times come from the last run, with no full read.
+    const two = await collect({ owner: "example-owner", token: null, fetch: f, npmTimes: one.npmTimes ?? {} });
+    expect(two.npm["@ex/core"]?.times).toEqual(one.npm["@ex/core"]?.times);
+    expect(full).toHaveLength(1);
+    // A publish changes the modified time, so the next run reads the full document again.
+    modified = "2026-11-09T12:00:00.000Z";
+    const three = await collect({ owner: "example-owner", token: null, fetch: f, npmTimes: two.npmTimes ?? {} });
+    expect(full).toHaveLength(2);
+    expect(three.npmTimes?.["@ex/core"]?.modified).toBe(modified);
+    // A package whose document has no modified time gets no entry, and npm with no times gives no field.
+    expect(three.npmTimes).not.toHaveProperty("@ex/fresh");
+    expect(three.npm["@ex/fresh"]).not.toHaveProperty("times");
+  });
+
   it("reads each version on npm and the runtime ranges of the latest version", async () => {
     const inner = fakeFetch(REPOS, { "@ex/core": "1.4.0", "@ex/fresh": "0.1.0" });
     const doc = {

@@ -25,7 +25,8 @@ import {
   workflowsRefused,
 } from "./sync.ts";
 import type { RepoFiles, RunFacts, SyncFacts, SyncJob, SyncPush, SyncUpdater } from "./sync.ts";
-import type { RepoSnapshot } from "./types.ts";
+import type { Manifest, NpmInfo, RepoSnapshot, Resolved } from "./types.ts";
+import { needStarts } from "./state.ts";
 import { CREDENTIAL_NAME, gitUpdater, needsGitAuth } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
@@ -532,33 +533,39 @@ describe("apply with the template sync", () => {
     }
   });
 
-  it("shares one limit with the update pushes, and each kind goes first in turn", async () => {
+  it("shares one limit with the update pushes, and the longer wait goes first in each slot", async () => {
     const snap: RepoSnapshot = { name: "demo-repo", private: false, defaultBranch: "main", manifests: [{ path: "", manifest: { name: "demo", private: true, devDependencies: { "@ex/tool": "^1.0.0" } } }], lockKind: "pnpm", resolved: { "": { "@ex/tool": "1.0.0" } }, warnings: [] };
     const tool: RepoSnapshot = { name: "tool-repo", private: false, defaultBranch: "main", manifests: [{ path: "", manifest: { name: "@ex/tool", version: "1.1.0" } }], lockKind: "pnpm", resolved: {}, warnings: [] };
     const p = plan(buildGraph({ owner: OWNER, repos: [snap, tool], npm: { "@ex/tool": { exists: true, latest: "1.1.0" } }, now: new Date("2026-01-01T00:00:00Z") }));
-    const run = async (slot: number, maxPushes: number) => {
-      const { gh } = server(repoRoutes("demo-repo"));
+    // The update waits from the start of its need, and the sync from the date of the template commit.
+    const run = async (slot: number, maxPushes: number, need: string, template: string) => {
+      const { gh } = server(repoRoutes("demo-repo", { [`GET ${base}/template/commits/${NEW}`]: () => [200, { commit: { committer: { date: template } } }] }));
       const up = syncer([]);
       const seen: string[] = [];
       const updater: Updater = { async update(u) { seen.push(u.repo); return { status: "pushed", sha: "s8", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
-      const r = await apply({ owner: OWNER, plan: p, gh, updater, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes, now: new Date(slot * RUN_MS) });
+      const r = await apply({ owner: OWNER, plan: p, gh, updater, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes, needSince: () => need, now: new Date(slot * RUN_MS) });
       return { updates: seen.length, syncs: up.jobs.length, states: r.results.map((x) => `${x.kind === SYNC_KIND ? "sync" : "update"} ${x.state}`).sort() };
     };
-    expect(await run(0, 1)).toEqual({ updates: 1, syncs: 0, states: ["sync waiting", "update opened"] });
-    expect(await run(1, 1)).toEqual({ updates: 0, syncs: 1, states: ["sync opened", "update waiting"] });
-    expect(await run(1, 2)).toEqual({ updates: 1, syncs: 1, states: ["sync opened", "update opened"] });
+    const older = "1969-12-30T00:00:00Z";
+    const newer = "1969-12-31T00:00:00Z";
+    for (const slot of [0, 1]) {
+      expect(await run(slot, 1, older, newer)).toEqual({ updates: 1, syncs: 0, states: ["sync waiting", "update opened"] });
+      expect(await run(slot, 1, newer, older)).toEqual({ updates: 0, syncs: 1, states: ["sync opened", "update waiting"] });
+      expect(await run(slot, 2, newer, older)).toEqual({ updates: 1, syncs: 1, states: ["sync opened", "update opened"] });
+    }
   });
 
   describe("on a busy account", () => {
     const pkg = (name: string, dep: boolean): RepoSnapshot => ({ name, private: false, defaultBranch: "main", manifests: [{ path: "", manifest: dep ? { name: "demo", private: true, devDependencies: { "@ex/tool": "^1.0.0" } } : { name: "@ex/tool", version: "1.1.0" } }], lockKind: "pnpm", resolved: dep ? { "": { "@ex/tool": "1.0.0" } } : {}, warnings: [] });
     const p = () => plan(buildGraph({ owner: OWNER, repos: [pkg("demo-repo", true), pkg("tool-repo", false)], npm: { "@ex/tool": { exists: true, latest: "1.1.0" } }, now: new Date("2026-01-01T00:00:00Z") }));
-    const run = async (o: { slot: number; busy: number; urgent?: string[] }) => {
-      const { gh } = server(repoRoutes("demo-repo"));
+    // The update waits from 1969-12-30. The sync waits from the date of the template commit, or from the start of the run.
+    const run = async (o: { slot: number; busy: number; urgent?: string[]; template?: string }) => {
+      const { gh } = server(repoRoutes("demo-repo", o.template ? { [`GET ${base}/template/commits/${NEW}`]: () => [200, { commit: { committer: { date: o.template } } }] } : {}));
       const order: string[] = [];
       const inner = syncer([]);
       const up: SyncUpdater = { sync: async (job, ctx) => { order.push("sync"); return inner.sync(job, ctx); } };
       const updater: Updater = { async update() { order.push("update"); return { status: "pushed", sha: "s8", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
-      const r = await apply({ owner: OWNER, plan: p(), gh, updater, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes: 5, runnersBusy: async () => o.busy, urgent: o.urgent ?? null, now: new Date(o.slot * RUN_MS) });
+      const r = await apply({ owner: OWNER, plan: p(), gh, updater, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes: 5, runnersBusy: async () => o.busy, urgent: o.urgent ?? null, needSince: () => "1969-12-30T00:00:00Z", now: new Date(o.slot * RUN_MS) });
       return { order, sync: r.results.find((x) => x.kind === SYNC_KIND) };
     };
 
@@ -571,13 +578,106 @@ describe("apply with the template sync", () => {
       }
     });
 
-    it("gives the sync its turn when the account is not busy", async () => {
-      expect((await run({ slot: 1, busy: BUSY_LIMIT - 1 })).order).toEqual(["sync", "update"]);
-      expect((await run({ slot: 0, busy: BUSY_LIMIT - 1 })).order).toEqual(["update", "sync"]);
+    it("gives the sync its turn when the account is not busy, by the longer wait", async () => {
+      for (const slot of [0, 1]) {
+        expect((await run({ slot, busy: BUSY_LIMIT - 1, template: "1969-12-29T00:00:00Z" })).order).toEqual(["sync", "update"]);
+        expect((await run({ slot, busy: BUSY_LIMIT - 1, template: "1969-12-31T00:00:00Z" })).order).toEqual(["update", "sync"]);
+      }
     });
 
-    it("puts an urgent update before the sync, also in the turn of the sync", async () => {
-      expect((await run({ slot: 1, busy: 0, urgent: ["@ex/tool"] })).order).toEqual(["update", "sync"]);
+    it("puts an urgent update before a sync that waited longer", async () => {
+      for (const slot of [0, 1]) expect((await run({ slot, busy: 0, urgent: ["@ex/tool"], template: "1969-01-01T00:00:00Z" })).order).toEqual(["update", "sync"]);
+    });
+  });
+
+  describe("one queue for the updates, the syncs and their waits", () => {
+    // lib-repo needs @ex/tool 1.1.0, which npm published on 11-09 at 10:00Z. Each repository of `pushed` has a sync pull
+    // request with a conflict and its last push at its time. The template commit of 11-09 20:20Z gives a new sync to
+    // lib-repo, tool-repo and each repository of `news`. The first run starts at 20:30Z.
+    const NEED = "2026-11-09T10:00:00Z";
+    const tools: Record<string, NpmInfo> = { "@ex/tool": { exists: true, latest: "1.1.0", versions: ["1.0.0", "1.1.0"], times: { "1.0.0": "2026-10-01T00:00:00Z", "1.1.0": NEED } } };
+    const first = Math.floor(Date.parse("2026-11-09T20:40:00Z") / RUN_MS);
+    const snap = (name: string, manifest: Manifest, resolved: Resolved = {}): RepoSnapshot => ({ name, private: false, defaultBranch: "main", manifests: [{ path: "", manifest }], lockKind: "pnpm", resolved, warnings: [] });
+    /**
+     * This function makes run `k`. With `stable`, the update waits from the publish time (`needStarts`), else from the
+     * start of the run. A pushed sync pull request gets the time of the run as its last push. With `done`, lib-repo has
+     * its update already. The function gives the pushes in their order and the report.
+     */
+    const run = async (k: number, pushed: Record<string, string>, maxPushes: number, o: { stable: boolean; news?: string[]; done?: boolean }) => {
+      const prs = Object.keys(pushed);
+      const news = o.news ?? [];
+      const routes: Record<string, Handler> = {};
+      for (const repo of [...prs, ...news, "lib-repo", "tool-repo"]) Object.assign(routes, repoRoutes(repo));
+      prs.forEach((repo, i) => {
+        const n = 20 + i;
+        const pr = { number: n, html_url: `u${n}`, node_id: `PR_${n}`, title: "t", body: "x <!-- release-train:fingerprint=000000000000 -->", state: "open", auto_merge: null, updated_at: "2026-11-09T20:30:00Z", head: { sha: `h${n}`, ref: SYNC_BRANCH }, base: { ref: "main" }, labels: [{ name: TRAIN_LABEL }] };
+        routes[`GET ${base}/${repo}/pulls`] = (_b, u) => [200, u.searchParams.get("state") === "open" ? [pr] : []];
+        routes[`GET ${base}/${repo}/pulls/${n}`] = () => [200, { ...pr, mergeable: false }];
+        routes[`GET ${base}/${repo}/commits/h${n}`] = () => [200, { commit: { committer: { date: pushed[repo] } } }];
+      });
+      routes[`GET ${base}/template/commits/${NEW}`] = () => [200, { commit: { committer: { date: "2026-11-09T20:20:00Z" } } }];
+      const order: string[] = [];
+      const inner = syncer([]);
+      const up: SyncUpdater = { sync: async (job, ctx) => { order.push(`sync ${job.repo}`); return inner.sync(job, ctx); } };
+      const updater: Updater = { async update(u) { order.push(`update ${u.repo}`); return { status: "pushed", sha: "s8", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
+      const repos = [
+        ...[...prs, ...news].map((name) => snap(name, { name, private: true })),
+        snap("lib-repo", { name: "lib", private: true, devDependencies: { "@ex/tool": "^1.0.0" } }, { "": { "@ex/tool": o.done ? "1.1.0" : "1.0.0" } }),
+        snap("tool-repo", { name: "@ex/tool", version: "1.1.0" }),
+      ];
+      const p = plan(buildGraph({ owner: OWNER, repos, npm: tools, now: new Date("2026-01-01T00:00:00Z") }));
+      const now = new Date((first + k) * RUN_MS);
+      const starts = needStarts(tools, {}, now.toISOString(), (key) => key);
+      const { gh } = server(routes);
+      const report = await apply({ owner: OWNER, plan: p, gh, updater, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no" }, maxPushes, now, ...(o.stable ? { needSince: (u) => starts.since(u.repo, u.items) } : {}) });
+      for (const job of inner.jobs) if (job.repo in pushed) pushed[job.repo] = now.toISOString();
+      return { order, report };
+    };
+    const olds = (): Record<string, string> => ({ "old-a": "2026-11-08T11:38:00Z", "old-b": "2026-11-08T11:39:00Z", "old-c": "2026-11-08T11:40:00Z" });
+
+    it("orders today's case by the start of each wait: old syncs, then the update, then the new syncs", async () => {
+      // Keys: old-a, old-b and old-c 11-08, the update 11-09 10:00Z, the new syncs 20:20Z. The limit is 5.
+      const { order, report } = await run(0, olds(), 5, { stable: true, news: ["new-1", "new-2"] });
+      expect(order.slice(0, 4)).toEqual(["sync old-a", "sync old-b", "sync old-c", "update lib-repo"]);
+      expect(order).toHaveLength(5);
+      expect(["sync new-1", "sync new-2", "sync lib-repo", "sync tool-repo"]).toContain(order[4]);
+      expect(report.startFallbacks).toBeUndefined();
+      // With no start of the need, the update waits from the start of the run, so it is behind each sync.
+      const fallback = await run(0, olds(), 5, { stable: false, news: ["new-1", "new-2"] });
+      expect(fallback.order).not.toContain("update lib-repo");
+      expect(fallback.report.startFallbacks).toBe(1);
+      expect(applySummary(fallback.report)).toContain("Updates with no known start of their need, which wait from the start of this run: 1.");
+    });
+
+    it("gives a sync and an update each their push within 2 runs at a limit of 1, in both orders", async () => {
+      // The bound is floor((Q - 1 + M) / L) + 1 runs, with Q = 2 (the two items), M = 0 (no later arrival with an older key) and L = 1.
+      for (const syncPush of ["2026-11-09T12:00:00Z", "2026-11-08T12:00:00Z"]) {
+        const pushed = { "old-a": syncPush };
+        const firstPush = new Map<string, number>();
+        for (let k = 0; k < 2; k++) {
+          const { order } = await run(k, pushed, 1, { stable: true, done: firstPush.has("update lib-repo") });
+          for (const x of order) if (!firstPush.has(x)) firstPush.set(x, k);
+        }
+        expect(firstPush.get("update lib-repo")).toBe(syncPush > NEED ? 0 : 1);
+        expect(firstPush.get("sync old-a")).toBe(syncPush > NEED ? 1 : 0);
+      }
+    });
+
+    it("lets an update with a stable key overtake newer sync rebuilds within the bound", async () => {
+      // old-a waited longer than the need, old-b and old-c are newer, and each sync pushes again in each run (a conflict).
+      // Q = 2 at the first run (old-a and the update) and M = 0, so the bound is floor((2 - 1 + 0) / 1) + 1 = 2 runs.
+      const pushed = { "old-a": "2026-11-08T11:38:00Z", "old-b": "2026-11-09T12:00:00Z", "old-c": "2026-11-09T13:00:00Z" };
+      let at = -1;
+      for (let k = 0; k < 6 && at < 0; k++) if ((await run(k, pushed, 1, { stable: true })).order.includes("update lib-repo")) at = k;
+      expect(at + 1).toBeLessThanOrEqual(Math.floor((2 - 1 + 0) / 1) + 1);
+      expect(at).toBe(1);
+      // With the start of the run as its key, the update is behind each rebuild in each run, and 6 runs do not push it.
+      const again = { "old-a": "2026-11-08T11:38:00Z", "old-b": "2026-11-09T12:00:00Z", "old-c": "2026-11-09T13:00:00Z" };
+      for (let k = 0; k < 6; k++) {
+        const { order, report } = await run(k, again, 1, { stable: false });
+        expect(order).not.toContain("update lib-repo");
+        expect(report.startFallbacks).toBe(1);
+      }
     });
   });
 

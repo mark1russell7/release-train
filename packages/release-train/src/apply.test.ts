@@ -1,6 +1,7 @@
 // All repository and package names in these tests are made up.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import {
   BLOCKED_LABEL,
@@ -822,7 +823,8 @@ describe("the pace of the update pushes", () => {
       expect(first.results.find((x) => x.kind === "train-merge")?.detail).toContain("The train merged main into the branch, so CI runs again.");
       const b = first.results.find((x) => x.repo === "b-repo");
       expect(b).toMatchObject({ state: "waiting", paced: true });
-      expect(b?.detail).toContain("keeps 1 turn(s) for an older merge of the default branch");
+      // The merge took one place of the limit, so the second update waits for a later run.
+      expect(b?.detail).toContain("This run pushed 2 branches, the most of one run");
     });
 
     it("waits behind pushes that waited longer, and gets its turn when they are done", async () => {
@@ -987,14 +989,18 @@ describe("the pace of the update pushes", () => {
     };
     const all = ["mid-repo", "top-repo", "a-repo", "b-repo", "z-repo"];
 
-    it("keeps a later wave behind the earlier wave, and pushes first the update that a later wave waits for", async () => {
+    it("keeps a later wave behind the earlier wave, and pushes first the update that an older pull request waits for", async () => {
       const p = waves();
       const later = selectUpdates(p).waiting.find((w) => w.repo === "top-repo");
       expect(later?.dependsOn).toContain("release:mid-repo");
       expect(selectUpdates(p).ready.every((u) => u.wave === 0)).toBe(true);
       for (let n = 0; n < 8; n++) {
+        // top-repo has an open pull request from before the run. mid-repo inherits its wait, so it is the oldest in each slot.
+        const m = memory(all);
+        m.prs.set("top-repo", pull(11, "top-repo"));
+        m.pushed.set("top-repo", "1969-12-01T00:00:00Z");
         const up = once();
-        const r = await apply({ owner: OWNER, plan: p, gh: memory(all).gh, updater: up, dryRun: false, maxPushes: 1, now: slot(n) });
+        const r = await apply({ owner: OWNER, plan: p, gh: m.gh, updater: up, dryRun: false, maxPushes: 1, now: slot(n) });
         expect(up.pushed).toEqual(["mid-repo"]);
         const top = r.results.find((x) => x.repo === "top-repo");
         expect(top).toMatchObject({ state: "waiting" });
@@ -1009,6 +1015,92 @@ describe("the pace of the update pushes", () => {
       for (let n = 0; n < 4; n++) await apply({ owner: OWNER, plan: p, gh: m.gh, updater: up, dryRun: false, maxPushes: 1, now: slot(2 * n) });
       expect([...up.pushed].sort()).toEqual(["a-repo", "b-repo", "mid-repo", "z-repo"]);
     });
+  });
+
+  describe("as one queue, by fast-check", () => {
+    /** The start of the need of key `k`: minute `k` of 1969-12-01. Each start is before each run. */
+    const keyTime = (k: number): string => new Date(Date.parse("1969-12-01T00:00:00Z") + k * 60_000).toISOString();
+    /**
+     * This function runs the train until each update is pushed. Before run r, the repositories of `arrivals[r]` arrive,
+     * with their stable keys. A pushed pull request merges before the next run. The function gives for each run the
+     * candidates in key order and the pushes, and for each repository its run of arrival and of push.
+     */
+    const simulate = async (arrivals: readonly (readonly { name: string; key: number }[])[], limit: number) => {
+      const names = arrivals.flat().map((a) => a.name);
+      const m = memory(names);
+      const up = once();
+      const keys = new Map<string, number>();
+      const arrived = new Map<string, number>();
+      const pushedIn = new Map<string, number>();
+      const waiting: string[] = [];
+      const runs: { order: string[]; pushed: string[] }[] = [];
+      for (let r = 0; r < arrivals.length || waiting.length > 0; r++) {
+        if (r > 100) throw new Error("the simulation does not end");
+        for (const a of arrivals[r] ?? []) {
+          keys.set(a.name, a.key);
+          arrived.set(a.name, r);
+          waiting.push(a.name);
+        }
+        const order = [...waiting].sort((x, y) => (keys.get(x) ?? 0) - (keys.get(y) ?? 0));
+        const before = up.pushed.length;
+        if (waiting.length > 0) {
+          await apply({ owner: OWNER, plan: fan(waiting), gh: m.gh, updater: up, dryRun: false, maxPushes: limit, needSince: (u) => keyTime(keys.get(u.repo) ?? 0), now: slot(r) });
+        }
+        const pushed = up.pushed.slice(before);
+        for (const name of pushed) {
+          m.prs.delete(name);
+          waiting.splice(waiting.indexOf(name), 1);
+          pushedIn.set(name, r);
+        }
+        runs.push({ order, pushed });
+      }
+      return { runs, keys, arrived, pushedIn };
+    };
+    /**
+     * A backlog of at most 4 L repositories at the first run, then at most L new repositories in each run, with distinct
+     * keys. Without the backlog, each run pushes all candidates, and the order has no effect.
+     */
+    const scenario = fc
+      .integer({ min: 1, max: 3 })
+      .chain((limit) => fc.tuple(fc.constant(limit), fc.integer({ min: 0, max: 4 * limit }), fc.array(fc.integer({ min: 0, max: limit }), { maxLength: 4 })))
+      .chain(([limit, backlog, more]) => {
+        const counts = [backlog, ...more];
+        const total = counts.reduce((a, b) => a + b, 0);
+        return fc.uniqueArray(fc.integer({ min: 0, max: 50_000 }), { minLength: total, maxLength: total }).map((keys) => {
+          let i = 0;
+          const arrivals = counts.map((c) => Array.from({ length: c }, () => ({ name: `r${i}-repo`, key: keys[i++] as number })));
+          return { limit, arrivals };
+        });
+      });
+    const params = { numRuns: 40, seed: 20261109 };
+
+    it("pushes in each run a prefix of the key order of its candidates", async () => {
+      await fc.assert(
+        fc.asyncProperty(scenario, async ({ limit, arrivals }) => {
+          const { runs } = await simulate(arrivals, limit);
+          for (const run of runs) expect(run.pushed).toEqual(run.order.slice(0, limit));
+        }),
+        params,
+      );
+    }, 120_000);
+
+    it("pushes each update within floor((Q - 1 + M) / L) + 1 runs of its arrival", async () => {
+      // Q is the place of the update in the key order at its arrival. M is the count of later arrivals with an older key.
+      // Each run pushes L candidates from the front, so at most Q - 1 + M candidates go before the update.
+      await fc.assert(
+        fc.asyncProperty(scenario, async ({ limit, arrivals }) => {
+          const { runs, keys, arrived, pushedIn } = await simulate(arrivals, limit);
+          for (const [name, r] of arrived) {
+            const key = keys.get(name) ?? 0;
+            const q = (runs[r]?.order ?? []).filter((x) => (keys.get(x) ?? 0) <= key).length;
+            const later = [...arrived].filter(([x, rx]) => rx > r && (keys.get(x) ?? 0) < key).length;
+            const took = (pushedIn.get(name) ?? Number.POSITIVE_INFINITY) - r + 1;
+            expect(took).toBeLessThanOrEqual(Math.floor((q - 1 + later) / limit) + 1);
+          }
+        }),
+        params,
+      );
+    }, 120_000);
   });
 
   it("reports the same plan in a dry run, and pushes nothing", async () => {
