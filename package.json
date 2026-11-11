@@ -3,7 +3,7 @@
   "name": "release-train-monorepo",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@12.10.1",
+  "packageManager": "pnpm@12.18.0",
   "engines": {
     "node": ">=22"
   },
