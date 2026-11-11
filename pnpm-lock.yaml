@@ -171,7 +171,7 @@ importers:
         version: 0.5.4
       '@mark1russell7/conventions':
         specifier: ^0.41.0
-        version: 0.41.0
+        version: 0.41.1
       '@mark1russell7/cue':
         specifier: github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8
         version: https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8
@@ -195,7 +195,7 @@ importers:
     dependencies:
       '@mark1russell7/conventions':
         specifier: ^0.41.0
-        version: 0.41.0
+        version: 0.41.1
       '@mark1russell7/service':
         specifier: ^0.8.6
         version: 0.8.6(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
@@ -203,8 +203,8 @@ importers:
         specifier: ^0.0.2
         version: 0.0.2
       '@procedures/shell':
-        specifier: ^0.54.1
-        version: 0.54.1
+        specifier: ^0.55.0
+        version: 0.55.0
       semver:
         specifier: ^7.8.5
         version: 7.8.6
@@ -479,15 +479,15 @@ packages:
     engines: {node: '>=22'}
     hasBin: true
 
-  '@mark1russell7/coeval@0.26.1':
-    resolution: {integrity: sha512-fzWgtsl3xpoOwmB5u/ZqEDPQIG6hIkXN3qSZc8uoN2Rv54OrqrMLw5Bgr9gedqIWhfHnT0+61EgkmRkoVg539Q==}
+  '@mark1russell7/coeval@0.29.0':
+    resolution: {integrity: sha512-Z+CEqmOKxyGrGwdKTuBQmzb0fHTcPY3gUA9RS2H6GF/mKFPEuIUIkrN65P7NgSMpb2J0owoduFWINh04RxFRkg==}
 
   '@mark1russell7/collections@0.10.0':
     resolution: {integrity: sha512-WsLRfrej6msQLVqcS17x6KODic8bLf/IuOF2tD04NNbOhWKYCQi0xAEGBCy/TtthxRvRa6Yti2fcpeIQbX/nCA==}
     engines: {node: '>=22.12'}
 
-  '@mark1russell7/conventions@0.41.0':
-    resolution: {integrity: sha512-Dko7OFFLIX2MqXzleltTKE44e1EzUo6RHF870623wrkSHfHkn7mjy703FFnDcG/tP+/s9avgm++6Lz0rGC8l9A==}
+  '@mark1russell7/conventions@0.41.1':
+    resolution: {integrity: sha512-FFBoKGXCzW1HFnF4kd0XjOguh1hGxMk4e6N4lK4uvfkLho7AD9ZahVa5e3QStO/vGDb5ZcnsJRkBvFkMB6hB1A==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -591,8 +591,8 @@ packages:
   '@oxc-project/types@0.156.0':
     resolution: {integrity: sha512-1Duyg48TdJNdyhEB8Xn1L36bT9Pv6GUtlKjHxOys8xkaF/rQq3XJE+bAurSK/AgIz5mGFsb77cn9Pb20+WCScw==}
 
-  '@procedures/client@0.54.1':
-    resolution: {integrity: sha512-nlO3CRri2pNac2OrNQGszcqCyjvSTSTLFfYRvS/u2yUUtxGS0+ZK4Uj+lsqOnzV96yIM4CwySOLRkOS9zgpH8Q==}
+  '@procedures/client@0.55.0':
+    resolution: {integrity: sha512-+JU/TDgY9umJtX0XFR7X4v8pHRdseBGm7fSWRGJ7hoXkqBcQVszMP7OCZWdhNkK2rfUvBscrWTHCN0O8DaZYYw==}
     engines: {node: '>=22'}
     peerDependencies:
       express: ^4.0.0 || ^5.0.0
@@ -600,8 +600,8 @@ packages:
       express:
         optional: true
 
-  '@procedures/shell@0.54.1':
-    resolution: {integrity: sha512-M5UxAfl2nT0NSQaPGm3KVZChOV/gWlO3yU95NS+ZLDodkJ0/x8MSsU/8uzdZSKOemn+YwlaquQbghRDPOVJfNw==}
+  '@procedures/shell@0.55.0':
+    resolution: {integrity: sha512-DpYaAgr3zfVlBsNW++VBF2IurWYdaxRxhL+5KWPkJpJdcixnUdP3CZU002tqIA8ysjPKc54ERfPM4OF/gvuiLQ==}
     engines: {node: '>=22'}
 
   '@publint/pack@0.1.7':
@@ -1348,11 +1348,14 @@ snapshots:
 
   '@mark1russell7/api-report@0.5.4':
     dependencies:
-      '@mark1russell7/conventions': 0.41.0
+      '@mark1russell7/conventions': 0.41.1
 
-  '@mark1russell7/coeval@0.26.1':
+  '@mark1russell7/coeval@0.29.0(zod@4.6.7)':
     dependencies:
+      '@mark1russell7/collections': 0.10.0(zod@4.6.7)
       '@mark1russell7/rigor-generators': 0.1.14
+    transitivePeerDependencies:
+      - zod
 
   '@mark1russell7/collections@0.10.0(zod@4.6.7)':
     dependencies:
@@ -1362,7 +1365,7 @@ snapshots:
     transitivePeerDependencies:
       - zod
 
-  '@mark1russell7/conventions@0.41.0':
+  '@mark1russell7/conventions@0.41.1':
     dependencies:
       yaml: 2.9.1
 
@@ -1420,10 +1423,10 @@ snapshots:
 
   '@oxc-project/types@0.156.0': {}
 
-  '@procedures/client@0.54.1':
+  '@procedures/client@0.55.0':
     dependencies:
       '@mark1russell7/algebra': 0.8.4(zod@4.6.7)
-      '@mark1russell7/coeval': 0.26.1
+      '@mark1russell7/coeval': 0.29.0(zod@4.6.7)
       '@mark1russell7/collections': 0.10.0(zod@4.6.7)
       '@mark1russell7/quantity': 0.3.5(zod@4.6.7)
       '@mark1russell7/service': 0.8.6(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
@@ -1440,9 +1443,9 @@ snapshots:
       - pg
       - utf-8-validate
 
-  '@procedures/shell@0.54.1':
+  '@procedures/shell@0.55.0':
     dependencies:
-      '@procedures/client': 0.54.1
+      '@procedures/client': 0.55.0
       zod: 4.6.7
     transitivePeerDependencies:
       - '@grpc/grpc-js'
