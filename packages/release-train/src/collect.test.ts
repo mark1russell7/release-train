@@ -380,7 +380,7 @@ describe("writeDb", () => {
     writeDb(dir, p, red, new Date("2026-01-02T00:00:00Z"));
     const alert = JSON.parse(readFileSync(file, "utf8")) as { since: string; url: string; relay: string };
     expect([alert.since, alert.url]).toEqual(["2026-01-01T00:00:00.000Z", red["update:app-repo"].url]);
-    expect(alert.relay).toContain("strategist");
+    expect(alert.relay).toContain("maintainer");
     writeDb(dir, p, {}, new Date("2026-01-03T00:00:00Z"));
     expect(readdirSync(join(dir, "db", "alerts"))).toEqual([]);
   });
