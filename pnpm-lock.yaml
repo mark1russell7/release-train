@@ -168,10 +168,10 @@ importers:
     devDependencies:
       '@mark1russell7/api-report':
         specifier: ^0.5.3
-        version: 0.5.3
+        version: 0.5.4
       '@mark1russell7/conventions':
-        specifier: ^0.40.6
-        version: 0.40.8
+        specifier: ^0.41.0
+        version: 0.41.0
       '@mark1russell7/cue':
         specifier: github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8
         version: https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8
@@ -194,8 +194,8 @@ importers:
   packages/release-train:
     dependencies:
       '@mark1russell7/conventions':
-        specifier: ^0.40.6
-        version: 0.40.8
+        specifier: ^0.41.0
+        version: 0.41.0
       '@mark1russell7/service':
         specifier: ^0.8.6
         version: 0.8.6(ws@8.22.1)(zod@4.6.7)
@@ -483,8 +483,8 @@ packages:
       zod:
         optional: true
 
-  '@mark1russell7/api-report@0.5.3':
-    resolution: {integrity: sha512-tdg5rrwp1xTd19dEtfhZ3ZxDSx07AnUWFZuNpMr9zFnUjAx5AYL238L6EFfo6HnevfKlxzQWGOmvpkFB1v80sw==}
+  '@mark1russell7/api-report@0.5.4':
+    resolution: {integrity: sha512-mGVkKw691mC3JfLkUEvmRsnBY4LJAt3svJG5olGfySg7S+Bv3sR2eQuWeeXrrgoeE/diokEBiecYpLUOmjYWOw==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -499,8 +499,8 @@ packages:
     resolution: {integrity: sha512-/SBxY5LOLjIYuBiSf0hdxA6OeGPJUIAHSQSepVDZVnCLEvY1Jte0E3ec0ahN3oyO7oE677FY9d3LuuN18nyv3g==}
     engines: {node: '>=22.12'}
 
-  '@mark1russell7/conventions@0.40.8':
-    resolution: {integrity: sha512-d8yzKBaIZH8H9GkUOCBapwbQTKqT+oB34twrxohkylfLtO4oljLew/s+UFqWR5qfddi8a8sfEvo7+WWotbiCTw==}
+  '@mark1russell7/conventions@0.41.0':
+    resolution: {integrity: sha512-Dko7OFFLIX2MqXzleltTKE44e1EzUo6RHF870623wrkSHfHkn7mjy703FFnDcG/tP+/s9avgm++6Lz0rGC8l9A==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -1388,9 +1388,9 @@ snapshots:
     optionalDependencies:
       zod: 4.6.7
 
-  '@mark1russell7/api-report@0.5.3':
+  '@mark1russell7/api-report@0.5.4':
     dependencies:
-      '@mark1russell7/conventions': 0.40.8
+      '@mark1russell7/conventions': 0.41.0
 
   '@mark1russell7/coeval@0.22.0': {}
 
@@ -1404,7 +1404,7 @@ snapshots:
 
   '@mark1russell7/collections@0.5.0': {}
 
-  '@mark1russell7/conventions@0.40.8':
+  '@mark1russell7/conventions@0.41.0':
     dependencies:
       yaml: 2.9.1
 
