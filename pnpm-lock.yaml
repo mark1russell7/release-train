@@ -198,13 +198,13 @@ importers:
         version: 0.41.0
       '@mark1russell7/service':
         specifier: ^0.8.6
-        version: 0.8.6(ws@8.22.1)(zod@4.6.7)
+        version: 0.8.6(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
       '@mark1russell7/text':
         specifier: ^0.0.2
         version: 0.0.2
       '@procedures/shell':
-        specifier: ^0.52.0
-        version: 0.52.0
+        specifier: ^0.54.1
+        version: 0.54.1
       semver:
         specifier: ^7.8.5
         version: 7.8.6
@@ -232,7 +232,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: ^5.0.3
-        version: 5.1.0(@types/node@26.6.6)(@vitest/coverage-v8@5.1.0)(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@opentelemetry/api@1.10.0)(@types/node@26.6.6)(@vitest/coverage-v8@5.1.0)(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/site:
     dependencies:
@@ -257,7 +257,7 @@ importers:
         version: 8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)
       vitest:
         specifier: ^5.0.3
-        version: 5.1.0(@types/node@26.6.6)(@vitest/coverage-v8@5.1.0)(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
+        version: 5.1.0(@opentelemetry/api@1.10.0)(@types/node@26.6.6)(@vitest/coverage-v8@5.1.0)(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
 
 packages:
 
@@ -456,15 +456,6 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@mark1russell7/algebra@0.8.1':
-    resolution: {integrity: sha512-lpuX4jO56Ht7F6ugymJwPCoL1F6fMVX/HAfuWaxfxBUCTrZxpSwD8qVk6O9M0fqaiyj2XUE+D5fz1XQP6BQlRA==}
-    engines: {node: '>=22.19'}
-    peerDependencies:
-      zod: ^4.1.0
-    peerDependenciesMeta:
-      zod:
-        optional: true
-
   '@mark1russell7/algebra@0.8.3':
     resolution: {integrity: sha512-Z0saYxCDcqZu1leABWqksrIa9y9dbeTjR5l36ZRBqsDW6XfUcM4mWoE90YgzSW86YFP+dcV8y+WCKu8446e/ng==}
     engines: {node: '>=22.19'}
@@ -488,15 +479,11 @@ packages:
     engines: {node: '>=22'}
     hasBin: true
 
-  '@mark1russell7/coeval@0.22.0':
-    resolution: {integrity: sha512-woojpBeRerVqxfFBx0yiR6ibSpm2f9mcfsUPDdvIyT9GKZ2uCtM0S/108Ur765C0rjNKxopwlSH4xXyhf906iA==}
+  '@mark1russell7/coeval@0.26.1':
+    resolution: {integrity: sha512-fzWgtsl3xpoOwmB5u/ZqEDPQIG6hIkXN3qSZc8uoN2Rv54OrqrMLw5Bgr9gedqIWhfHnT0+61EgkmRkoVg539Q==}
 
   '@mark1russell7/collections@0.10.0':
     resolution: {integrity: sha512-WsLRfrej6msQLVqcS17x6KODic8bLf/IuOF2tD04NNbOhWKYCQi0xAEGBCy/TtthxRvRa6Yti2fcpeIQbX/nCA==}
-    engines: {node: '>=22.12'}
-
-  '@mark1russell7/collections@0.5.0':
-    resolution: {integrity: sha512-/SBxY5LOLjIYuBiSf0hdxA6OeGPJUIAHSQSepVDZVnCLEvY1Jte0E3ec0ahN3oyO7oE677FY9d3LuuN18nyv3g==}
     engines: {node: '>=22.12'}
 
   '@mark1russell7/conventions@0.41.0':
@@ -552,33 +539,6 @@ packages:
     resolution: {integrity: sha512-UnBEZVSVSytwFH5pJ5ezlOCEs/19Ur0/REQ+Tq5BYs8uYWSNoP/hZNGx2tdqLN2Rn0u+A41GwieBnuM6DuWS4g==}
     engines: {node: '>=22'}
 
-  '@mark1russell7/service@0.6.5':
-    resolution: {integrity: sha512-USBAaZX8lQ3nmBzaTycF+6xQJyIQ51ZTWIxw9rZnZ5bhaqZe5FydTgVPYr92/gb8VWcOG4jxWsPnLPBBEaxzSA==}
-    engines: {node: '>=22.19'}
-    peerDependencies:
-      '@grpc/grpc-js': ^1.14.6
-      amqplib: ^2.2.0
-      ioredis: ^6.0.0
-      mongodb: ^7.7.0
-      pg: ^8.23.1
-      ws: ^8.22.0
-      zod: ^4.1.0
-    peerDependenciesMeta:
-      '@grpc/grpc-js':
-        optional: true
-      amqplib:
-        optional: true
-      ioredis:
-        optional: true
-      mongodb:
-        optional: true
-      pg:
-        optional: true
-      ws:
-        optional: true
-      zod:
-        optional: true
-
   '@mark1russell7/service@0.8.6':
     resolution: {integrity: sha512-BX5effgTFE+EyT1Id/w9Xr8xcUmRfs+PuvaLhYGGXraXTe1v0ISRiqL3hM3MNi7gCpfvve/n6lSvZoC8pBPlnw==}
     engines: {node: '>=22.19'}
@@ -624,11 +584,15 @@ packages:
     resolution: {integrity: sha512-m1aIB8X+PDekktzr1fYOp1/7gvlh9iL/2M7ktj/GnmPmVrWin0rTADgTm00dKFdWFRzXraCUYkjyCl3jQZHEVg==}
     engines: {node: '>=22.12'}
 
+  '@opentelemetry/api@1.10.0':
+    resolution: {integrity: sha512-lMkyes8iHrG+mk6WH7X70MdCLI2RS0FwNBY1PyQ8UemaijE2m5mv5A0Niy3HtbYTFrgkUEQjFMXmSAk2hQDuPQ==}
+    engines: {node: '>=8.0.0'}
+
   '@oxc-project/types@0.156.0':
     resolution: {integrity: sha512-1Duyg48TdJNdyhEB8Xn1L36bT9Pv6GUtlKjHxOys8xkaF/rQq3XJE+bAurSK/AgIz5mGFsb77cn9Pb20+WCScw==}
 
-  '@procedures/client@0.52.0':
-    resolution: {integrity: sha512-oXqwm2UFz6SFymuuDXc9gkK0m56xStIE8c3zmOfzoDtXCq2yx3c5SjoIOoVmZUsX7IOHZu8ZQXkK7j6GP79amA==}
+  '@procedures/client@0.54.1':
+    resolution: {integrity: sha512-nlO3CRri2pNac2OrNQGszcqCyjvSTSTLFfYRvS/u2yUUtxGS0+ZK4Uj+lsqOnzV96yIM4CwySOLRkOS9zgpH8Q==}
     engines: {node: '>=22'}
     peerDependencies:
       express: ^4.0.0 || ^5.0.0
@@ -636,8 +600,8 @@ packages:
       express:
         optional: true
 
-  '@procedures/shell@0.52.0':
-    resolution: {integrity: sha512-r9+kpmtFqrKIN3Xa7dewbKT0fKT8AnrQ+YeStu3LZ8WbsYqlyZMcA+kncJSIwuo5vnORNJP8KkjUQeM7vhF75g==}
+  '@procedures/shell@0.54.1':
+    resolution: {integrity: sha512-M5UxAfl2nT0NSQaPGm3KVZChOV/gWlO3yU95NS+ZLDodkJ0/x8MSsU/8uzdZSKOemn+YwlaquQbghRDPOVJfNw==}
     engines: {node: '>=22'}
 
   '@publint/pack@0.1.7':
@@ -1370,12 +1334,6 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.6.0
 
-  '@mark1russell7/algebra@0.8.1(zod@4.6.7)':
-    dependencies:
-      '@mark1russell7/quantity': 0.3.0(zod@4.6.7)
-    optionalDependencies:
-      zod: 4.6.7
-
   '@mark1russell7/algebra@0.8.3(zod@4.6.7)':
     dependencies:
       '@mark1russell7/quantity': 0.3.0(zod@4.6.7)
@@ -1392,7 +1350,9 @@ snapshots:
     dependencies:
       '@mark1russell7/conventions': 0.41.0
 
-  '@mark1russell7/coeval@0.22.0': {}
+  '@mark1russell7/coeval@0.26.1':
+    dependencies:
+      '@mark1russell7/rigor-generators': 0.1.14
 
   '@mark1russell7/collections@0.10.0(zod@4.6.7)':
     dependencies:
@@ -1401,8 +1361,6 @@ snapshots:
       '@mark1russell7/rigor-statistics': 0.1.27
     transitivePeerDependencies:
       - zod
-
-  '@mark1russell7/collections@0.5.0': {}
 
   '@mark1russell7/conventions@0.41.0':
     dependencies:
@@ -1436,16 +1394,7 @@ snapshots:
     dependencies:
       '@mark1russell7/rigor-generators': 0.1.14
 
-  '@mark1russell7/service@0.6.5(ws@8.22.1)(zod@4.6.7)':
-    dependencies:
-      '@mark1russell7/algebra': 0.8.1(zod@4.6.7)
-      '@mark1russell7/quantity': 0.3.0(zod@4.6.7)
-      '@mark1russell7/rigor-generators': 0.1.1
-    optionalDependencies:
-      ws: 8.22.1
-      zod: 4.6.7
-
-  '@mark1russell7/service@0.8.6(ws@8.22.1)(zod@4.6.7)':
+  '@mark1russell7/service@0.8.6(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)':
     dependencies:
       '@mark1russell7/algebra': 0.8.4(zod@4.6.7)
       '@mark1russell7/collections': 0.10.0(zod@4.6.7)
@@ -1453,6 +1402,7 @@ snapshots:
       '@mark1russell7/rigor-generators': 0.1.1
       '@mark1russell7/text': 0.0.2
     optionalDependencies:
+      '@opentelemetry/api': 1.10.0
       ws: 8.22.1
       zod: 4.6.7
 
@@ -1466,15 +1416,18 @@ snapshots:
 
   '@mark1russell7/text@0.0.2': {}
 
+  '@opentelemetry/api@1.10.0': {}
+
   '@oxc-project/types@0.156.0': {}
 
-  '@procedures/client@0.52.0':
+  '@procedures/client@0.54.1':
     dependencies:
-      '@mark1russell7/algebra': 0.8.1(zod@4.6.7)
-      '@mark1russell7/coeval': 0.22.0
-      '@mark1russell7/collections': 0.5.0
-      '@mark1russell7/quantity': 0.3.0(zod@4.6.7)
-      '@mark1russell7/service': 0.6.5(ws@8.22.1)(zod@4.6.7)
+      '@mark1russell7/algebra': 0.8.4(zod@4.6.7)
+      '@mark1russell7/coeval': 0.26.1
+      '@mark1russell7/collections': 0.10.0(zod@4.6.7)
+      '@mark1russell7/quantity': 0.3.5(zod@4.6.7)
+      '@mark1russell7/service': 0.8.6(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
+      '@opentelemetry/api': 1.10.0
       '@types/ws': 8.18.2
       ws: 8.22.1
       zod: 4.6.7
@@ -1487,9 +1440,9 @@ snapshots:
       - pg
       - utf-8-validate
 
-  '@procedures/shell@0.52.0':
+  '@procedures/shell@0.54.1':
     dependencies:
-      '@procedures/client': 0.52.0
+      '@procedures/client': 0.54.1
       zod: 4.6.7
     transitivePeerDependencies:
       - '@grpc/grpc-js'
@@ -1641,7 +1594,7 @@ snapshots:
       obug: 3.0.0
       std-env: 4.3.0
       tinyrainbow: 3.2.0
-      vitest: 5.1.0(@types/node@26.6.6)(@vitest/coverage-v8@5.1.0)(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
+      vitest: 5.1.0(@opentelemetry/api@1.10.0)(@types/node@26.6.6)(@vitest/coverage-v8@5.1.0)(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
 
   '@vitest/istanbul-lib-coverage@2.1.0': {}
 
@@ -1909,7 +1862,7 @@ snapshots:
       tsx: 4.23.15
       yaml: 2.9.1
 
-  vitest@5.1.0(@types/node@26.6.6)(@vitest/coverage-v8@5.1.0)(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)):
+  vitest@5.1.0(@opentelemetry/api@1.10.0)(@types/node@26.6.6)(@vitest/coverage-v8@5.1.0)(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)):
     dependencies:
       '@types/chai': 5.2.3
       '@vitest/mocker': 5.1.0(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
@@ -1926,6 +1879,7 @@ snapshots:
       vite: 8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)
       why-is-node-running: 3.2.1
     optionalDependencies:
+      '@opentelemetry/api': 1.10.0
       '@types/node': 26.6.6
       '@vitest/coverage-v8': 5.1.0(vitest@5.1.0)
     transitivePeerDependencies:
