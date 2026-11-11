@@ -32,7 +32,7 @@ jobs:
       security-events: write
       actions: read
     steps:
-      - uses: mark1russell7/template/.github/actions/security-scan@ddf7e495fc88b536e2ea89bb8271ac2d50b28baf # main
+      - uses: mark1russell7/template/.github/actions/security-scan@4466542421ef76bcb3ccf5b5e1765d4f509f8f4f # main
 
   # The one check of this file that the ruleset of main names, next to CI OK (CI.md of
   # mark1russell7/template, "The check of the ruleset"). The scans stay out of ci.yml, because
