@@ -171,17 +171,24 @@ A change of the plan on a green update candidate merges first when the change is
 
 The body of each pull request has the mark `<!-- release-train:attempt=N -->`, after the fingerprint mark. The body of an update also has a mark with its items. The number in the mark counts the builds of the same plan that follow a red result. A new plan, or a build after a green result or a result that is not known, starts at 1. A missing or damaged `attempt` mark counts as 1.
 
-The field `mode` of the policy has three values:
+The field `mode` of the policy has three values. The default is `one-candidate` with the share 0.25:
 
 - `strict`: the train acts by the strict rule and reads no fact of the candidate rules.
-- `shadow`: the default. The train acts by the strict rule. It also reads the facts, logs the decision next to the strict action and counts each pair in the summary. Each decision has a code: a short fixed id of the step that made it, for example `green-behind`, `main-red` or `pace-wait`. The log of a private repository has its hash label and the code, but no reason.
+- `shadow`: the train acts by the strict rule. It also reads the facts, logs the decision next to the strict action and counts each pair in the summary. Each decision has a code: a short fixed id of the step that made it, for example `green-behind`, `main-red` or `pace-wait`. The log of a private repository has its hash label and the code, but no reason.
   - Two cases that have the same rule also have different codes. A list of files that GitHub cut gives `surface-list-cut`, and a real change of the surface gives `surface-changed`. A merge of a candidate that is behind with no read of the default branch gives `green-behind-main-no-read`, and a merge with a read gives `green-behind`.
   - The log line of a pair is `<label>: candidate rules (<kind>): strict <action>, candidate <action> by <rule> [<code>]: <reason>.`. The line of a private repository stops after the code.
   - The table of the pairs in the summary has the columns strict rule, candidate rules, rule, code and count. In the report, each row of `candidates.pairs` is `{ today, next, rule, code, count }`.
   - A pair goes into the table only when the candidate rules can decide differently from the strict rule. A merge of the default branch into a candidate starts CI, so it counts as a strict push.
   - A cause outside the rules can hold the strict action first. The causes are the push limit of the run, busy runners, a young version, an open release run, a skip and an error. Then the decision goes into a second table, "Held by the run before the rules", with its cause. For a held branch with no candidate, the run reads no fact.
   - The log line of a held branch is `<label>: candidate rules (<kind>): held by <cause> before the rules, candidate <action> by <rule> [<code>]: <reason>.`. The line of a private repository stops after the code. The line of a branch with no fact read stops after `not read`.
-- `one-candidate`: the train acts on the decision. The field `share` selects a part of the repositories, by a hash of the label of the log. A repository below the share gets this mode, and the others get `shadow`. Only this mode makes the label `release-train:retry` and tells it in the body.
+- `one-candidate`: the default mode. The train acts on the decision. The field `share` selects a part of the repositories, by a hash of the label of the log. A repository below the share gets this mode. Only this mode makes the label `release-train:retry` and tells it in the body.
+  - The default share is 0.25. The repositories above the share stay in the mode `shadow` as the control group. Their log lines and tables do not change.
+  - The log line of an applied decision is `<label>: candidate rules (<kind>): acted <action> by <rule> [<code>], result <state>, held by <cause>: <reason>.`. The part `, held by <cause>` is there only when a cause stopped the decision. The line of a private repository stops before the reason.
+  - A failed read of the facts gives the line `<label>: candidate rules (<kind>): acted not read, result <state>.`.
+  - The record keeps the last decision of the run. After a refused merge, it is the second decision.
+  - The causes of this mode are the causes of the mode `shadow`, and also `merge-failed`. `merge-failed`: GitHub refused the merge of a candidate, and no push follows. A dry run gives the result `planned` and no cause.
+  - The summary has a third table, "Applied decisions", with the columns decision, rule, code, held by, result and count. An empty value shows as `-`. In the report, each row of `candidates.acted` is `{ action, rule, code, held, state, count }`, sorted by count from high to low.
+  - The field `candidates.share` of the report is the share of the policy. The summary line is `Candidate rules (mode <mode>, share <share>): <A> decisions applied, <N> decisions compared, <M> held by the run before the rules, <K> GitHub requests for their facts.`.
 
 The facts cost GitHub requests, all with GET. CI costs 3, mergeable 1, behind 1, surface 1, the runs of other branches 2 and the last push 1 or 2. The cost of the last candidate is 1 request, plus 1 for each of its workflow runs. The default branch costs 2 requests after the CI read: its head commit and the runs of that commit. With a bound, it costs 2 more requests for the closed pull requests, plus 1 for each train merge in the window. The run keeps each response, and the summary gives the count of the requests.
 

@@ -48,10 +48,13 @@ export interface CandidatePolicy {
   readonly retryLabel: string;
 }
 
-/** The policy of the train. This version logs the decisions of the candidate rules and does not act on them. */
+/**
+ * The policy of the train. The candidate rules act for a share of 0.25 of the repositories, by the hash of the label of
+ * the log. The other repositories stay in the mode `shadow`: the train logs the decision of the rules and does not act on it.
+ */
 export const CANDIDATE_POLICY: CandidatePolicy = {
-  mode: "shadow",
-  share: 1,
+  mode: "one-candidate",
+  share: 0.25,
   ratePublic: 5,
   ratePrivate: 1,
   paceFloorHours: 1,

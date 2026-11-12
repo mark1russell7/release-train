@@ -537,7 +537,7 @@ describe("apply with the template sync", () => {
       );
       const up = syncer([]);
       const lines: string[] = [];
-      const r = await apply({ owner: OWNER, plan: onePlan("demo-repo"), gh: s.gh, updater: noUpdates, dryRun: false, log: (l) => lines.push(l), candidatePolicy: { ...CANDIDATE_POLICY, mode }, sync: { updater: up, facts: runFacts(), workflows: "no" } });
+      const r = await apply({ owner: OWNER, plan: onePlan("demo-repo"), gh: s.gh, updater: noUpdates, dryRun: false, log: (l) => lines.push(l), candidatePolicy: { ...CANDIDATE_POLICY, mode, share: 1 }, sync: { updater: up, facts: runFacts(), workflows: "no" } });
       return { r, up, lines, calls: s.calls };
     };
     // Shadow: the strict rule builds the branch again, and the candidate rules would merge it.
@@ -555,6 +555,10 @@ describe("apply with the template sync", () => {
     expect(one.up.jobs).toEqual([]);
     expect(one.r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "merged", ci: "green" });
     expect(one.calls.find((c) => c.method === "PUT")?.body).toMatchObject({ sha: "s6" });
+    // The applied decision has a record on the sync branch too, and the pairs of the mode shadow stay empty.
+    expect(one.r.candidates?.pairs).toEqual([]);
+    expect(one.r.candidates?.acted).toEqual([{ action: "merge", rule: "R2", code: "green-behind-main-no-read", held: null, state: "merged", count: 1 }]);
+    expect(one.lines.some((l) => l.startsWith("demo-repo: candidate rules (sync): acted merge by R2 [green-behind-main-no-read], result merged: green and 2 commit(s) behind"))).toBe(true);
   });
 
   it("waits for the next run after maxPushes pushes, and while the runners are busy", async () => {
