@@ -553,7 +553,7 @@ function replay(choice: PlanChangeChoice): { pushes: number; kept: number; minut
 }
 
 describe("the replay of planChangeOnGreen", () => {
-  it("merge-first keeps more pushes for fewer runner minutes than replace", () => {
+  it("merge-first merges each push that it keeps, and replace merges none, for the same runner minutes", () => {
     const first = replay("merge-first-when-monotone");
     const replace = replay("replace");
     expect(first.merges).toBeGreaterThan(replace.merges);
