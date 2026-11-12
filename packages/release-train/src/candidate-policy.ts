@@ -168,7 +168,7 @@ export const CANDIDATE_CODES = [
   "building",
   "merge-refused",
   "not-mergeable",
-  "surface-cut",
+  "surface-list-cut",
   "surface-changed",
   "plan-changed-no-items",
   "plan-changed",
@@ -177,6 +177,7 @@ export const CANDIDATE_CODES = [
   "red-merges-bound",
   "green-current",
   "green-behind",
+  "green-behind-main-no-read",
   "no-check-plan-changed",
   "no-check-behind",
   "no-check",
@@ -320,7 +321,7 @@ function green(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChan
   const behind = f.behind === null || f.behind > 0;
   if (behind) {
     if (f.surfaceChanged === undefined) return { need: "surface" };
-    if (f.surfaceChanged && f.surfaceCut) return stale("surface-cut", "GitHub cut a list of files of the surface check at 300 files, so the check has no read and counts a change");
+    if (f.surfaceChanged && f.surfaceCut) return stale("surface-list-cut", "GitHub cut a list of files of the surface check at 300 files, so the check has no read and counts a change");
     if (f.surfaceChanged) return stale("surface-changed", "the default branch changed a file of the surface of the candidate");
   }
   // 4b: a change of the plan. A missing or empty items mark gives no read, and no read is not monotone.
@@ -340,6 +341,7 @@ function green(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChan
   }
   // 4d: R4, the red default branch.
   let note = "";
+  let mainRead = true;
   if (behind) {
     if (f.mainHealth === undefined) return { need: "mainHealth" };
     const h = f.mainHealth;
@@ -348,11 +350,14 @@ function green(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChan
     if (p.redMainBound !== null && h.redMerges !== null && h.redMerges >= p.redMainBound) {
       return paced(p, f, { action: "push", rule: "R4", code: "red-merges-bound", reason: `${h.redMerges} red train merges in ${p.redMainWindowDays} days, so the strict rule builds a candidate that is behind`, attempt: next, rebuild: true });
     }
-    if (h.head === "no-read") note = ", and the default branch has no CI result (no read)";
+    if (h.head === "no-read") {
+      note = ", and the default branch has no CI result (no read)";
+      mainRead = false;
+    }
   }
-  // 4e: the merge.
+  // 4e: the merge. A merge with no read of the default branch has its own code, so the shadow data counts it.
   const where = behind ? `green and ${f.behind ?? "some"} commit(s) behind, with no change of its surface` : "green on the current default branch";
-  return { decision: { action: "merge", rule: "R2", code: behind ? "green-behind" : "green-current", reason: `${where}${planChanged ? ", and the plan change is monotone" : ""}${note}` } };
+  return { decision: { action: "merge", rule: "R2", code: !behind ? "green-current" : mainRead ? "green-behind" : "green-behind-main-no-read", reason: `${where}${planChanged ? ", and the plan change is monotone" : ""}${note}` } };
 }
 
 /**

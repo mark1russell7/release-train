@@ -1811,13 +1811,13 @@ describe("the candidate rules in a run of apply", () => {
     expect(r.results[0]).toMatchObject({ state: "updated" });
     expect(s.calls.some((c) => c.method === "PUT")).toBe(false);
     expect(r.candidates?.mode).toBe("shadow");
-    // Each row of the pairs has the code of the decision.
-    expect(r.candidates?.pairs).toEqual([{ today: "push", next: "merge", rule: "R2", code: "green-behind", count: 1 }]);
+    // Each row of the pairs has the code of the decision. The routes have no run of the default branch, so the merge has no read of it.
+    expect(r.candidates?.pairs).toEqual([{ today: "push", next: "merge", rule: "R2", code: "green-behind-main-no-read", count: 1 }]);
     expect(r.candidates?.requests).toBeGreaterThan(0);
     const summary = applySummary(publicReport(r));
     expect(summary).toContain("Candidate rules (mode shadow): 1 decisions compared");
     expect(summary).toContain("| Strict rule | Candidate rules | Rule | Code | Count |");
-    expect(summary).toContain("| push | merge | R2 | green-behind | 1 |");
+    expect(summary).toContain("| push | merge | R2 | green-behind-main-no-read | 1 |");
     // The marks of the body: the attempt and the items. CI was green before the push, so the attempt starts at 1 again.
     // The mode shadow tells nothing of the retry label.
     const body = patched(s.calls);
@@ -1833,7 +1833,7 @@ describe("the candidate rules in a run of apply", () => {
     const pair = lines.filter((l) => l.includes("candidate rules (update)"));
     expect(pair).toHaveLength(1);
     // The line of a private repository has the code and no reason.
-    expect(pair[0]).toMatch(/: candidate rules \(update\): strict push, candidate merge by R2 \[green-behind\]\.$/);
+    expect(pair[0]).toMatch(/: candidate rules \(update\): strict push, candidate merge by R2 \[green-behind-main-no-read\]\.$/);
     for (const text of [...lines, applySummary(publicReport(r)), JSON.stringify(publicReport(r))]) expect(text).not.toContain(S);
   });
 

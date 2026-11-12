@@ -175,6 +175,7 @@ The field `mode` of the policy has three values:
 
 - `strict`: the train acts by the strict rule and reads no fact of the candidate rules.
 - `shadow`: the default. The train acts by the strict rule. It also reads the facts, logs the decision next to the strict action and counts each pair in the summary. Each decision has a code: a short fixed id of the step that made it, for example `green-behind`, `main-red` or `pace-wait`. The log of a private repository has its hash label and the code, but no reason.
+  - Two cases that have the same rule also have different codes. A list of files that GitHub cut gives `surface-list-cut`, and a real change of the surface gives `surface-changed`. A merge of a candidate that is behind with no read of the default branch gives `green-behind-main-no-read`, and a merge with a read gives `green-behind`.
   - The log line of a pair is `<label>: candidate rules (<kind>): strict <action>, candidate <action> by <rule> [<code>]: <reason>.`. The line of a private repository stops after the code.
   - The table of the pairs in the summary has the columns strict rule, candidate rules, rule, code and count. In the report, each row of `candidates.pairs` is `{ today, next, rule, code, count }`.
   - A pair goes into the table only when the candidate rules can decide differently from the strict rule. A merge of the default branch into a candidate starts CI, so it counts as a strict push.

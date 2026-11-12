@@ -138,7 +138,9 @@ describe("R2, exact staleness", () => {
 
   it("R2: a list of files that GitHub cut gives its own reason, not the reason of a real change", () => {
     const d = decision(facts({ behind: 40, surfaceChanged: true, surfaceCut: true }));
-    expect(d).toMatchObject({ action: "push", rule: "R2", rebuild: true });
+    // The code tells the two cases apart, so the log of a private repository also tells them apart.
+    expect(d).toMatchObject({ action: "push", rule: "R2", code: "surface-list-cut", rebuild: true });
+    expect(decision(facts({ behind: 40, surfaceChanged: true }))).toMatchObject({ action: "push", rule: "R2", code: "surface-changed", rebuild: true });
     expect(d.reason).toContain(`cut a list of files of the surface check at ${COMPARE_FILES_MAX} files`);
     expect(d.reason).not.toContain("changed a file of the surface");
     // A real change keeps its reason.
@@ -274,9 +276,11 @@ describe("R4, the red default branch", () => {
   });
 
   it("R4: a head that is pending, green or has no read goes on to the merge", () => {
-    for (const head of ["pending", "green", "no-read"] as const) {
+    for (const head of ["pending", "green"] as const) {
       expect(decision(facts({ ...behind, ...health(head) }))).toMatchObject({ action: "merge", rule: "R2", code: "green-behind" });
     }
+    // A merge with no read of the default branch has its own code.
+    expect(decision(facts({ ...behind, ...health("no-read") }))).toMatchObject({ action: "merge", rule: "R2", code: "green-behind-main-no-read" });
   });
 
   it("R4: no read of the default branch is not green, and the reason tells it", () => {
@@ -459,7 +463,7 @@ describe("the codes of the decisions", () => {
     ["building", facts(ci("running"))],
     ["merge-refused", facts({ behind: 3, mergeRefused: true })],
     ["not-mergeable", facts({ mergeable: false })],
-    ["surface-cut", facts({ behind: 40, surfaceChanged: true, surfaceCut: true })],
+    ["surface-list-cut", facts({ behind: 40, surfaceChanged: true, surfaceCut: true })],
     ["surface-changed", facts({ behind: 40, surfaceChanged: true })],
     ["plan-changed-no-items", facts({ ...plan2, open: { ...facts().open!, items: null } })],
     ["plan-changed", facts({ plan: { fingerprint: "fp2", items: [{ dep: "@acme/util", to: "2.0.0" }] } })],
@@ -468,6 +472,7 @@ describe("the codes of the decisions", () => {
     ["red-merges-bound", facts({ behind: 12, mainHealth: { head: "green", redMerges: 3 } }), { ...P, redMainBound: 3 }],
     ["green-current", facts()],
     ["green-behind", facts({ behind: 40 })],
+    ["green-behind-main-no-read", facts({ behind: 40, mainHealth: { head: "no-read", redMerges: null } })],
     ["no-check-plan-changed", facts({ ...ci("none"), ...plan2 })],
     ["no-check-behind", facts({ ...ci("none"), behind: 3 })],
     ["no-check", facts(ci("none"))],
