@@ -131,7 +131,9 @@ export interface CandidateFacts {
   behind?: number | null;
   /** True when the default branch changed a file of the surface of the candidate since the merge base. */
   surfaceChanged?: boolean;
-  /** The count of the workflow jobs of other branches that are not done. */
+  /** True when GitHub cut a list of files of the surface check short. Then `surfaceChanged` is true, and the check has no read. */
+  surfaceCut?: boolean;
+  /** The count of the workflow runs of other branches that are queued or in progress. A run older than `stuckCiHours` does not count. */
   otherRuns?: number;
   /** The time of the last push of the last candidate, in milliseconds. Null when the branch had no candidate before. */
   lastPushAt?: number | null;
@@ -234,16 +236,16 @@ export function decide(p: CandidatePolicy, f: CandidateFacts): CandidateStep {
   // Step 0: no open pull request.
   if (o === null) return paced(p, f, { action: "push", rule: f.urgent ? "urgent" : "R3", reason: "the branch has no open candidate", attempt: 1, rebuild: false });
   const planChanged = o.fingerprint !== f.plan.fingerprint;
-  const next = planChanged ? 1 : o.attempt + 1;
-  // Step 1: an urgent update pushes as the strict rule does.
+  // Step 1: an urgent update pushes as the strict rule does. Its CI is not read yet, so its new build is attempt 1.
   if (f.urgent) {
     if (planChanged) return done({ action: "push", rule: "urgent", reason: "an urgent update with a new plan", attempt: 1, rebuild: false });
     if (f.mergeable === undefined) return { need: "mergeable" };
     if (f.behind === undefined) return { need: "behind" };
-    if (f.mergeable === false || (f.behind ?? 0) > 0) return done({ action: "push", rule: "urgent", reason: "an urgent update that is not on the current default branch", attempt: next, rebuild: true });
+    if (f.mergeable === false || (f.behind ?? 0) > 0) return done({ action: "push", rule: "urgent", reason: "an urgent update that is not on the current default branch", attempt: buildAttempt(o, planChanged, f.ci), rebuild: true });
   }
   if (f.ci === undefined) return { need: "ci" };
   const building = f.ci.state === "running" && !f.ci.stuck;
+  const next = buildAttempt(o, planChanged, f.ci);
   // Step 2: the retry label passes R3 and R5, but not R1.
   if (o.retryLabel) {
     if (building) return done({ action: "wait", rule: "R1", reason: `building: the label ${p.retryLabel} waits for the end of CI` });
@@ -253,7 +255,15 @@ export function decide(p: CandidatePolicy, f: CandidateFacts): CandidateStep {
   if (building) return done({ action: "wait", rule: "R1", reason: "building" });
   if (f.ci.state === "green") return green(p, f, o, planChanged, next);
   if (f.ci.state === "none") return noCheck(f, planChanged, next);
-  return red(p, f, o, planChanged);
+  return red(p, f, o, planChanged, next);
+}
+
+/**
+ * This function gives the number of the try of a new build of a candidate. The number counts the builds of the same
+ * plan that follow a red result. A new plan, or a build after a green result or a result that is not known, gives 1.
+ */
+function buildAttempt(o: OpenCandidate, planChanged: boolean, ci: CandidateCi | undefined): number {
+  return !planChanged && ci?.state === "failed" ? o.attempt + 1 : 1;
 }
 
 /** Step 4 of the table: a green candidate. */
@@ -267,11 +277,15 @@ function green(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChan
   const behind = f.behind === null || f.behind > 0;
   if (behind) {
     if (f.surfaceChanged === undefined) return { need: "surface" };
+    if (f.surfaceChanged && f.surfaceCut) return stale("GitHub cut a list of files of the surface check at 300 files, so the check has no read and counts a change");
     if (f.surfaceChanged) return stale("the default branch changed a file of the surface of the candidate");
   }
-  // 4b: a change of the plan.
+  // 4b: a change of the plan. A missing or empty items mark gives no read, and no read is not monotone.
   if (planChanged && f.plan) {
     const choice = p.planChangeOnGreen[f.kind];
+    if (choice === "merge-first-when-monotone" && (o.items === null || o.items.length === 0)) {
+      return paced(p, f, { action: "push", rule: "R3", reason: "the plan changed, and the candidate has no items mark, so the monotone check has no read", attempt: 1, rebuild: false });
+    }
     const first = choice === "merge-first-when-monotone" && o.items !== null && f.plan.items !== null && monotone(o.items, f.plan.items);
     if (!first) return paced(p, f, { action: "push", rule: "R3", reason: "the plan changed, and the candidate goes out of date", attempt: 1, rebuild: false });
   }
@@ -307,7 +321,7 @@ function noCheck(f: CandidateFacts, planChanged: boolean, next: number): Candida
 }
 
 /** Step 5 of the table: a red candidate, or a candidate with stuck CI. */
-function red(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChanged: boolean): CandidateStep {
+function red(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChanged: boolean, next: number): CandidateStep {
   const what = f.ci?.stuck ? "CI is stuck" : "red";
   const hint = `or add the label ${p.retryLabel}`;
   // 5a: a new plan.
@@ -318,7 +332,7 @@ function red(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChange
   if (f.lastPushAt === undefined) return { need: "lastPush" };
   const backoffAt = f.lastPushAt === null ? f.now : f.lastPushAt + backoffHours(p, o.attempt) * HOUR_MS;
   if (f.now < backoffAt) return { decision: { action: "wait", rule: "R5", reason: `${what}: next retry at ${at(backoffAt)}, ${hint}`, until: backoffAt } };
-  const step = paced(p, f, { action: "push", rule: "R5", reason: `${what}, the default branch moved and the wait of attempt ${o.attempt} passed`, attempt: o.attempt + 1, rebuild: true });
+  const step = paced(p, f, { action: "push", rule: "R5", reason: `${what}, the default branch moved and the wait of attempt ${o.attempt} passed`, attempt: next, rebuild: true });
   if ("decision" in step && step.decision.action === "wait" && step.decision.until !== undefined) {
     return { decision: { action: "wait", rule: "R5", reason: `${what}: next retry at ${at(step.decision.until)}, ${hint}`, until: step.decision.until } };
   }
@@ -437,11 +451,13 @@ export function bodyItems(body: string | null | undefined): CandidateItem[] | nu
 
 /**
  * This function gives the number of the try for the `attempt` mark of a new body. A new candidate or a new plan gives 1.
- * A push of the same plan adds 1. A body with no push keeps its number.
+ * A push of the same plan after a red result adds 1. A push after a green result or a result that is not known gives 1.
+ * A body with no push keeps its number.
  */
-export function nextAttempt(open: { fingerprint: string | null; attempt: number } | null, fingerprint: string, pushed: boolean): number {
+export function nextAttempt(open: { fingerprint: string | null; attempt: number } | null, fingerprint: string, pushed: boolean, red: boolean): number {
   if (!open || open.fingerprint !== fingerprint) return 1;
-  return pushed ? open.attempt + 1 : open.attempt;
+  if (!pushed) return open.attempt;
+  return red ? open.attempt + 1 : 1;
 }
 
 /** One job of a workflow run, as far as the cost reads it. */
@@ -463,6 +479,7 @@ export function jobMinutes(job: JobCost, isPrivate: boolean, now: number): numbe
   const end = job.completed_at ? Date.parse(job.completed_at) : now;
   const minutes = Math.max(0, end - Date.parse(job.started_at)) / 60_000;
   if (Number.isNaN(minutes)) return 0;
+  // A job of zero length got no runner time, so GitHub bills nothing for it. Thus it stays at 0, also after the round up below.
   if (!isPrivate) return minutes;
   const factor = labels.some((l) => l.startsWith("macos")) ? 10 : labels.some((l) => l.startsWith("windows")) ? 2 : 1;
   return Math.ceil(minutes) * factor;

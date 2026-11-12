@@ -547,7 +547,8 @@ describe("apply with the template sync", () => {
     expect(shadow.r.candidates?.pairs).toEqual([{ today: "push", next: "merge", rule: "R2", count: 1 }]);
     expect(shadow.lines.some((l) => l.startsWith("demo-repo: candidate rules (sync): strict push, candidate merge by R2: green and 2 commit(s) behind"))).toBe(true);
     const body = String(shadow.calls.find((c) => c.method === "PATCH" && c.path === `${base}/demo-repo/pulls/6`)?.body?.["body"]);
-    expect(body).toContain("<!-- release-train:attempt=2 -->");
+    // CI was green before the push, so the attempt starts at 1 again.
+    expect(body).toContain("<!-- release-train:attempt=1 -->");
     expect(body).not.toContain("release-train:items");
     // One candidate: the candidate merges with no clone and no push.
     const one = await run("one-candidate");

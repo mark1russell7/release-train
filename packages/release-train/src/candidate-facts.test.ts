@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { candidateReader, stuckCi } from "./candidate-facts.ts";
 import type { CandidateTarget } from "./candidate-facts.ts";
+import { COMPARE_FILES_MAX } from "./apply.ts";
 import { CANDIDATE_POLICY } from "./candidate-policy.ts";
 import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
@@ -102,6 +103,37 @@ describe("candidateReader", () => {
       [`GET ${base}/data-repo/actions/runs`]: (u) => [200, { workflow_runs: u.searchParams.get("status") === "queued" ? [{ head_branch: "feature" }] : [{ head_branch: "main" }, { head_branch: "release-train/update" }, { head_branch: "other" }] }],
     });
     expect(await r.read("otherRuns", target())).toEqual({ otherRuns: 2 });
+  });
+
+  it("does not count a run of another branch that is older than stuckCiHours", async () => {
+    const { r } = reader({
+      [`GET ${base}/data-repo/actions/runs`]: (u) => [200, { workflow_runs: u.searchParams.get("status") === "queued" ? [{ head_branch: "feature", created_at: iso(NOW - 7 * H) }] : [{ head_branch: "other", created_at: iso(NOW - H) }] }],
+    });
+    expect(await r.read("otherRuns", target())).toEqual({ otherRuns: 1 });
+  });
+
+  it("counts runs, not jobs", async () => {
+    // The fact counts the workflow runs that the list gives. It reads no list of jobs.
+    const { r, calls } = reader({
+      [`GET ${base}/data-repo/actions/runs`]: (u) => [200, { workflow_runs: u.searchParams.get("status") === "queued" ? [] : [{ id: 1, head_branch: "other", created_at: iso(NOW - H) }] }],
+      [`GET ${base}/data-repo/actions/runs/1/jobs`]: () => [200, { jobs: [{}, {}, {}] }],
+    });
+    expect(await r.read("otherRuns", target())).toEqual({ otherRuns: 1 });
+    expect(calls.some((c) => c.includes("/jobs"))).toBe(false);
+  });
+
+  it("marks a surface read with a list that GitHub cut", async () => {
+    const many = Array.from({ length: COMPARE_FILES_MAX }, (_, i) => ({ filename: `src/f${i}.ts` }));
+    const head = reader({
+      [`GET ${base}/data-repo/compare/main...sha7`]: () => [200, { behind_by: 4, files: many, merge_base_commit: { sha: "mb1" } }],
+      [`GET ${base}/data-repo/compare/mb1...main`]: () => [200, { files: [{ filename: "docs/a.md" }] }],
+    });
+    expect(await head.r.read("surface", target())).toEqual({ surfaceChanged: true, surfaceCut: true });
+    const main = reader({
+      [`GET ${base}/data-repo/compare/main...sha7`]: () => [200, { behind_by: 4, files: [{ filename: "src/a.ts" }], merge_base_commit: { sha: "mb1" } }],
+      [`GET ${base}/data-repo/compare/mb1...main`]: () => [200, { files: many }],
+    });
+    expect(await main.r.read("surface", target())).toEqual({ surfaceChanged: true, surfaceCut: true });
   });
 
   it("reads the last push from the head commit of the open pull request", async () => {

@@ -141,13 +141,20 @@ export function candidateReader(gh: GitHub, owner: string, policy: CandidatePoli
       const res = await get<{ files?: { filename: string }[] }>(`${base}/${t.repo}/compare/${c.mergeBase}...${encodeURIComponent(t.defaultBranch)}`);
       if (!res.ok || !res.data) return { surfaceChanged: true };
       const main = (res.data.files ?? []).map((f) => f.filename);
-      return { surfaceChanged: surfaceChanged(c, { files: main, cut: main.length >= COMPARE_FILES_MAX }) };
+      const mainCut = main.length >= COMPARE_FILES_MAX;
+      // A cut list counts as a change. The fact surfaceCut lets the reason tell this case from a real change.
+      return { surfaceChanged: surfaceChanged(c, { files: main, cut: mainCut }), ...(c.cut || mainCut ? { surfaceCut: true } : {}) };
     },
     async otherRuns(t) {
       let n = 0;
       for (const status of ["in_progress", "queued"]) {
-        const res = await get<{ workflow_runs?: { head_branch: string | null }[] }>(`${base}/${t.repo}/actions/runs?status=${status}&per_page=100`);
-        for (const run of res.data?.workflow_runs ?? []) if (run.head_branch !== t.branch && run.head_branch !== t.defaultBranch) n++;
+        const res = await get<{ workflow_runs?: { head_branch: string | null; created_at?: string }[] }>(`${base}/${t.repo}/actions/runs?status=${status}&per_page=100`);
+        for (const run of res.data?.workflow_runs ?? []) {
+          if (run.head_branch === t.branch || run.head_branch === t.defaultBranch) continue;
+          // A run that is queued or in progress for more than stuckCiHours is stuck, as in R1, so it does not count.
+          if (now - Date.parse(run.created_at ?? "") > policy.stuckCiHours * HOUR_MS) continue;
+          n++;
+        }
       }
       return { otherRuns: n };
     },

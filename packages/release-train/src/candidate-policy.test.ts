@@ -1,5 +1,6 @@
 // All repository and package names in these tests are made up.
 import { describe, expect, it } from "vitest";
+import { COMPARE_FILES_MAX } from "./apply.ts";
 import {
   CANDIDATE_POLICY,
   backoffHours,
@@ -131,7 +132,16 @@ describe("R2, exact staleness", () => {
   });
 
   it("R2: a change of the surface makes the candidate stale", () => {
-    expect(decision(facts({ behind: 40, surfaceChanged: true }))).toMatchObject({ action: "push", rule: "R2", attempt: 2, rebuild: true });
+    expect(decision(facts({ behind: 40, surfaceChanged: true }))).toMatchObject({ action: "push", rule: "R2", attempt: 1, rebuild: true });
+  });
+
+  it("R2: a list of files that GitHub cut gives its own reason, not the reason of a real change", () => {
+    const d = decision(facts({ behind: 40, surfaceChanged: true, surfaceCut: true }));
+    expect(d).toMatchObject({ action: "push", rule: "R2", rebuild: true });
+    expect(d.reason).toContain(`cut a list of files of the surface check at ${COMPARE_FILES_MAX} files`);
+    expect(d.reason).not.toContain("changed a file of the surface");
+    // A real change keeps its reason.
+    expect(decision(facts({ behind: 40, surfaceChanged: true })).reason).toBe("the default branch changed a file of the surface of the candidate");
   });
 
   it("R2: a candidate that GitHub cannot merge is stale", () => {
@@ -197,6 +207,20 @@ describe("R3, the pace as a budget", () => {
   it("R3: between the floor and the ceiling, the cost of the last candidate decides", () => {
     expect(decision(facts({ open: null, lastPushAt: NOW - 3 * H, costMinutes: 30 }))).toMatchObject({ action: "wait", rule: "R3", until: NOW + 3 * H });
     expect(decision(facts({ open: null, lastPushAt: NOW - 3 * H, costMinutes: 10 }))).toMatchObject({ action: "push" });
+  });
+
+  it("R3: the next push uses the clamped budget, so a cost above the ceiling waits until the ceiling", () => {
+    // 1000 runner minutes at 5 an hour is 200 h, and the ceiling clamps it to 24 h.
+    expect(decision(facts({ open: null, lastPushAt: NOW - 2 * H, costMinutes: 1000 }))).toMatchObject({ action: "wait", rule: "R3", until: NOW + 22 * H });
+    // A cost below the floor waits until the floor.
+    expect(decision(facts({ open: null, lastPushAt: NOW - 30 * 60_000, costMinutes: 1 }))).toMatchObject({ action: "wait", until: NOW + 30 * 60_000 });
+  });
+
+  it("R3: before the floor, the wait is the floor, also for a cost above the ceiling", async () => {
+    // Before the floor, the run reads no cost. The floor is the earliest time of the next push, not the exact time.
+    const r = await lazy(facts({ open: null, lastPushAt: NOW - 20 * 60_000, costMinutes: 1000 }));
+    expect(r.decision).toMatchObject({ action: "wait", until: NOW + 40 * 60_000 });
+    expect(r.needs).toEqual(["lastPush"]);
   });
 
   it("R3: a private repository pays in billed minutes at 1 an hour", () => {
@@ -281,6 +305,11 @@ describe("R5, a red candidate waits for a reason", () => {
     expect(decision(facts({ ...red, behind: 5, open: { ...facts().open!, attempt: 3 }, lastPushAt: NOW - 5 * H }))).toMatchObject({ action: "push", rule: "R5", attempt: 4, rebuild: true });
   });
 
+  it("R5: CI that is stuck is not a red result, so the new build is attempt 1", () => {
+    const stuck = { ci: { state: "running" as const, stuck: true } };
+    expect(decision(facts({ ...stuck, behind: 5, open: { ...facts().open!, attempt: 3 }, lastPushAt: NOW - 5 * H }))).toMatchObject({ action: "push", rule: "R5", attempt: 1 });
+  });
+
   it("R5: the pace of R3 holds a retry, and the wait tells the time", () => {
     const d = decision(facts({ ...red, behind: 5, lastPushAt: NOW - 2 * H, costMinutes: 30 }));
     expect(d).toMatchObject({ action: "wait", rule: "R5", until: NOW + 4 * H });
@@ -333,6 +362,23 @@ describe("the decision table", () => {
   it("row 4b: a change of the plan that is not monotone replaces the candidate", () => {
     const plan = { fingerprint: "fp2", items: [{ dep: "@acme/util", to: "2.0.0" }] };
     expect(decision(facts({ plan }))).toMatchObject({ action: "push", rule: "R3", attempt: 1, rebuild: false });
+  });
+
+  it("row 4b: a missing or empty items mark is no read, not monotone, and the reason tells it", () => {
+    const plan = { fingerprint: "fp2", items: ITEMS };
+    for (const items of [null, []]) {
+      const d = decision(facts({ plan, open: { ...facts().open!, items } }));
+      expect(d).toMatchObject({ action: "push", rule: "R3", attempt: 1, rebuild: false });
+      expect(d.reason).toBe("the plan changed, and the candidate has no items mark, so the monotone check has no read");
+    }
+  });
+
+  it("the attempt counts only the builds of the same plan after a red result", () => {
+    const open = { ...facts().open!, attempt: 3, retryLabel: true };
+    expect(decision(facts({ open }))).toMatchObject({ action: "push", rule: "label", attempt: 1 });
+    expect(decision(facts({ open, ci: { state: "none", stuck: false } }))).toMatchObject({ action: "push", attempt: 1 });
+    expect(decision(facts({ open, ci: { state: "failed", stuck: false } }))).toMatchObject({ action: "push", rule: "label", attempt: 4 });
+    expect(decision(facts({ open, ci: { state: "failed", stuck: false }, plan: { fingerprint: "fp2", items: ITEMS } }))).toMatchObject({ action: "push", attempt: 1 });
   });
 
   it("row 4b: items that the train cannot read replace the candidate", () => {
@@ -447,10 +493,12 @@ describe("the marks", () => {
   });
 
   it("gives the next attempt", () => {
-    expect(nextAttempt(null, "fp", true)).toBe(1);
-    expect(nextAttempt({ fingerprint: "old", attempt: 4 }, "fp", true)).toBe(1);
-    expect(nextAttempt({ fingerprint: "fp", attempt: 4 }, "fp", true)).toBe(5);
-    expect(nextAttempt({ fingerprint: "fp", attempt: 4 }, "fp", false)).toBe(4);
+    expect(nextAttempt(null, "fp", true, true)).toBe(1);
+    expect(nextAttempt({ fingerprint: "old", attempt: 4 }, "fp", true, true)).toBe(1);
+    expect(nextAttempt({ fingerprint: "fp", attempt: 4 }, "fp", true, true)).toBe(5);
+    expect(nextAttempt({ fingerprint: "fp", attempt: 4 }, "fp", false, true)).toBe(4);
+    // A push after a green result or a result that is not known starts at 1 again.
+    expect(nextAttempt({ fingerprint: "fp", attempt: 4 }, "fp", true, false)).toBe(1);
   });
 });
 
@@ -475,6 +523,12 @@ describe("jobMinutes", () => {
   it("gives 0 for a job with no runner or a self-hosted runner", () => {
     expect(jobMinutes({ ...job(90), runner_name: null }, true, NOW)).toBe(0);
     expect(jobMinutes(job(90, ["self-hosted", "linux"]), true, NOW)).toBe(0);
+  });
+
+  it("gives 0 for a job of zero length, also after the round up of a private repository", () => {
+    expect(jobMinutes(job(0), false, NOW)).toBe(0);
+    expect(jobMinutes(job(0), true, NOW)).toBe(0);
+    expect(jobMinutes(job(0, ["macos-14"]), true, NOW)).toBe(0);
   });
 
   it("counts a job that runs until now", () => {

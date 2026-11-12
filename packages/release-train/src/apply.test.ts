@@ -1814,9 +1814,10 @@ describe("the candidate rules in a run of apply", () => {
     const summary = applySummary(publicReport(r));
     expect(summary).toContain("Candidate rules (mode shadow): 1 decisions compared");
     expect(summary).toContain("| push | merge | R2 | 1 |");
-    // The marks of the body: the next attempt and the items. The mode shadow tells nothing of the retry label.
+    // The marks of the body: the attempt and the items. CI was green before the push, so the attempt starts at 1 again.
+    // The mode shadow tells nothing of the retry label.
     const body = patched(s.calls);
-    expect(body).toContain("<!-- release-train:attempt=2 -->");
+    expect(body).toContain("<!-- release-train:attempt=1 -->");
     expect(body).toContain("<!-- release-train:items=@ex/util@1.4.0 -->");
     expect(body).not.toContain(RETRY);
   });
@@ -1843,6 +1844,55 @@ describe("the candidate rules in a run of apply", () => {
     const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater(), dryRun: false, only: ["lib-repo"], now: NOW, log: (l) => lines.push(l) });
     expect(r.results[0]).toMatchObject({ state: "opened" });
     expect(lines).toContain("lib-repo: candidate rules (update): strict push, candidate push by R3: the branch has no open candidate.");
+  });
+
+  it("in the mode shadow puts a decision that the push limit held in the held table, with no fact read", async () => {
+    const s = server({
+      [`GET ${base}/lib-repo`]: meta,
+      [`GET ${base}/lib-repo/pulls`]: () => [200, []],
+    });
+    const lines: string[] = [];
+    // With no `only`, the pace of R3 needs the time of the last push. The limit holds the branch, so the run does not read it.
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater(), dryRun: false, now: NOW, maxPushes: 0, log: (l) => lines.push(l) });
+    expect(r.results.find((x) => x.repo === "lib-repo")).toMatchObject({ state: "waiting" });
+    // The limit holds the strict push before the candidate rules, so this decision is not a pair to compare.
+    expect(r.candidates?.pairs).toEqual([]);
+    expect(r.candidates?.held).toEqual([{ cause: "limit", next: "not read", count: 1 }]);
+    // A held branch with no candidate costs no request for the facts.
+    expect(r.candidates?.requests).toBe(0);
+    // The reader of the last push lists the closed pull requests with per_page=100. The strict rule lists them with 20.
+    expect(s.calls.some((c) => (c.path.includes("state=closed") && c.path.includes("per_page=100")) || c.path.includes("/commits/") || c.path.includes("/actions/runs"))).toBe(false);
+    expect(lines).toContain("lib-repo: candidate rules (update): held by limit before the rules, candidate not read.");
+    const summary = applySummary(publicReport(r));
+    expect(summary).toContain("Candidate rules (mode shadow): 0 decisions compared, 1 held by the run before the rules, 0 GitHub requests for their facts.");
+    expect(summary).toContain("| limit | not read | 1 |");
+    // The summary gives the rate limit when the report has it, and a failed read never fails the summary.
+    expect(summary).not.toContain("GitHub rate limit");
+    expect(applySummary({ ...publicReport(r), rateLimit: { start: null, end: null } })).toContain("GitHub rate limit: no read.");
+  });
+
+  it("in the mode shadow counts a merge of the default branch into the candidate as a strict push", async () => {
+    // The first two compares (the candidate rules and the strict rule) give 0 commits behind. The compare of settle gives 1.
+    let n = 0;
+    const s = server({
+      ...routes(),
+      [`GET ${base}/${S}/compare/main...sha7`]: () => [200, { behind_by: n++ < 2 ? 0 : 1, files: [{ filename: "package.json" }], merge_base_commit: { sha: "mb1" } }],
+      [`PUT ${base}/${S}/pulls/7/update-branch`]: () => [202, { message: "Updating pull request branch." }],
+    });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: [S], now: NOW });
+    expect(r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+    expect(s.calls.some((c) => c.method === "PUT" && c.path.endsWith("/pulls/7/update-branch"))).toBe(true);
+    // The catch-up merge starts CI as a push does, so the strict side of the pair is push, not wait.
+    expect(r.candidates?.pairs).toEqual([{ today: "push", next: "merge", rule: "R2", count: 1 }]);
+  });
+
+  it("in the mode shadow counts the attempt up for a new build of a red plan", async () => {
+    const s = server(routes({ body: `x <!-- release-train:fingerprint=${fp()} --> <!-- release-train:attempt=3 -->`, checks: [{ status: "completed", conclusion: "failure" }] }));
+    const { up, rebuilds } = recorder();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW });
+    expect(rebuilds).toEqual([true]);
+    expect(r.results[0]).toMatchObject({ state: "updated" });
+    expect(patched(s.calls)).toContain("<!-- release-train:attempt=4 -->");
   });
 
   it("in the mode strict reads no fact of the candidate rules and writes no mark", async () => {
@@ -1872,8 +1922,9 @@ describe("the candidate rules in a run of apply", () => {
     const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW, candidatePolicy: one });
     expect(rebuilds).toEqual([true]);
     expect(r.results[0]).toMatchObject({ state: "updated" });
+    // CI was green before the push, so the new build is attempt 1, not the second build of a red plan.
     const body = patched(s.calls);
-    expect(body).toContain("<!-- release-train:attempt=2 -->");
+    expect(body).toContain("<!-- release-train:attempt=1 -->");
     expect(body).toContain(`add the label \`${RETRY}\``);
   });
 

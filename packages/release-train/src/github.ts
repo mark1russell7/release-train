@@ -58,3 +58,44 @@ export function gitHub(opts: { token: string | null; fetch?: FetchFn; apiBase?: 
     },
   };
 }
+
+/** The numbers of one read of the rate limit of the REST API: the requests in one hour. */
+export interface RateLimitRead {
+  limit: number;
+  used: number;
+  remaining: number;
+  /** The time when the count starts again, as an ISO text. */
+  reset: string;
+}
+
+/** The reads of the rate limit at the start and at the end of a run. A read that failed is null. */
+export interface RateLimitReport {
+  start: RateLimitRead | null;
+  end: RateLimitRead | null;
+}
+
+/**
+ * This function reads the rate limit of the token of the client with `GET /rate_limit`. GitHub does not count this
+ * request. A failed read gives null and does not stop the run.
+ */
+export async function readRateLimit(gh: GitHub): Promise<RateLimitRead | null> {
+  type Core = { limit?: unknown; used?: unknown; remaining?: unknown; reset?: unknown };
+  try {
+    const res = await gh.request<{ resources?: { core?: Core }; rate?: Core }>("GET", "/rate_limit");
+    const core = res.data?.resources?.core ?? res.data?.rate;
+    if (!core) return null;
+    const { limit, used, remaining, reset } = core;
+    if (typeof limit !== "number" || typeof used !== "number" || typeof remaining !== "number" || typeof reset !== "number") return null;
+    return { limit, used, remaining, reset: new Date(reset * 1000).toISOString() };
+  } catch {
+    return null;
+  }
+}
+
+/** This function gives the summary line of the rate limit of a run. A read that failed shows "no read". */
+export function rateLimitLine(r: RateLimitReport): string {
+  const last = r.end ?? r.start;
+  if (!last) return "GitHub rate limit: no read.";
+  const used = (x: RateLimitRead | null): string => (x ? String(x.used) : "no read");
+  return `GitHub rate limit: ${last.limit} requests an hour, ${used(r.start)} used at the start, ${used(r.end)} used at the end, ${last.remaining} left, reset at ${last.reset}.`;
+}
