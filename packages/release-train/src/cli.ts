@@ -10,7 +10,7 @@ import { writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
 import { plan } from "./plan.ts";
 import type { Plan } from "./plan.ts";
-import { type GitHub, gitHub } from "./github.ts";
+import { type GitHub, gitHub, readRateLimit } from "./github.ts";
 import { moveCheck, moveSummary } from "./move.ts";
 import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
@@ -380,6 +380,9 @@ async function runApply(o: CliOptions): Promise<number> {
   try {
     const read = o.state === undefined ? null : readState(o.state);
     if (read?.note) log(read.note);
+    const gh = gitHub({ token: tok });
+    // The reads of the rate limit at the start and at the end give the GitHub requests of the run. A failed read is no read.
+    const rateStart = await readRateLimit(gh);
     const data = await collect({
       owner: o.owner,
       token: tok,
@@ -392,7 +395,6 @@ async function runApply(o: CliOptions): Promise<number> {
     const p = plan(graph);
     // Without a state file the train keeps no first sight of a need, so the run gives no start for a need with no publish time.
     const starts = read ? needStarts(data.npm, read.state.seen, (o.now ?? new Date()).toISOString(), (k) => hashName(k, key)) : null;
-    const gh = gitHub({ token: tok });
     const updater = gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author) });
     const report = await apply({
       owner: o.owner,
@@ -417,6 +419,7 @@ async function runApply(o: CliOptions): Promise<number> {
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
       ...(starts ? { needSince: (u) => starts.since(u.repo, u.items) } : {}),
     });
+    report.rateLimit = { start: rateStart, end: await readRateLimit(gh) };
     if (o.state !== undefined && starts) {
       writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen() })}\n`);
       const c = starts.counts();
