@@ -75,7 +75,8 @@ export function stuckCi(runs: readonly CheckRun[], status: { state: string; tota
 
 /**
  * This function makes the readers of the candidate facts for one run. It reads only with GET. It keeps each response by
- * its path, so two reads of the same path cost one request. The pull requests of `branches` give the train merges of R4.
+ * its path, so two reads of the same path cost one request. The pull requests of `branches` give the train merges of R4,
+ * and the train reads them only when the policy has a bound for R4.
  */
 export function candidateReader(gh: GitHub, owner: string, policy: CandidatePolicy, now: number, branches: readonly string[]): CandidateReader {
   const base = `/repos/${owner}`;
@@ -180,38 +181,35 @@ export function candidateReader(gh: GitHub, owner: string, policy: CandidatePoli
       return { costMinutes: minutes };
     },
     async mainHealth(t) {
-      return { mainHealth: await healthOf(t.repo, t.defaultBranch) };
+      return { mainHealth: await healthOf(t) };
     },
   };
 
-  const health = new Map<string, Promise<MainHealth>>();
-  /** This function reads the facts of R4 one time for each repository in the run. */
-  const healthOf = (repo: string, defaultBranch: string): Promise<MainHealth> => {
-    let p = health.get(repo);
-    if (!p) {
-      p = (async () => {
-        const since = now - policy.redMainWindowDays * 24 * HOUR_MS;
-        const merged: CandidatePull[] = [];
-        for (const branch of branches) {
-          for (const pr of (await closedOf(repo, branch)) ?? []) {
-            const at = Date.parse(pr.merged_at ?? "");
-            if (!Number.isNaN(at) && at >= since && pr.merge_commit_sha) merged.push(pr);
-          }
-        }
-        merged.sort((a, b) => (b.merged_at ?? "").localeCompare(a.merged_at ?? ""));
-        const healthOfSha = async (sha: string): Promise<CommitHealth> => commitHealth(await runsOf(repo, sha));
-        const states: CommitHealth[] = [];
-        for (const pr of merged) states.push(await healthOfSha(pr.merge_commit_sha as string));
-        const head = (await get<{ sha?: string }>(`${base}/${repo}/commits/${encodeURIComponent(defaultBranch)}`)).data?.sha;
-        return {
-          lastMerge: states[0] ?? "none",
-          head: head ? await healthOfSha(head) : "no-read",
-          redMerges: states.filter((s) => s === "red").length,
-        };
-      })();
-      health.set(repo, p);
+  /**
+   * This function reads the facts of R4 for a candidate. Each value counts only the runs of the workflows of the head
+   * of the candidate. The value thus depends on the candidate, and the train keeps no value for each repository. The
+   * cache of `get` makes each second read of a path free. With no bound in the policy, it does not read the count.
+   */
+  const healthOf = async (t: CandidateTarget): Promise<MainHealth> => {
+    const own = t.pr ? await runsOf(t.repo, t.pr.head.sha) : null;
+    const ids = new Set((own ?? []).map((r) => r.workflow_id));
+    // An empty set or a failed read gives no read: the train cannot tell which workflows count.
+    if (ids.size === 0) return { head: "no-read", redMerges: null };
+    // A failed read, or no run of the set, gives no read.
+    const healthOfSha = async (sha: string): Promise<CommitHealth> => commitHealth((await runsOf(t.repo, sha))?.filter((r) => ids.has(r.workflow_id)));
+    const headSha = (await get<{ sha?: string }>(`${base}/${t.repo}/commits/${encodeURIComponent(t.defaultBranch)}`)).data?.sha;
+    const head = headSha ? await healthOfSha(headSha) : "no-read";
+    if (policy.redMainBound === null) return { head, redMerges: null };
+    const since = now - policy.redMainWindowDays * 24 * HOUR_MS;
+    let redMerges = 0;
+    for (const branch of branches) {
+      for (const pr of (await closedOf(t.repo, branch)) ?? []) {
+        const at = Date.parse(pr.merged_at ?? "");
+        if (Number.isNaN(at) || at < since || !pr.merge_commit_sha) continue;
+        if ((await healthOfSha(pr.merge_commit_sha)) === "red") redMerges += 1;
+      }
     }
-    return p;
+    return { head, redMerges };
   };
 
   return {

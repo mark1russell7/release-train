@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { COMPARE_FILES_MAX } from "./apply.ts";
 import {
+  CANDIDATE_CODES,
   CANDIDATE_POLICY,
   backoffHours,
   bodyAttempt,
@@ -19,7 +20,7 @@ import {
   shareOf,
   surfaceChanged,
 } from "./candidate-policy.ts";
-import type { CandidateDecision, CandidateFacts, CandidateItem, CandidateNeed, CandidatePolicy, PlanChangeChoice } from "./candidate-policy.ts";
+import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateNeed, CandidatePolicy, PlanChangeChoice } from "./candidate-policy.ts";
 
 const H = 3_600_000;
 const NOW = Date.parse("2026-11-11T12:00:00Z");
@@ -44,7 +45,7 @@ function facts(over: Partial<CandidateFacts> = {}): CandidateFacts {
     otherRuns: 0,
     lastPushAt: NOW - 2 * H,
     costMinutes: 10,
-    mainHealth: { lastMerge: "green", head: "green", redMerges: 0 },
+    mainHealth: { head: "green", redMerges: null },
     ...over,
   };
 }
@@ -137,7 +138,9 @@ describe("R2, exact staleness", () => {
 
   it("R2: a list of files that GitHub cut gives its own reason, not the reason of a real change", () => {
     const d = decision(facts({ behind: 40, surfaceChanged: true, surfaceCut: true }));
-    expect(d).toMatchObject({ action: "push", rule: "R2", rebuild: true });
+    // The code tells the two cases apart, so the log of a private repository also tells them apart.
+    expect(d).toMatchObject({ action: "push", rule: "R2", code: "surface-list-cut", rebuild: true });
+    expect(decision(facts({ behind: 40, surfaceChanged: true }))).toMatchObject({ action: "push", rule: "R2", code: "surface-changed", rebuild: true });
     expect(d.reason).toContain(`cut a list of files of the surface check at ${COMPARE_FILES_MAX} files`);
     expect(d.reason).not.toContain("changed a file of the surface");
     // A real change keeps its reason.
@@ -246,34 +249,63 @@ describe("R3, the pace as a budget", () => {
   });
 });
 
-describe("R4, the gate on the default branch", () => {
+describe("R4, the red default branch", () => {
   const behind = { behind: 12 };
+  const health = (head: "red" | "green" | "pending" | "no-read", redMerges: number | null = null) => ({ mainHealth: { head, redMerges } });
 
-  it("R4: no merge when the newest train merge and the head of the default branch are red", () => {
-    expect(decision(facts({ ...behind, mainHealth: { lastMerge: "red", head: "red", redMerges: 1 } }))).toMatchObject({ action: "wait", rule: "R4" });
+  it("R4: a green candidate that is behind gets a new build when the default branch is red in its checks", () => {
+    const d = decision(facts({ ...behind, ...health("red") }));
+    expect(d).toMatchObject({ action: "push", rule: "R4", code: "main-red", attempt: 1, rebuild: true });
+    expect(d.reason).toBe("the default branch is red in the checks of the candidate, so the candidate gets a new build on it");
   });
 
-  it("R4: a red train merge with a green head does not stop the merge", () => {
-    expect(decision(facts({ ...behind, mainHealth: { lastMerge: "red", head: "green", redMerges: 1 } }))).toMatchObject({ action: "merge" });
+  it("R4: the push of a red default branch keeps the pace of R3", () => {
+    const d = decision(facts({ ...behind, ...health("red"), lastPushAt: NOW - 10 * 60_000 }));
+    expect(d).toMatchObject({ action: "wait", rule: "R3", code: "pace-wait", until: NOW + 50 * 60_000 });
+  });
+
+  it("R4: a red default branch changes nothing for a candidate that is not behind, and the train does not read it", async () => {
+    expect(decision(facts({ behind: 0, ...health("red") }))).toMatchObject({ action: "merge", rule: "R2", code: "green-current" });
+    expect((await lazy(facts({ behind: 0, ...health("red") }))).needs).not.toContain("mainHealth");
+  });
+
+  it("R4: a candidate that holds the fix gets one new build, and then merges on the current default branch", () => {
+    expect(decision(facts({ ...behind, ...health("red") }))).toMatchObject({ action: "push", code: "main-red" });
+    // After the new build, the candidate is on the head of the default branch. A red head does not stop the merge.
+    expect(decision(facts({ behind: 0, ...health("red"), lastPushAt: NOW - 60_000 }))).toMatchObject({ action: "merge" });
+  });
+
+  it("R4: a head that is pending, green or has no read goes on to the merge", () => {
+    for (const head of ["pending", "green"] as const) {
+      expect(decision(facts({ ...behind, ...health(head) }))).toMatchObject({ action: "merge", rule: "R2", code: "green-behind" });
+    }
+    // A merge with no read of the default branch has its own code.
+    expect(decision(facts({ ...behind, ...health("no-read") }))).toMatchObject({ action: "merge", rule: "R2", code: "green-behind-main-no-read" });
+  });
+
+  it("R4: no read of the default branch is not green, and the reason tells it", () => {
+    expect(decision(facts({ ...behind, ...health("no-read") })).reason).toContain("no read");
+    expect(decision(facts({ ...behind, ...health("green") })).reason).not.toContain("no read");
   });
 
   it("R4: at the bound, a candidate that is behind gets a new build", () => {
     const p = { ...P, redMainBound: 3 };
-    expect(decision(facts({ ...behind, mainHealth: { lastMerge: "green", head: "green", redMerges: 3 } }), p)).toMatchObject({ action: "push", rule: "R4", rebuild: true });
-    expect(decision(facts({ ...behind, mainHealth: { lastMerge: "green", head: "green", redMerges: 2 } }), p)).toMatchObject({ action: "merge" });
+    expect(decision(facts({ ...behind, ...health("green", 3) }), p)).toMatchObject({ action: "push", rule: "R4", code: "red-merges-bound", rebuild: true });
+    expect(decision(facts({ ...behind, ...health("green", 2) }), p)).toMatchObject({ action: "merge" });
   });
 
   it("R4: the bound keeps the pace of R3", () => {
     const p = { ...P, redMainBound: 1 };
-    expect(decision(facts({ ...behind, lastPushAt: NOW - 10 * 60_000, mainHealth: { lastMerge: "green", head: "green", redMerges: 5 } }), p)).toMatchObject({ action: "wait", rule: "R3" });
+    expect(decision(facts({ ...behind, lastPushAt: NOW - 10 * 60_000, ...health("green", 5) }), p)).toMatchObject({ action: "wait", rule: "R3" });
   });
 
-  it("R4: a null bound counts and changes nothing", () => {
-    expect(decision(facts({ ...behind, mainHealth: { lastMerge: "green", head: "green", redMerges: 99 } }))).toMatchObject({ action: "merge" });
+  it("R4: the bound does nothing when the count has no read", () => {
+    const p = { ...P, redMainBound: 1 };
+    expect(decision(facts({ ...behind, ...health("green", null) }), p)).toMatchObject({ action: "merge" });
   });
 
-  it("R4: no read of the default branch is not green, and the reason tells it", () => {
-    expect(decision(facts({ ...behind, mainHealth: { lastMerge: "none", head: "no-read", redMerges: 0 } })).reason).toContain("no read");
+  it("R4: a null bound does nothing, also with a count", () => {
+    expect(decision(facts({ ...behind, ...health("green", 99) }))).toMatchObject({ action: "merge" });
   });
 
   it("R4: the train reads the health only for a candidate that is behind", async () => {
@@ -394,8 +426,8 @@ describe("the decision table", () => {
     expect(decision(facts({ otherRuns: 1 }))).toMatchObject({ action: "wait", rule: "R0" });
   });
 
-  it("row 4d: the gate on the default branch", () => {
-    expect(decision(facts({ behind: 1, mainHealth: { lastMerge: "red", head: "red", redMerges: 1 } }))).toMatchObject({ action: "wait", rule: "R4" });
+  it("row 4d: a red default branch gives a new build", () => {
+    expect(decision(facts({ behind: 1, mainHealth: { head: "red", redMerges: null } }))).toMatchObject({ action: "push", rule: "R4", rebuild: true });
   });
 
   it("row 4e: merge, behind or not", () => {
@@ -414,6 +446,51 @@ describe("the decision table", () => {
     expect(decision(facts(none))).toMatchObject({ action: "wait", rule: "legacy" });
     expect(decision(facts({ ...none, behind: 3 }))).toMatchObject({ action: "push", rule: "legacy", rebuild: true });
     expect(decision(facts({ ...none, plan: { fingerprint: "fp2", items: ITEMS } }))).toMatchObject({ action: "push", rule: "legacy", attempt: 1 });
+  });
+});
+
+describe("the codes of the decisions", () => {
+  const ci = (state: "none" | "failed" | "running") => ({ ci: { state, stuck: false } });
+  const plan2 = { plan: { fingerprint: "fp2", items: ITEMS } };
+  /** One case for each code: the code, the facts and the policy. */
+  const cases: [CandidateCode, CandidateFacts, CandidatePolicy?][] = [
+    ["no-plan", facts({ plan: null })],
+    ["no-candidate", facts({ open: null, lastPushAt: null })],
+    ["urgent-plan-changed", facts({ urgent: true, ...plan2 })],
+    ["urgent-not-current", facts({ urgent: true, behind: 2 })],
+    ["label-building", facts({ ...ci("running"), open: { ...facts().open!, retryLabel: true } })],
+    ["label-retry", facts({ open: { ...facts().open!, retryLabel: true } })],
+    ["building", facts(ci("running"))],
+    ["merge-refused", facts({ behind: 3, mergeRefused: true })],
+    ["not-mergeable", facts({ mergeable: false })],
+    ["surface-list-cut", facts({ behind: 40, surfaceChanged: true, surfaceCut: true })],
+    ["surface-changed", facts({ behind: 40, surfaceChanged: true })],
+    ["plan-changed-no-items", facts({ ...plan2, open: { ...facts().open!, items: null } })],
+    ["plan-changed", facts({ plan: { fingerprint: "fp2", items: [{ dep: "@acme/util", to: "2.0.0" }] } })],
+    ["yield", facts({ otherRuns: 1 })],
+    ["main-red", facts({ behind: 12, mainHealth: { head: "red", redMerges: null } })],
+    ["red-merges-bound", facts({ behind: 12, mainHealth: { head: "green", redMerges: 3 } }), { ...P, redMainBound: 3 }],
+    ["green-current", facts()],
+    ["green-behind", facts({ behind: 40 })],
+    ["green-behind-main-no-read", facts({ behind: 40, mainHealth: { head: "no-read", redMerges: null } })],
+    ["no-check-plan-changed", facts({ ...ci("none"), ...plan2 })],
+    ["no-check-behind", facts({ ...ci("none"), behind: 3 })],
+    ["no-check", facts(ci("none"))],
+    ["red-plan-changed", facts({ ...ci("failed"), ...plan2 })],
+    ["red-current", facts({ ...ci("failed"), behind: 0 })],
+    ["red-backoff", facts({ ...ci("failed"), behind: 5, open: { ...facts().open!, attempt: 3 }, lastPushAt: NOW - 2 * H })],
+    ["red-retry", facts({ ...ci("failed"), behind: 5, open: { ...facts().open!, attempt: 3 }, lastPushAt: NOW - 5 * H })],
+    ["red-pace-wait", facts({ ...ci("failed"), behind: 5, lastPushAt: NOW - 2 * H, costMinutes: 30 })],
+    ["pace-wait", facts({ mergeable: false, lastPushAt: NOW - 30 * 60_000 })],
+  ];
+
+  it("gives each decision of the table its code", () => {
+    for (const [code, f, p] of cases) expect([code, decision(f, p).code]).toEqual([code, code]);
+  });
+
+  it("reaches each code, and each code is a fixed id with no name and no number", () => {
+    expect(cases.map(([code]) => code)).toEqual([...CANDIDATE_CODES]);
+    for (const code of CANDIDATE_CODES) expect(code).toMatch(/^[a-z]+(-[a-z]+)*$/);
   });
 });
 
@@ -589,7 +666,7 @@ function replay(choice: PlanChangeChoice): { pushes: number; kept: number; minut
       otherRuns: 0,
       lastPushAt,
       costMinutes: cost,
-      mainHealth: { lastMerge: "green", head: "green", redMerges: 0 },
+      mainHealth: { head: "green", redMerges: null },
     };
     const d = decision(f, p);
     if (d.action === "push" && plan) {
