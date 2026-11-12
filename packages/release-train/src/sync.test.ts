@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BUSY_LIMIT, RUN_MS, TRAIN_LABEL, apply, applySummary, bodyFingerprint, busyRunners, publicReport, syncPrBody } from "./apply.ts";
 import type { Updater } from "./apply.ts";
+import { CANDIDATE_POLICY } from "./candidate-policy.ts";
 import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
 import { buildGraph } from "./graph.ts";
@@ -510,6 +511,49 @@ describe("apply with the template sync", () => {
     expect(up.jobs).toEqual([]);
     expect(r.results[0]).toMatchObject({ state: "merged", ci: "green" });
     expect(calls.some((c) => c.method === "DELETE" && c.path.endsWith(`/refs/heads/${SYNC_BRANCH}`))).toBe(true);
+  });
+
+  it("compares the candidate rules on the sync branch in the mode shadow, and merges a candidate that is behind in the mode one-candidate", async () => {
+    const files = mem({ ".github/workflows/ci.yml": ci(OLD), "package.json": rootPkg({ package: CLI_COPY_SCRIPT }), "packages/cli/package.json": JSON.stringify({ name: "@demo/cli", private: true }) });
+    const fp = (await syncRepo(files, facts(), undefined, false)).fingerprint;
+    const pr = { number: 6, html_url: "u6", node_id: "PR_6", title: "t", body: `x <!-- release-train:fingerprint=${fp} -->`, state: "open", auto_merge: null, head: { sha: "s6", ref: SYNC_BRANCH }, base: { ref: "main" }, labels: [{ name: TRAIN_LABEL }] };
+    const run = async (mode: "shadow" | "one-candidate") => {
+      const s = server(
+        repoRoutes("demo-repo", {
+          [`GET ${base}/demo-repo/pulls`]: (_b, u) => [200, u.searchParams.get("head")?.endsWith(SYNC_BRANCH) && u.searchParams.get("state") === "open" ? [pr] : []],
+          [`GET ${base}/demo-repo/pulls/6`]: () => [200, { ...pr, mergeable: true }],
+          [`PATCH ${base}/demo-repo/pulls/6`]: (b) => [200, { ...pr, ...b }],
+          [`GET ${base}/demo-repo/commits/s6/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }],
+          [`GET ${base}/demo-repo/commits/s6/status`]: () => [200, { state: "pending", total_count: 0 }],
+          [`GET ${base}/demo-repo/actions/runs`]: () => [200, { workflow_runs: [] }],
+          [`GET ${base}/demo-repo/compare/main...s6`]: () => [200, { behind_by: 2, files: [{ filename: "package.json" }], merge_base_commit: { sha: "mb1" } }],
+          [`GET ${base}/demo-repo/compare/mb1...main`]: () => [200, { files: [{ filename: "src/index.ts" }] }],
+          [`GET ${base}/demo-repo/commits/main`]: () => [200, { sha: "head1" }],
+          [`POST /graphql`]: () => [200, { errors: [{ message: "Auto merge is not allowed for this repository" }] }],
+          [`PATCH ${base}/demo-repo`]: () => [403, { message: "no" }],
+          [`PUT ${base}/demo-repo/pulls/6/merge`]: () => [200, { merged: true }],
+          [`DELETE ${base}/demo-repo/git/refs/heads/${SYNC_BRANCH}`]: () => [204, null],
+        }),
+      );
+      const up = syncer([]);
+      const lines: string[] = [];
+      const r = await apply({ owner: OWNER, plan: onePlan("demo-repo"), gh: s.gh, updater: noUpdates, dryRun: false, log: (l) => lines.push(l), candidatePolicy: { ...CANDIDATE_POLICY, mode }, sync: { updater: up, facts: runFacts(), workflows: "no" } });
+      return { r, up, lines, calls: s.calls };
+    };
+    // Shadow: the strict rule builds the branch again, and the candidate rules would merge it.
+    const shadow = await run("shadow");
+    expect(shadow.up.jobs).toHaveLength(1);
+    expect(shadow.r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "updated" });
+    expect(shadow.r.candidates?.pairs).toEqual([{ today: "push", next: "merge", rule: "R2", count: 1 }]);
+    expect(shadow.lines.some((l) => l.startsWith("demo-repo: candidate rules (sync): strict push, candidate merge by R2: green and 2 commit(s) behind"))).toBe(true);
+    const body = String(shadow.calls.find((c) => c.method === "PATCH" && c.path === `${base}/demo-repo/pulls/6`)?.body?.["body"]);
+    expect(body).toContain("<!-- release-train:attempt=2 -->");
+    expect(body).not.toContain("release-train:items");
+    // One candidate: the candidate merges with no clone and no push.
+    const one = await run("one-candidate");
+    expect(one.up.jobs).toEqual([]);
+    expect(one.r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "merged", ci: "green" });
+    expect(one.calls.find((c) => c.method === "PUT")?.body).toMatchObject({ sha: "s6" });
   });
 
   it("waits for the next run after maxPushes pushes, and while the runners are busy", async () => {

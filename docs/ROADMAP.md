@@ -27,3 +27,4 @@ This file gives the items of the release train and their status. The Status page
 | RT19 | An update that moves `api-report` writes the reports in the same commit, so a new form of a report does not stop the update | Done | #114 |
 | RT20 | A hold can name a dependent repository, and the train then sends no update of that package to that repository | Done | #115 |
 | RT21 | The version gate: a taken version blocks its release, two open pull requests cannot set one version, and a published workspace range that falls behind gets a cascade release | In progress | #140 |
+| RT22 | One candidate at a time on each train branch: the rules R0 to R5 as one pure policy with data, first in the mode `shadow` | In progress | #160 |
