@@ -25,6 +25,7 @@ import {
   selectUpdates,
 } from "./apply.ts";
 import type { RepoUpdate, UpdateResult, Updater } from "./apply.ts";
+import { CANDIDATE_POLICY } from "./candidate-policy.ts";
 import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
 import { buildGraph } from "./graph.ts";
@@ -1755,5 +1756,160 @@ describe("apiReportUpdateArgs", () => {
     for (const script of [undefined, "", "pnpm -r run check:api", "api-report check . && tsc", "api-report check \"a b\"", "api-report update .", "node scripts/api.ts check"]) {
       expect(apiReportUpdateArgs(script)).toEqual(["update"]);
     }
+  });
+});
+
+describe("the candidate rules in a run of apply", () => {
+  const S = "secret-repo";
+  const RETRY = CANDIDATE_POLICY.retryLabel;
+  const NOW = new Date("2026-11-11T12:00:00Z");
+  const one = { ...CANDIDATE_POLICY, mode: "one-candidate" as const };
+  const fp = (): string => selectUpdates(fixture(), [S]).ready[0]?.fingerprint ?? "";
+  /** The routes of a private repository with the open candidate #7. By default, it is green, 2 commits behind and has no change of its surface. */
+  const routes = (o: { body?: string; labels?: { name: string }[]; checks?: unknown[]; behind?: number; pushedAt?: string; merge?: Handler } = {}): Record<string, Handler> => {
+    const pr = pull(7, S, { body: o.body ?? `x <!-- release-train:fingerprint=${fp()} -->`, labels: o.labels ?? [{ name: TRAIN_LABEL }] });
+    return {
+      [`GET ${base}/${S}`]: meta,
+      [`GET ${base}/${S}/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pr] : []],
+      [`GET ${base}/${S}/pulls/7`]: () => [200, { ...pr, mergeable: true }],
+      [`PATCH ${base}/${S}/pulls/7`]: (b) => [200, { ...pr, ...b }],
+      [`POST ${base}/${S}/labels`]: () => [201, {}],
+      [`POST ${base}/${S}/issues/7/labels`]: () => [200, []],
+      [`DELETE ${base}/${S}/issues/7/labels/${encodeURIComponent(RETRY)}`]: () => [200, []],
+      [`GET ${base}/${S}/commits/sha7/check-runs`]: () => [200, { check_runs: o.checks ?? [{ status: "completed", conclusion: "success" }] }],
+      [`GET ${base}/${S}/commits/sha7/status`]: () => [200, { state: "pending", total_count: 0 }],
+      [`GET ${base}/${S}/commits/sha7`]: () => [200, { commit: { committer: { date: o.pushedAt ?? "2026-11-11T08:00:00Z" } } }],
+      [`GET ${base}/${S}/actions/runs`]: () => [200, { workflow_runs: [] }],
+      [`GET ${base}/${S}/compare/main...sha7`]: () => [200, { behind_by: o.behind ?? 2, files: [{ filename: "package.json" }], merge_base_commit: { sha: "mb1" } }],
+      [`GET ${base}/${S}/compare/mb1...main`]: () => [200, { files: [{ filename: "src/index.ts" }] }],
+      [`GET ${base}/${S}/commits/main`]: () => [200, { sha: "head1" }],
+      [`PUT ${base}/${S}/pulls/7/merge`]: o.merge ?? (() => [200, { merged: true }]),
+      [`DELETE ${base}/${S}/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+    };
+  };
+  /** An updater that records the value `rebuild` of each update. */
+  const recorder = () => {
+    const rebuilds: boolean[] = [];
+    const up: Updater = {
+      async update(_u, ctx) {
+        rebuilds.push(ctx.rebuild);
+        return { status: "pushed", sha: "newsha", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null };
+      },
+    };
+    return { up, rebuilds };
+  };
+  const patched = (calls: Call[]): string => String(calls.find((c) => c.method === "PATCH" && c.path === `${base}/${S}/pulls/7`)?.body?.["body"]);
+
+  it("in the mode shadow acts as the strict rule, and counts and logs the decision of the candidate rules", async () => {
+    const s = server(routes());
+    const { up, rebuilds } = recorder();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW });
+    // The strict rule builds the branch again because it is behind. The candidate rules merge it: its surface did not change.
+    expect(rebuilds).toEqual([true]);
+    expect(r.results[0]).toMatchObject({ state: "updated" });
+    expect(s.calls.some((c) => c.method === "PUT")).toBe(false);
+    expect(r.candidates?.mode).toBe("shadow");
+    expect(r.candidates?.pairs).toEqual([{ today: "push", next: "merge", rule: "R2", count: 1 }]);
+    expect(r.candidates?.requests).toBeGreaterThan(0);
+    const summary = applySummary(publicReport(r));
+    expect(summary).toContain("Candidate rules (mode shadow): 1 decisions compared");
+    expect(summary).toContain("| push | merge | R2 | 1 |");
+    // The marks of the body: the next attempt and the items. The mode shadow tells nothing of the retry label.
+    const body = patched(s.calls);
+    expect(body).toContain("<!-- release-train:attempt=2 -->");
+    expect(body).toContain("<!-- release-train:items=@ex/util@1.4.0 -->");
+    expect(body).not.toContain(RETRY);
+  });
+
+  it("keeps the name and the reason of a private repository out of the shadow log and the public report", async () => {
+    const s = server(routes());
+    const lines: string[] = [];
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: recorder().up, dryRun: false, only: [S], now: NOW, log: (l) => lines.push(l) });
+    const pair = lines.filter((l) => l.includes("candidate rules (update)"));
+    expect(pair).toHaveLength(1);
+    expect(pair[0]).toMatch(/: candidate rules \(update\): strict push, candidate merge by R2\.$/);
+    for (const text of [...lines, applySummary(publicReport(r)), JSON.stringify(publicReport(r))]) expect(text).not.toContain(S);
+  });
+
+  it("logs the reason of a public repository", async () => {
+    const { gh } = server({
+      [`GET ${base}/lib-repo`]: meta,
+      [`GET ${base}/lib-repo/pulls`]: () => [200, []],
+      [`POST ${base}/lib-repo/pulls`]: (b) => [201, { ...pull(9, "lib-repo"), ...b, labels: [] }],
+      [`POST ${base}/lib-repo/labels`]: () => [201, {}],
+      [`POST ${base}/lib-repo/issues/9/labels`]: () => [200, []],
+    });
+    const lines: string[] = [];
+    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater(), dryRun: false, only: ["lib-repo"], now: NOW, log: (l) => lines.push(l) });
+    expect(r.results[0]).toMatchObject({ state: "opened" });
+    expect(lines).toContain("lib-repo: candidate rules (update): strict push, candidate push by R3: the branch has no open candidate.");
+  });
+
+  it("in the mode strict reads no fact of the candidate rules and writes no mark", async () => {
+    const s = server(routes());
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: recorder().up, dryRun: false, only: [S], now: NOW, candidatePolicy: { ...CANDIDATE_POLICY, mode: "strict" } });
+    expect(r.candidates).toBeUndefined();
+    expect(s.calls.some((c) => c.path.includes("/actions/runs") || c.path.includes("/compare/mb1"))).toBe(false);
+    expect(patched(s.calls)).not.toContain("release-train:attempt");
+  });
+
+  it("in the mode one-candidate merges a green candidate that is behind when its surface did not change, with no push", async () => {
+    const s = server(routes());
+    const { up, rebuilds } = recorder();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW, candidatePolicy: one });
+    expect(rebuilds).toEqual([]);
+    expect(r.results[0]).toMatchObject({ state: "merged", ci: "green" });
+    expect(r.results[0]?.detail).toContain("2 commit(s) behind, with no change of its surface");
+    expect(s.calls.find((c) => c.method === "PUT")?.body).toEqual({ merge_method: "merge", sha: "sha7" });
+    expect(s.calls.some((c) => c.method === "DELETE" && c.path.endsWith(`/refs/heads/${TRAIN_BRANCH}`))).toBe(true);
+    // In the mode one-candidate, the candidate rules act, so there is no pair to compare.
+    expect(r.candidates?.pairs).toEqual([]);
+  });
+
+  it("in the mode one-candidate builds the candidate again in the same run when GitHub refuses the merge", async () => {
+    const s = server(routes({ merge: () => [405, { message: "Base branch was modified" }] }));
+    const { up, rebuilds } = recorder();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW, candidatePolicy: one });
+    expect(rebuilds).toEqual([true]);
+    expect(r.results[0]).toMatchObject({ state: "updated" });
+    const body = patched(s.calls);
+    expect(body).toContain("<!-- release-train:attempt=2 -->");
+    expect(body).toContain(`add the label \`${RETRY}\``);
+  });
+
+  it("in the mode one-candidate builds a red candidate again for the retry label, removes the label and makes it", async () => {
+    const s = server(routes({ labels: [{ name: TRAIN_LABEL }, { name: RETRY }], checks: [{ status: "completed", conclusion: "failure" }], behind: 0 }));
+    const { up, rebuilds } = recorder();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW, candidatePolicy: one });
+    expect(rebuilds).toEqual([true]);
+    expect(r.results[0]).toMatchObject({ state: "updated" });
+    expect(s.calls.some((c) => c.method === "DELETE" && c.path === `${base}/${S}/issues/7/labels/${encodeURIComponent(RETRY)}`)).toBe(true);
+    expect(s.calls.some((c) => c.method === "POST" && c.path === `${base}/${S}/labels` && c.body?.["name"] === RETRY)).toBe(true);
+  });
+
+  it("in the mode one-candidate keeps a red candidate on the current default branch, and until the backoff ends", async () => {
+    const red = [{ status: "completed", conclusion: "failure" }];
+    const current = server(routes({ checks: red, behind: 0 }));
+    const a = recorder();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: current.gh, updater: a.up, dryRun: false, only: [S], now: NOW, candidatePolicy: one });
+    expect(a.rebuilds).toEqual([]);
+    expect(r.results[0]).toMatchObject({ state: "blocked", ci: "failed" });
+    expect(r.results[0]?.detail).toContain(`add the label ${RETRY}`);
+    expect(current.calls.find((c) => c.path === `${base}/${S}/issues/7/labels`)?.body).toEqual({ labels: [BLOCKED_LABEL] });
+    // The default branch moved, but the last push was 30 minutes ago: the backoff of the first attempt is 1 hour.
+    const moved = server(routes({ checks: red, behind: 3, pushedAt: "2026-11-11T11:30:00Z" }));
+    const b = recorder();
+    const r2 = await apply({ owner: OWNER, plan: fixture(), gh: moved.gh, updater: b.up, dryRun: false, only: [S], now: NOW, candidatePolicy: one });
+    expect(b.rebuilds).toEqual([]);
+    expect(r2.results[0]?.detail).toContain("next retry at 2026-11-11T12:30");
+  });
+
+  it("in the mode one-candidate does not push a new plan while CI runs", async () => {
+    const s = server(routes({ body: "old body", checks: [{ status: "in_progress", conclusion: null }] }));
+    const { up, rebuilds } = recorder();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW, candidatePolicy: one });
+    expect(rebuilds).toEqual([]);
+    expect(r.results[0]).toMatchObject({ state: "unchanged", ci: "running", detail: "building." });
+    expect(s.calls.some((c) => c.method === "PATCH" || c.method === "PUT")).toBe(false);
   });
 });

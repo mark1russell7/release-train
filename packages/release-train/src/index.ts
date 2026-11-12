@@ -7,6 +7,7 @@ export * from "./progress.ts";
 export * from "./db.ts";
 export * from "./apply.ts";
 export * from "./candidate-policy.ts";
+export * from "./candidate-facts.ts";
 export * from "./github.ts";
 export * from "./workspace.ts";
 export * from "./cli.ts";
