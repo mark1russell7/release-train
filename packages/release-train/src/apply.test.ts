@@ -17,6 +17,7 @@ import {
   applySummary,
   bodyFingerprint,
   ciState,
+  hashName,
   latestRuns,
   longestWaitFirst,
   prBody,
@@ -25,7 +26,7 @@ import {
   selectUpdates,
 } from "./apply.ts";
 import type { RepoUpdate, UpdateResult, Updater } from "./apply.ts";
-import { CANDIDATE_POLICY } from "./candidate-policy.ts";
+import { CANDIDATE_POLICY, shareOf } from "./candidate-policy.ts";
 import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
 import { buildGraph } from "./graph.ts";
@@ -36,6 +37,8 @@ import { API_REPORT_PACKAGE, CONVENTIONS, ageExcluded, apiReportUpdateArgs, edit
 import type { RunFn } from "./workspace.ts";
 
 const OWNER = "example-owner";
+/** The policy of the mode shadow. A test of the strict rule or of the mode shadow passes it, so it does not depend on the default. */
+const SHADOW = { ...CANDIDATE_POLICY, mode: "shadow" as const };
 
 function repo(name: string, manifests: Record<string, Manifest>, opts: { private?: boolean; resolved?: Resolved } = {}): RepoSnapshot {
   return {
@@ -339,7 +342,7 @@ describe("apply", () => {
       [`POST ${base}/secret-repo/issues/7/labels`]: () => [200, []],
       [`POST /graphql`]: () => [200, { data: { disablePullRequestAutoMerge: { clientMutationId: null } } }],
     });
-    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"] });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"], candidatePolicy: SHADOW });
     expect(r.results).toHaveLength(1);
     // The native auto-merge of GitHub goes off, so only the train merges.
     expect(calls.some((c) => c.path === "/graphql" && String(c.body?.["query"]).includes("disablePullRequestAutoMerge"))).toBe(true);
@@ -361,7 +364,7 @@ describe("apply", () => {
       [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
       [`DELETE ${base}/secret-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
     });
-    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"] });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"], candidatePolicy: SHADOW });
     // The strict rule merges only a branch that is 0 commits behind.
     expect(r.results[0]).toMatchObject({ state: "merged", ci: "green", autoMerge: "train", mergedBehind: 0 });
     expect(publicReport(r).results[0]).toMatchObject({ private: true, mergedBehind: 0 });
@@ -386,7 +389,7 @@ describe("apply", () => {
     const behind = server(routes(2));
     const seen: boolean[] = [];
     const up: Updater = { async update(_u, ctx) { seen.push(ctx.rebuild); return { status: "pushed", sha: "newsha", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
-    const r = await apply({ owner: OWNER, plan: fixture(), gh: behind.gh, updater: up, dryRun: false, only: ["secret-repo"] });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: behind.gh, updater: up, dryRun: false, only: ["secret-repo"], candidatePolicy: SHADOW });
     expect(seen).toEqual([true]);
     expect(r.results[0]).toMatchObject({ state: "updated", ci: "none", autoMerge: "train" });
     expect(behind.calls.some((c) => c.method === "PUT")).toBe(false);
@@ -394,7 +397,7 @@ describe("apply", () => {
     const current = server(routes(0));
     const seen2: boolean[] = [];
     const same: Updater = { async update(_u, ctx) { seen2.push(ctx.rebuild); return { status: "same", sha: "sha7", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
-    const r2 = await apply({ owner: OWNER, plan: fixture(), gh: current.gh, updater: same, dryRun: false, only: ["secret-repo"] });
+    const r2 = await apply({ owner: OWNER, plan: fixture(), gh: current.gh, updater: same, dryRun: false, only: ["secret-repo"], candidatePolicy: SHADOW });
     expect(seen2).toEqual([false]);
     expect(r2.results[0]).toMatchObject({ state: "merged", ci: "green" });
   });
@@ -411,7 +414,7 @@ describe("apply", () => {
         [`GET ${base}/secret-repo/compare/main...sha7`]: compare,
         [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
       });
-      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"] });
+      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"], candidatePolicy: SHADOW });
       return { r, calls: s.calls };
     };
     // The first compare (before the update) gives 0, the second (before the merge) gives 1: main moved in between.
@@ -441,7 +444,7 @@ describe("apply", () => {
         [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
         [`DELETE ${base}/secret-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
       });
-      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"] });
+      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"], candidatePolicy: SHADOW });
       return { r, calls: s.calls };
     };
     const wf = [{ filename: ".github/workflows/ci.yml" }];
@@ -597,7 +600,7 @@ ${RENOVATE_REBASE_BOX} If you want to rebase/retry this PR, check this box`,
     const now = new Date("2026-01-02T00:00:00Z");
     const run = (created: string) => {
       const s = server(routes(created));
-      return apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"], now }).then((r) => ({ r, calls: s.calls }));
+      return apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: ["secret-repo"], now, candidatePolicy: SHADOW }).then((r) => ({ r, calls: s.calls }));
     };
     const young = await run("2026-01-01T12:00:00Z");
     expect(young.r.results[0]).toMatchObject({ state: "unchanged", ci: "green", autoMerge: "train" });
@@ -897,7 +900,7 @@ describe("the pace of the update pushes", () => {
         [`POST ${base}/secret-repo/issues/7/labels`]: () => [200, []],
       });
       const up = updater();
-      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: ["secret-repo"], maxPushes: 0, now: slot(0) });
+      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: ["secret-repo"], maxPushes: 0, now: slot(0), candidatePolicy: SHADOW });
       expect(up.seen).toEqual([]);
       return { x: r.results[0], calls: s.calls };
     };
@@ -1765,28 +1768,33 @@ describe("the candidate rules in a run of apply", () => {
   const S = "secret-repo";
   const RETRY = CANDIDATE_POLICY.retryLabel;
   const NOW = new Date("2026-11-11T12:00:00Z");
-  const one = { ...CANDIDATE_POLICY, mode: "one-candidate" as const };
-  const fp = (): string => selectUpdates(fixture(), [S]).ready[0]?.fingerprint ?? "";
-  /** The routes of a private repository with the open candidate #7. By default, it is green, 2 commits behind and has no change of its surface. */
-  const routes = (o: { body?: string; labels?: { name: string }[]; checks?: unknown[]; behind?: number; pushedAt?: string; merge?: Handler } = {}): Record<string, Handler> => {
-    const pr = pull(7, S, { body: o.body ?? `x <!-- release-train:fingerprint=${fp()} -->`, labels: o.labels ?? [{ name: TRAIN_LABEL }] });
+  /** The mode one-candidate for each repository, so the test does not depend on the default share. */
+  const one = { ...CANDIDATE_POLICY, mode: "one-candidate" as const, share: 1 };
+  const fp = (repo: string = S): string => selectUpdates(fixture(), [repo]).ready[0]?.fingerprint ?? "";
+  /**
+   * The routes of a repository with the open candidate #7. The default repository is the private repository `S`. By
+   * default, the candidate is green, 2 commits behind and has no change of its surface.
+   */
+  const routes = (o: { repo?: string; body?: string; labels?: { name: string }[]; checks?: unknown[]; behind?: number; pushedAt?: string; merge?: Handler } = {}): Record<string, Handler> => {
+    const R = o.repo ?? S;
+    const pr = pull(7, R, { body: o.body ?? `x <!-- release-train:fingerprint=${fp(R)} -->`, labels: o.labels ?? [{ name: TRAIN_LABEL }] });
     return {
-      [`GET ${base}/${S}`]: meta,
-      [`GET ${base}/${S}/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pr] : []],
-      [`GET ${base}/${S}/pulls/7`]: () => [200, { ...pr, mergeable: true }],
-      [`PATCH ${base}/${S}/pulls/7`]: (b) => [200, { ...pr, ...b }],
-      [`POST ${base}/${S}/labels`]: () => [201, {}],
-      [`POST ${base}/${S}/issues/7/labels`]: () => [200, []],
-      [`DELETE ${base}/${S}/issues/7/labels/${encodeURIComponent(RETRY)}`]: () => [200, []],
-      [`GET ${base}/${S}/commits/sha7/check-runs`]: () => [200, { check_runs: o.checks ?? [{ status: "completed", conclusion: "success" }] }],
-      [`GET ${base}/${S}/commits/sha7/status`]: () => [200, { state: "pending", total_count: 0 }],
-      [`GET ${base}/${S}/commits/sha7`]: () => [200, { commit: { committer: { date: o.pushedAt ?? "2026-11-11T08:00:00Z" } } }],
-      [`GET ${base}/${S}/actions/runs`]: () => [200, { workflow_runs: [] }],
-      [`GET ${base}/${S}/compare/main...sha7`]: () => [200, { behind_by: o.behind ?? 2, files: [{ filename: "package.json" }], merge_base_commit: { sha: "mb1" } }],
-      [`GET ${base}/${S}/compare/mb1...main`]: () => [200, { files: [{ filename: "src/index.ts" }] }],
-      [`GET ${base}/${S}/commits/main`]: () => [200, { sha: "head1" }],
-      [`PUT ${base}/${S}/pulls/7/merge`]: o.merge ?? (() => [200, { merged: true }]),
-      [`DELETE ${base}/${S}/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+      [`GET ${base}/${R}`]: meta,
+      [`GET ${base}/${R}/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pr] : []],
+      [`GET ${base}/${R}/pulls/7`]: () => [200, { ...pr, mergeable: true }],
+      [`PATCH ${base}/${R}/pulls/7`]: (b) => [200, { ...pr, ...b }],
+      [`POST ${base}/${R}/labels`]: () => [201, {}],
+      [`POST ${base}/${R}/issues/7/labels`]: () => [200, []],
+      [`DELETE ${base}/${R}/issues/7/labels/${encodeURIComponent(RETRY)}`]: () => [200, []],
+      [`GET ${base}/${R}/commits/sha7/check-runs`]: () => [200, { check_runs: o.checks ?? [{ status: "completed", conclusion: "success" }] }],
+      [`GET ${base}/${R}/commits/sha7/status`]: () => [200, { state: "pending", total_count: 0 }],
+      [`GET ${base}/${R}/commits/sha7`]: () => [200, { commit: { committer: { date: o.pushedAt ?? "2026-11-11T08:00:00Z" } } }],
+      [`GET ${base}/${R}/actions/runs`]: () => [200, { workflow_runs: [] }],
+      [`GET ${base}/${R}/compare/main...sha7`]: () => [200, { behind_by: o.behind ?? 2, files: [{ filename: "package.json" }], merge_base_commit: { sha: "mb1" } }],
+      [`GET ${base}/${R}/compare/mb1...main`]: () => [200, { files: [{ filename: "src/index.ts" }] }],
+      [`GET ${base}/${R}/commits/main`]: () => [200, { sha: "head1" }],
+      [`PUT ${base}/${R}/pulls/7/merge`]: o.merge ?? (() => [200, { merged: true }]),
+      [`DELETE ${base}/${R}/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
     };
   };
   /** An updater that records the value `rebuild` of each update. */
@@ -1805,7 +1813,7 @@ describe("the candidate rules in a run of apply", () => {
   it("in the mode shadow acts as the strict rule, and counts and logs the decision of the candidate rules", async () => {
     const s = server(routes());
     const { up, rebuilds } = recorder();
-    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW, candidatePolicy: SHADOW });
     // The strict rule builds the branch again because it is behind. The candidate rules merge it: its surface did not change.
     expect(rebuilds).toEqual([true]);
     expect(r.results[0]).toMatchObject({ state: "updated" });
@@ -1815,7 +1823,7 @@ describe("the candidate rules in a run of apply", () => {
     expect(r.candidates?.pairs).toEqual([{ today: "push", next: "merge", rule: "R2", code: "green-behind-main-no-read", count: 1 }]);
     expect(r.candidates?.requests).toBeGreaterThan(0);
     const summary = applySummary(publicReport(r));
-    expect(summary).toContain("Candidate rules (mode shadow): 1 decisions compared");
+    expect(summary).toContain(`Candidate rules (mode shadow, share ${SHADOW.share}): 0 decisions applied, 1 decisions compared`);
     expect(summary).toContain("| Strict rule | Candidate rules | Rule | Code | Count |");
     expect(summary).toContain("| push | merge | R2 | green-behind-main-no-read | 1 |");
     // The marks of the body: the attempt and the items. CI was green before the push, so the attempt starts at 1 again.
@@ -1829,7 +1837,7 @@ describe("the candidate rules in a run of apply", () => {
   it("keeps the name and the reason of a private repository out of the shadow log and the public report", async () => {
     const s = server(routes());
     const lines: string[] = [];
-    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: recorder().up, dryRun: false, only: [S], now: NOW, log: (l) => lines.push(l) });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: recorder().up, dryRun: false, only: [S], now: NOW, log: (l) => lines.push(l), candidatePolicy: SHADOW });
     const pair = lines.filter((l) => l.includes("candidate rules (update)"));
     expect(pair).toHaveLength(1);
     // The line of a private repository has the code and no reason.
@@ -1846,7 +1854,7 @@ describe("the candidate rules in a run of apply", () => {
       [`POST ${base}/lib-repo/issues/9/labels`]: () => [200, []],
     });
     const lines: string[] = [];
-    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater(), dryRun: false, only: ["lib-repo"], now: NOW, log: (l) => lines.push(l) });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: updater(), dryRun: false, only: ["lib-repo"], now: NOW, log: (l) => lines.push(l), candidatePolicy: SHADOW });
     expect(r.results[0]).toMatchObject({ state: "opened" });
     // The line of a public repository has the code and the reason.
     expect(lines).toContain("lib-repo: candidate rules (update): strict push, candidate push by R3 [no-candidate]: the branch has no open candidate.");
@@ -1859,7 +1867,7 @@ describe("the candidate rules in a run of apply", () => {
     });
     const lines: string[] = [];
     // With no `only`, the pace of R3 needs the time of the last push. The limit holds the branch, so the run does not read it.
-    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater(), dryRun: false, now: NOW, maxPushes: 0, log: (l) => lines.push(l) });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater(), dryRun: false, now: NOW, maxPushes: 0, log: (l) => lines.push(l), candidatePolicy: SHADOW });
     expect(r.results.find((x) => x.repo === "lib-repo")).toMatchObject({ state: "waiting" });
     // The limit holds the strict push before the candidate rules, so this decision is not a pair to compare.
     expect(r.candidates?.pairs).toEqual([]);
@@ -1870,7 +1878,7 @@ describe("the candidate rules in a run of apply", () => {
     expect(s.calls.some((c) => (c.path.includes("state=closed") && c.path.includes("per_page=100")) || c.path.includes("/commits/") || c.path.includes("/actions/runs"))).toBe(false);
     expect(lines).toContain("lib-repo: candidate rules (update): held by limit before the rules, candidate not read.");
     const summary = applySummary(publicReport(r));
-    expect(summary).toContain("Candidate rules (mode shadow): 0 decisions compared, 1 held by the run before the rules, 0 GitHub requests for their facts.");
+    expect(summary).toContain(`Candidate rules (mode shadow, share ${SHADOW.share}): 0 decisions applied, 0 decisions compared, 1 held by the run before the rules, 0 GitHub requests for their facts.`);
     expect(summary).toContain("| limit | not read | 1 |");
     // The summary gives the rate limit when the report has it, and a failed read never fails the summary.
     expect(summary).not.toContain("GitHub rate limit");
@@ -1885,7 +1893,7 @@ describe("the candidate rules in a run of apply", () => {
       [`GET ${base}/${S}/compare/main...sha7`]: () => [200, { behind_by: n++ < 2 ? 0 : 1, files: [{ filename: "package.json" }], merge_base_commit: { sha: "mb1" } }],
       [`PUT ${base}/${S}/pulls/7/update-branch`]: () => [202, { message: "Updating pull request branch." }],
     });
-    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: [S], now: NOW });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: updater({ status: "same", sha: "sha7" }), dryRun: false, only: [S], now: NOW, candidatePolicy: SHADOW });
     expect(r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
     expect(s.calls.some((c) => c.method === "PUT" && c.path.endsWith("/pulls/7/update-branch"))).toBe(true);
     // The catch-up merge starts CI as a push does, so the strict side of the pair is push, not wait.
@@ -1895,7 +1903,7 @@ describe("the candidate rules in a run of apply", () => {
   it("in the mode shadow counts the attempt up for a new build of a red plan", async () => {
     const s = server(routes({ body: `x <!-- release-train:fingerprint=${fp()} --> <!-- release-train:attempt=3 -->`, checks: [{ status: "completed", conclusion: "failure" }] }));
     const { up, rebuilds } = recorder();
-    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW });
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: [S], now: NOW, candidatePolicy: SHADOW });
     expect(rebuilds).toEqual([true]);
     expect(r.results[0]).toMatchObject({ state: "updated" });
     expect(patched(s.calls)).toContain("<!-- release-train:attempt=4 -->");
@@ -1970,5 +1978,161 @@ describe("the candidate rules in a run of apply", () => {
     expect(rebuilds).toEqual([]);
     expect(r.results[0]).toMatchObject({ state: "unchanged", ci: "running", detail: "building." });
     expect(s.calls.some((c) => c.method === "PATCH" || c.method === "PUT")).toBe(false);
+  });
+
+  describe("the record of an applied decision", () => {
+    const P = "lib-repo";
+    /** The label of the private repository `S` in the log. */
+    const SL = hashName(S);
+    /** This function runs apply on the routes, and gives the report, the log lines and the calls. */
+    const run = async (routes: Record<string, Handler>, only: string[], extra: Partial<Parameters<typeof apply>[0]> = {}) => {
+      const s = server(routes);
+      const lines: string[] = [];
+      const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: recorder().up, dryRun: false, only, now: NOW, log: (l) => lines.push(l), candidatePolicy: one, ...extra });
+      return { r, lines, calls: s.calls, acted: lines.filter((l) => l.includes(": candidate rules (update): acted")) };
+    };
+    const row = (action: string, rule: string | null, code: string | null, held: string | null, state: string, count = 1) => ({ action, rule, code, held, state, count });
+
+    it("records a merge: the line of a public repository has the reason, the line of a private repository does not", async () => {
+      const { r, lines, acted } = await run({ ...routes({ behind: 0 }), ...routes({ repo: P, behind: 0 }) }, [S, P]);
+      expect(r.results.map((x) => x.state)).toEqual(["merged", "merged"]);
+      expect(acted).toEqual(
+        expect.arrayContaining([
+          `${P}: candidate rules (update): acted merge by R2 [green-current], result merged: green on the current default branch.`,
+          `${SL}: candidate rules (update): acted merge by R2 [green-current], result merged.`,
+        ]),
+      );
+      expect(acted).toHaveLength(2);
+      expect(r.candidates).toMatchObject({ mode: "one-candidate", share: 1, pairs: [], held: [], acted: [row("merge", "R2", "green-current", null, "merged", 2)] });
+      const summary = applySummary(publicReport(r));
+      expect(summary).toContain("Candidate rules (mode one-candidate, share 1): 2 decisions applied, 0 decisions compared, 0 held by the run before the rules,");
+      expect(summary).toContain("| Decision | Rule | Code | Held by | Result | Count |");
+      expect(summary).toContain("| merge | R2 | green-current | - | merged | 2 |");
+      // The public report keeps the candidates part as it is: it has codes and counts, and no name.
+      expect(publicReport(r).candidates).toEqual(r.candidates);
+      for (const text of [...lines, summary, JSON.stringify(publicReport(r))]) expect(text).not.toContain(S);
+    });
+
+    it("records the wait of a red candidate", async () => {
+      const red = [{ status: "completed", conclusion: "failure" }];
+      const { r, acted } = await run({ ...routes({ checks: red, behind: 0 }), ...routes({ repo: P, checks: red, behind: 0 }) }, [S, P]);
+      expect(r.results.map((x) => x.state)).toEqual(["blocked", "blocked"]);
+      expect(acted).toContain(`${P}: candidate rules (update): acted wait by R5 [red-current], result blocked: red: the next build comes after the default branch moves, or add the label ${RETRY}.`);
+      expect(acted).toContain(`${SL}: candidate rules (update): acted wait by R5 [red-current], result blocked.`);
+      expect(r.candidates?.acted).toEqual([row("wait", "R5", "red-current", null, "blocked", 2)]);
+    });
+
+    it("records a push that updates a candidate and a push that opens one", async () => {
+      const { r, acted } = await run(
+        {
+          ...routes({ body: "old body", behind: 0 }),
+          [`GET ${base}/${P}`]: meta,
+          [`GET ${base}/${P}/pulls`]: () => [200, []],
+          [`POST ${base}/${P}/pulls`]: (b) => [201, { ...pull(9, P), ...b, labels: [] }],
+          [`POST ${base}/${P}/labels`]: () => [201, {}],
+          [`POST ${base}/${P}/issues/9/labels`]: () => [200, []],
+        },
+        [S, P],
+      );
+      expect(Object.fromEntries(r.results.map((x) => [x.repo, x.state]))).toEqual({ [S]: "updated", [P]: "opened" });
+      expect(acted).toContain(`${SL}: candidate rules (update): acted push by R3 [plan-changed-no-items], result updated.`);
+      expect(acted).toContain(`${P}: candidate rules (update): acted push by R3 [no-candidate], result opened: the branch has no open candidate.`);
+      expect(r.candidates?.acted).toEqual(
+        expect.arrayContaining([row("push", "R3", "plan-changed-no-items", null, "updated"), row("push", "R3", "no-candidate", null, "opened")]),
+      );
+      expect(r.candidates?.acted).toHaveLength(2);
+    });
+
+    it("records a push that the limit of the run holds", async () => {
+      const { r, acted, calls } = await run(routes({ body: "old body", behind: 0 }), [S], { maxPushes: 0 });
+      expect(r.results[0]).toMatchObject({ state: "waiting", paced: true });
+      expect(calls.some((c) => c.method === "PATCH" || c.method === "PUT")).toBe(false);
+      expect(acted).toEqual([`${SL}: candidate rules (update): acted push by R3 [plan-changed-no-items], result waiting, held by limit.`]);
+      expect(r.candidates?.acted).toEqual([row("push", "R3", "plan-changed-no-items", "limit", "waiting")]);
+      expect(applySummary(publicReport(r))).toContain("| push | R3 | plan-changed-no-items | limit | waiting | 1 |");
+    });
+
+    it("records a merge that waits for a release run of the default branch", async () => {
+      const { r, acted, calls } = await run(
+        {
+          ...routes({ behind: 0 }),
+          [`GET ${base}/${S}/compare/main...sha7`]: () => [200, { behind_by: 0, files: [{ filename: ".github/workflows/ci.yml" }], merge_base_commit: { sha: "mb1" } }],
+          [`GET ${base}/${S}/actions/workflows/release.yml/runs`]: () => [200, { workflow_runs: [{ status: "queued" }] }],
+        },
+        [S],
+      );
+      expect(r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+      expect(calls.some((c) => c.method === "PUT")).toBe(false);
+      expect(acted).toEqual([`${SL}: candidate rules (update): acted merge by R2 [green-current], result unchanged, held by release-run.`]);
+      expect(r.candidates?.acted).toEqual([row("merge", "R2", "green-current", "release-run", "unchanged")]);
+    });
+
+    it("records a refused merge of a current candidate as merge-failed, with no push after", async () => {
+      const { r, acted, calls } = await run(routes({ behind: 0, merge: () => [405, { message: "Base branch was modified" }] }), [S]);
+      expect(r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+      expect(r.results[0]?.detail).toContain("the merge failed (HTTP 405");
+      expect(calls.some((c) => c.method === "PATCH")).toBe(false);
+      expect(acted).toEqual([`${SL}: candidate rules (update): acted merge by R2 [green-current], result unchanged, held by merge-failed.`]);
+      expect(r.candidates?.acted).toEqual([row("merge", "R2", "green-current", "merge-failed", "unchanged")]);
+    });
+
+    it("records the second decision after a refused merge of a candidate that is behind", async () => {
+      const { r, acted } = await run(routes({ merge: () => [405, { message: "Base branch was modified" }] }), [S]);
+      expect(r.results[0]).toMatchObject({ state: "updated" });
+      // The decision that counts is the push after the refused merge, not the merge.
+      expect(acted).toEqual([`${SL}: candidate rules (update): acted push by R2 [merge-refused], result updated.`]);
+      expect(r.candidates?.acted).toEqual([row("push", "R2", "merge-refused", null, "updated")]);
+    });
+
+    it("records a failed read of the facts as not read, with the result error", async () => {
+      const { r, acted, lines } = await run(
+        {
+          ...routes(),
+          [`GET ${base}/${S}/commits/sha7/check-runs`]: () => {
+            throw new Error("network down");
+          },
+        },
+        [S],
+      );
+      expect(r.results[0]).toMatchObject({ state: "error" });
+      expect(acted).toEqual([`${SL}: candidate rules (update): acted not read, result error.`]);
+      expect(r.candidates?.acted).toEqual([row("not read", null, null, null, "error")]);
+      expect(applySummary(publicReport(r))).toContain("| not read | - | - | - | error | 1 |");
+      expect(lines.some((l) => l.includes(": candidate rules (update): strict"))).toBe(false);
+    });
+
+    it("records a planned decision of a dry run with no cause", async () => {
+      const { r, acted, calls } = await run(routes({ behind: 0 }), [S], { dryRun: true });
+      expect(r.results[0]).toMatchObject({ state: "planned" });
+      expect(calls.some((c) => c.method !== "GET")).toBe(false);
+      expect(acted).toEqual([`${SL}: candidate rules (update): acted merge by R2 [green-current], result planned.`]);
+    });
+
+    it("records a push that changes no file as skip", async () => {
+      const { r, acted } = await run(routes({ body: "old body", behind: 0 }), [S], { updater: updater({ status: "same", sha: "sha7" }) });
+      expect(r.results[0]).toMatchObject({ state: "unchanged" });
+      expect(acted).toEqual([`${SL}: candidate rules (update): acted push by R3 [plan-changed-no-items], result unchanged, held by skip.`]);
+      expect(r.candidates?.acted).toEqual([row("push", "R3", "plan-changed-no-items", "skip", "unchanged")]);
+    });
+
+    it("acts below the share and logs a pair above it, with both tables in the summary", async () => {
+      const policy = { ...CANDIDATE_POLICY, mode: "one-candidate" as const, share: 0.25 };
+      // The private repository is below the share and acts. The public repository is above the share and stays in shadow.
+      expect(shareOf(SL)).toBeLessThan(policy.share);
+      expect(shareOf(P)).toBeGreaterThanOrEqual(policy.share);
+      const { r, lines } = await run({ ...routes({ behind: 0 }), ...routes({ repo: P, behind: 0 }) }, [S, P], { candidatePolicy: policy });
+      const of = (who: string) => lines.filter((l) => l.startsWith(`${who}: candidate rules (update):`));
+      expect(of(SL)).toEqual([`${SL}: candidate rules (update): acted merge by R2 [green-current], result merged.`]);
+      expect(of(P)).toHaveLength(1);
+      expect(of(P)[0]).toMatch(/^lib-repo: candidate rules \(update\): strict \w+, candidate merge by R2 \[green-current\]: green on the current default branch\.$/);
+      expect(r.candidates).toMatchObject({ mode: "one-candidate", share: 0.25, acted: [row("merge", "R2", "green-current", null, "merged")] });
+      expect(r.candidates?.pairs).toHaveLength(1);
+      const summary = applySummary(publicReport(r));
+      expect(summary).toContain("Candidate rules (mode one-candidate, share 0.25): 1 decisions applied, 1 decisions compared, 0 held by the run before the rules,");
+      expect(summary).toContain("| Strict rule | Candidate rules | Rule | Code | Count |");
+      expect(summary).toContain("Applied decisions:");
+      expect(summary).toContain("| merge | R2 | green-current | - | merged | 1 |");
+      for (const text of [...lines, summary, JSON.stringify(publicReport(r))]) expect(text).not.toContain(S);
+    });
   });
 });

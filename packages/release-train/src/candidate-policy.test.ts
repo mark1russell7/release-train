@@ -67,9 +67,13 @@ async function lazy(full: CandidateFacts, p: CandidatePolicy = P): Promise<{ dec
 }
 
 describe("the policy data", () => {
-  it("ships the shadow mode with the values of the design", () => {
+  it("acts in the mode one-candidate for a share of 0.25 of the repositories", () => {
+    // The next step to each repository changes the share in the data and in this one line.
+    expect({ mode: CANDIDATE_POLICY.mode, share: CANDIDATE_POLICY.share }).toEqual({ mode: "one-candidate", share: 0.25 });
+  });
+
+  it("ships the other values of the design", () => {
     expect(CANDIDATE_POLICY).toMatchObject({
-      mode: "shadow",
       ratePublic: 5,
       ratePrivate: 1,
       paceFloorHours: 1,
