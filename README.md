@@ -150,7 +150,7 @@ The policy is data: `CANDIDATE_POLICY` in `candidate-policy.ts`. The function `d
 - R1, no preemption: the train does not push while CI of the candidate is in progress. An urgent update is the exception. A workflow run that is older than 6 hours does not count as in progress.
 - R2, exact staleness: a green candidate is stale only in two cases. GitHub cannot merge it, or the default branch changed a file of its surface since the merge base. To be behind is not a reason.
 - R3, the pace: a new push waits `clamp(cost / rate, 1 h, 24 h)` after the last push of the branch. An urgent update and `--only` pass the pace.
-- R4, a red default branch: a candidate that is behind waits while the newest train merge and the head are both red.
+- R4, a red default branch: the head of the default branch is red in the checks of the candidate. Then a green candidate that is behind gets a new build. R3 paces this push.
 - R5, a red candidate: the train builds it again only for three reasons. They are a new plan, the label `release-train:retry`, or a moved default branch after the backoff.
 
 The surface of a candidate is the list of the files that it changes. When the candidate changes the lockfile, the surface also has `pnpm-lock.yaml`, `pnpm-workspace.yaml` and `.npmrc`. GitHub cuts a list of files at 300 files. A cut list counts as a change, with its own reason in the log. A failed read also counts as a change.
@@ -159,7 +159,13 @@ The cost of R3 is the CI minutes of the last candidate. For a public repository,
 
 The backoff of R5 is `clamp(2^(attempt - 1) h, 1 h, 24 h)` after the last push, and the pace must also permit the push. The label `release-train:retry` gives one new build, and then the train removes the label. A retry label waits for the end of CI.
 
-For R4, the train counts the red train merges of the last 30 days. At `redMainBound` or more, the strict rule comes back for a candidate that is behind. The bound is null at first, so the train only counts and logs. A commit with no CI result is "no read" in the log, and it does not count as green. The train reads these facts only for a green candidate that is behind, one time for each repository in a run.
+For R4, the train reads the CI result of the head of the default branch. Only the workflows of the head of the candidate count. A workflow that runs only on the default branch, for example a release workflow, does not count.
+
+A red head gives a new build of the candidate on the default branch, and not a wait. So a candidate that has the fix of the default branch gets one new build and then merges. R3 paces the push, and R5 holds a red result, so the cost has a limit. A head that is pending or green goes on to the merge.
+
+A commit with no CI result is "no read" in the log, and it does not count as green. An empty set of workflows of the candidate, or a failed read, also gives "no read". The train reads these facts only for a green candidate that is behind. The value is for one candidate, because two train branches of a repository can run different workflows.
+
+The field `redMainBound` sets a bound on the red train merges of the last 30 days. At the bound or more, the strict rule comes back for a candidate that is behind. The count uses the same workflows of the candidate. The bound is null, so the rule has no bound, and the train does not read the count.
 
 A change of the plan on a green update candidate merges first when the change is monotone. Monotone: each item of the candidate is in the plan with the same version or a newer version. Else the new plan replaces the candidate, so a held item or a removed item does not merge. A missing or empty items mark is "no read", and "no read" is not monotone. A change of the plan on a green sync candidate replaces it.
 
@@ -168,12 +174,17 @@ The body of each pull request has the mark `<!-- release-train:attempt=N -->`, a
 The field `mode` of the policy has three values:
 
 - `strict`: the train acts by the strict rule and reads no fact of the candidate rules.
-- `shadow`: the default. The train acts by the strict rule. It also reads the facts, logs the decision next to the strict action and counts each pair in the summary. The log of a private repository has its hash label and no reason.
+- `shadow`: the default. The train acts by the strict rule. It also reads the facts, logs the decision next to the strict action and counts each pair in the summary. Each decision has a code: a short fixed id of the step that made it, for example `green-behind`, `main-red` or `pace-wait`. The log of a private repository has its hash label and the code, but no reason.
+  - The log line of a pair is `<label>: candidate rules (<kind>): strict <action>, candidate <action> by <rule> [<code>]: <reason>.`. The line of a private repository stops after the code.
+  - The table of the pairs in the summary has the columns strict rule, candidate rules, rule, code and count. In the report, each row of `candidates.pairs` is `{ today, next, rule, code, count }`.
   - A pair goes into the table only when the candidate rules can decide differently from the strict rule. A merge of the default branch into a candidate starts CI, so it counts as a strict push.
   - A cause outside the rules can hold the strict action first. The causes are the push limit of the run, busy runners, a young version, an open release run, a skip and an error. Then the decision goes into a second table, "Held by the run before the rules", with its cause. For a held branch with no candidate, the run reads no fact.
+  - The log line of a held branch is `<label>: candidate rules (<kind>): held by <cause> before the rules, candidate <action> by <rule> [<code>]: <reason>.`. The line of a private repository stops after the code. The line of a branch with no fact read stops after `not read`.
 - `one-candidate`: the train acts on the decision. The field `share` selects a part of the repositories, by a hash of the label of the log. A repository below the share gets this mode, and the others get `shadow`. Only this mode makes the label `release-train:retry` and tells it in the body.
 
-The facts cost GitHub requests, all with GET. CI costs 3, mergeable 1, behind 1, surface 1, the runs of other branches 2 and the last push 1 or 2. The cost of the last candidate is 1 request, plus 1 for each of its workflow runs. The default branch costs 4 requests, plus 1 for each train merge in the window. The run keeps each response, and the summary gives the count of the requests.
+The facts cost GitHub requests, all with GET. CI costs 3, mergeable 1, behind 1, surface 1, the runs of other branches 2 and the last push 1 or 2. The cost of the last candidate is 1 request, plus 1 for each of its workflow runs. The default branch costs 2 requests after the CI read: its head commit and the runs of that commit. With a bound, it costs 2 more requests for the closed pull requests, plus 1 for each train merge in the window. The run keeps each response, and the summary gives the count of the requests.
+
+Each result with the state `merged` has the field `mergedBehind` in the report. It is the count of the commits of the default branch that were not in the branch at the merge. Null tells that the train has no read. The strict rule merges only at 0. The field is a count, so the report keeps it for a private repository.
 
 The run also reads `GET /rate_limit` at the start and at the end. The summary and the report give the limit, the used count at the start and at the end, the count left and the reset time. A failed read shows "no read" and does not stop the run.
 

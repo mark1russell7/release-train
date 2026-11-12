@@ -3,7 +3,7 @@ import semver from "semver";
 import { candidateReader } from "./candidate-facts.ts";
 import type { CandidateTarget } from "./candidate-facts.ts";
 import { CANDIDATE_POLICY, bodyAttempt, bodyItems, candidateItems, decide, decideWith, markLines, modeFor, nextAttempt } from "./candidate-policy.ts";
-import type { CandidateDecision, CandidateFacts, CandidateItem, CandidateKind, CandidateMode, CandidatePolicy, CandidateRule, DecideResult } from "./candidate-policy.ts";
+import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateKind, CandidateMode, CandidatePolicy, CandidateRule, DecideResult } from "./candidate-policy.ts";
 import { pool } from "./collect.ts";
 import { rateLimitLine } from "./github.ts";
 import type { GitHub, RateLimitReport } from "./github.ts";
@@ -381,6 +381,11 @@ export interface RepoResult {
   urgent?: boolean;
   /** The count of the items of the repository that stay for a later run. A private repository gives only this count. */
   held?: number;
+  /**
+   * A merge: the count of the commits of the default branch that were not in the branch at the merge. Null when the train
+   * has no read. A count has no name, so the report keeps it also for a private repository.
+   */
+  mergedBehind?: number | null;
 }
 
 /** The result of one run of the train. */
@@ -404,11 +409,12 @@ export interface ApplyReport {
 /** An action of a train branch: a push, a merge or a wait. */
 export type CandidateAction = CandidateDecision["action"];
 
-/** One pair of the mode `shadow`: the action of the strict rule, the action of the candidate rules and their count. */
+/** One pair of the mode `shadow`: the action of the strict rule, the action of the candidate rules, their rule, code and count. */
 export interface CandidatePair {
   today: CandidateAction;
   next: CandidateAction;
   rule: CandidateRule;
+  code: CandidateCode;
   count: number;
 }
 
@@ -934,8 +940,8 @@ export function applySummary(r: ApplyReport): string {
     const held = c.held.reduce((n, x) => n + x.count, 0);
     lines.push(`Candidate rules (mode ${c.mode}): ${total} decisions compared, ${held} held by the run before the rules, ${c.requests} GitHub requests for their facts.`);
     if (c.pairs.length > 0) {
-      lines.push("", "| Strict rule | Candidate rules | Rule | Count |", "| --- | --- | --- | ---: |");
-      for (const x of c.pairs) lines.push(`| ${x.today} | ${x.next} | ${x.rule} | ${x.count} |`);
+      lines.push("", "| Strict rule | Candidate rules | Rule | Code | Count |", "| --- | --- | --- | --- | ---: |");
+      for (const x of c.pairs) lines.push(`| ${x.today} | ${x.next} | ${x.rule} | ${x.code} | ${x.count} |`);
       lines.push("");
     }
     if (c.held.length > 0) {
@@ -1139,7 +1145,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     meta: RepoMeta | null,
     branch: string = TRAIN_BRANCH,
     deleteBranch = true,
-  ): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number; caughtUp?: boolean; held?: HeldCause }> => {
+  ): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number; caughtUp?: boolean; held?: HeldCause; mergedBehind?: number }> => {
     const ci = await ciOf(repo, pr.head.sha);
     if (ci === "failed") {
       if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
@@ -1176,13 +1182,16 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
         if (deleteBranch) await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);
-        return { state: "merged", ci, detail: "CI was green. The train merged the pull request." };
+        return { state: "merged", ci, detail: "CI was green. The train merged the pull request.", mergedBehind: cmp.behind };
       }
       return { state: "unchanged", ci, detail: `CI is green, but the merge failed (HTTP ${m.status}${m.message ? `: ${m.message}` : ""}).` };
     }
     const why = ci === "none" ? "No CI check started yet." : "CI runs.";
     return { state: "unchanged", ci, detail: why };
   };
+
+  /** This function gives the field `mergedBehind` of a result of settle that merged, and no field for another result. */
+  const mergedOf = (s: { state: RepoState; mergedBehind?: number }): Pick<RepoResult, "mergedBehind"> => (s.state === "merged" ? { mergedBehind: s.mergedBehind ?? null } : {});
 
   /** This function closes a pull request of the train with a comment, marks it as closed by the train and deletes the branch. */
   const closeTrainPr = async (repo: string, pr: Pull, why: string, branch: string = TRAIN_BRANCH): Promise<void> => {
@@ -1278,7 +1287,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       p.shadow.caughtUp = s.caughtUp === true;
       p.shadow.cause = s.held ?? null;
     }
-    result({ ...p.common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: s.state === "merged" ? s.detail : `${s.detail} ${how}` });
+    result({ ...p.common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: s.state === "merged" ? s.detail : `${s.detail} ${how}`, ...mergedOf(s) });
   };
 
   // The candidate rules (see candidate-policy.ts). The mode `shadow` acts as `strict` and logs the decision of the rules
@@ -1353,7 +1362,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const pairOf = (repo: string, isPrivate: boolean, kind: CandidateKind, rec: ShadowRecord, added: readonly RepoResult[]): void => {
     const d = rec.d;
     if (!d) return;
-    const why = (x: CandidateDecision): string => ` by ${x.rule}${isPrivate ? "" : `: ${x.reason}`}`;
+    const why = (x: CandidateDecision): string => ` by ${x.rule} [${x.code}]${isPrivate ? "" : `: ${x.reason}`}`;
     if (rec.cause !== null) {
       const next: HeldNext = d === "not read" ? d : d.action;
       const key = `${rec.cause}|${next}`;
@@ -1367,8 +1376,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const last = added[added.length - 1];
     const today = rec.caughtUp ? "push" : last ? strictAction(last) : null;
     if (!today) return;
-    const key = `${today}|${d.action}|${d.rule}`;
-    const pair = pairs.get(key) ?? { today, next: d.action, rule: d.rule, count: 0 };
+    const key = `${today}|${d.action}|${d.rule}|${d.code}`;
+    const pair = pairs.get(key) ?? { today, next: d.action, rule: d.rule, code: d.code, count: 0 };
     pair.count += 1;
     pairs.set(key, pair);
     log(`${label(repo, isPrivate)}: candidate rules (${kind}): strict ${today}, candidate ${d.action}${why(d)}.`);
@@ -1415,7 +1424,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
     if (m.ok) {
       await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${t.branch}`);
-      result({ ...common, state: "merged", pr: prRef(pr), autoMerge, ci, detail: `The train merged the pull request: ${d.reason}.` });
+      result({ ...common, state: "merged", pr: prRef(pr), autoMerge, ci, detail: `The train merged the pull request: ${d.reason}.`, mergedBehind: dr.facts.behind ?? null });
       return null;
     }
     const failed = `the merge failed (HTTP ${m.status}${m.message ? `: ${m.message}` : ""})`;
@@ -1553,7 +1562,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
             detail += r.ok ? " The train ticked the rebase box, so Renovate rebases the branch." : ` The tick of the rebase box failed (HTTP ${r.status}).`;
           }
         }
-        result({ ...base0, state: s.state, pr: prRef(pr), ci: s.ci, detail });
+        result({ ...base0, state: s.state, pr: prRef(pr), ci: s.ci, detail, ...mergedOf(s) });
       } catch (e) {
         result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
       }
@@ -1630,7 +1639,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       const meta = (await gh.request<RepoMeta>("GET", `${base}/${w.repo}`)).data;
       await disableAutoMerge(pr);
       const s = await settle(w.repo, pr, meta);
-      result({ ...base0, state: s.state === "unchanged" ? "waiting" : s.state, pr: { number: pr.number, url: pr.html_url }, ci: s.ci, detail: `${s.detail} The rest of the update waits for ${w.dependsOn.join(", ") || "npm"}.` });
+      result({ ...base0, state: s.state === "unchanged" ? "waiting" : s.state, pr: { number: pr.number, url: pr.html_url }, ci: s.ci, detail: `${s.detail} The rest of the update waits for ${w.dependsOn.join(", ") || "npm"}.`, ...mergedOf(s) });
       continue;
     }
     result({ ...base0, state: "waiting", pr: pr ? { number: pr.number, url: pr.html_url } : null, ci: null, detail: `It waits for ${w.dependsOn.join(", ") || "the target versions on npm"}.` });
@@ -1749,7 +1758,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         shadow.cause = state === "waiting" ? "limit" : (s?.held ?? null);
         shadow.caughtUp = s?.caughtUp === true;
         const detail = state === "waiting" ? `${s ? `${s.detail} ` : ""}${wait}` : (s?.detail ?? wait);
-        result({ ...common, state, ...(state === "waiting" ? { paced: true } : {}), pr: prRef(existing), autoMerge: s ? "train" : null, ci: s?.ci ?? null, detail });
+        result({ ...common, state, ...(state === "waiting" ? { paced: true } : {}), pr: prRef(existing), autoMerge: s ? "train" : null, ci: s?.ci ?? null, detail, ...(s ? mergedOf(s) : {}) });
         return;
       }
       const urgentDeps = [...new Set(u.items.map((i) => i.dep).filter((dep) => urgentNames.has(dep)))];
@@ -1999,7 +2008,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           continue;
         }
         const s = await settle(repo, vpr, meta, VERSION_BRANCH);
-        result({ ...base0, state: s.state, pr: { number: vpr.number, url: vpr.html_url }, ci: s.ci, detail: `Version pull request: ${s.detail}` });
+        result({ ...base0, state: s.state, pr: { number: vpr.number, url: vpr.html_url }, ci: s.ci, detail: `Version pull request: ${s.detail}`, ...mergedOf(s) });
         continue;
       }
       const runs = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(meta.default_branch)}&per_page=5`);

@@ -39,7 +39,7 @@ export interface CandidatePolicy {
   readonly planChangeOnGreen: { readonly update: PlanChangeChoice; readonly sync: PlanChangeChoice };
   /**
    * The count of red train merges in the window at which a repository goes back to the strict rule. Then a green candidate
-   * that is behind gets a new build. Null: the train counts and logs, and the count changes nothing.
+   * that is behind gets a new build. Null: the rule has no bound, and the train does not read the count.
    */
   readonly redMainBound: number | null;
   /** The days of the window of the count of red train merges. */
@@ -81,14 +81,18 @@ export interface CandidateCi {
 /** The CI result of one commit of the default branch. `no-read`: the commit has no workflow run that tells a result. */
 export type CommitHealth = "red" | "green" | "pending" | "no-read";
 
-/** The facts of rule R4 for one repository. */
+/**
+ * The facts of rule R4 for one candidate. Each value counts only the workflows of the head of the candidate. A workflow
+ * that runs only on the default branch, for example a release workflow, does not count.
+ */
 export interface MainHealth {
-  /** The CI result of the newest merge commit of a train pull request, or `none` when the train merged nothing. */
-  lastMerge: CommitHealth | "none";
-  /** The CI result of the head of the default branch. */
+  /** The CI result of the head of the default branch, from the workflows of the candidate. */
   head: CommitHealth;
-  /** The count of red merge commits of train pull requests in the window of the policy. */
-  redMerges: number;
+  /**
+   * The count of red merge commits of train pull requests in the window of the policy, from the workflows of the
+   * candidate. Null when the policy has no bound, or when the train has no read of the workflows of the candidate.
+   */
+  redMerges: number | null;
 }
 
 /** The facts of the open candidate of a branch, from the pull request. */
@@ -150,10 +154,49 @@ export type CandidateNeed = "ci" | "mergeable" | "behind" | "surface" | "otherRu
 /** The rule that made a decision. */
 export type CandidateRule = "R0" | "R1" | "R2" | "R3" | "R4" | "R5" | "urgent" | "label" | "legacy";
 
+/**
+ * The codes of the decisions: a short fixed id for each place in `decide` that makes a decision, in the order of its steps.
+ * A code has no name and no number, so the log of a private repository can show it.
+ */
+export const CANDIDATE_CODES = [
+  "no-plan",
+  "no-candidate",
+  "urgent-plan-changed",
+  "urgent-not-current",
+  "label-building",
+  "label-retry",
+  "building",
+  "merge-refused",
+  "not-mergeable",
+  "surface-cut",
+  "surface-changed",
+  "plan-changed-no-items",
+  "plan-changed",
+  "yield",
+  "main-red",
+  "red-merges-bound",
+  "green-current",
+  "green-behind",
+  "no-check-plan-changed",
+  "no-check-behind",
+  "no-check",
+  "red-plan-changed",
+  "red-current",
+  "red-backoff",
+  "red-retry",
+  "red-pace-wait",
+  "pace-wait",
+] as const;
+
+/** The code of a decision. Refer to `CANDIDATE_CODES`. */
+export type CandidateCode = (typeof CANDIDATE_CODES)[number];
+
 /** The decision of the candidate rules for one branch. */
 export interface CandidateDecision {
   action: "push" | "merge" | "wait";
   rule: CandidateRule;
+  /** The code of the place in `decide` that made the decision. The log of a private repository shows it and not the reason. */
+  code: CandidateCode;
   reason: string;
   /** A push: the number of the try in the `attempt` mark of the new body. */
   attempt?: number;
@@ -214,7 +257,7 @@ function paced(p: CandidatePolicy, f: CandidateFacts, d: CandidateDecision): Can
   const c = paceCheck(p, f);
   if ("need" in c) return c;
   if (c.ok) return { decision: d };
-  return { decision: { action: "wait", rule: "R3", reason: `${d.reason}, but the pace of the branch permits the next push at ${at(c.until)}`, until: c.until } };
+  return { decision: { action: "wait", rule: "R3", code: "pace-wait", reason: `${d.reason}, but the pace of the branch permits the next push at ${at(c.until)}`, until: c.until } };
 }
 
 /**
@@ -231,28 +274,28 @@ export function monotone(candidate: readonly CandidateItem[], plan: readonly Can
  */
 export function decide(p: CandidatePolicy, f: CandidateFacts): CandidateStep {
   const done = (d: CandidateDecision): CandidateStep => ({ decision: d });
-  if (f.plan === null) return done({ action: "wait", rule: "legacy", reason: "no plan is due for the branch" });
+  if (f.plan === null) return done({ action: "wait", rule: "legacy", code: "no-plan", reason: "no plan is due for the branch" });
   const o = f.open;
   // Step 0: no open pull request.
-  if (o === null) return paced(p, f, { action: "push", rule: f.urgent ? "urgent" : "R3", reason: "the branch has no open candidate", attempt: 1, rebuild: false });
+  if (o === null) return paced(p, f, { action: "push", rule: f.urgent ? "urgent" : "R3", code: "no-candidate", reason: "the branch has no open candidate", attempt: 1, rebuild: false });
   const planChanged = o.fingerprint !== f.plan.fingerprint;
   // Step 1: an urgent update pushes as the strict rule does. Its CI is not read yet, so its new build is attempt 1.
   if (f.urgent) {
-    if (planChanged) return done({ action: "push", rule: "urgent", reason: "an urgent update with a new plan", attempt: 1, rebuild: false });
+    if (planChanged) return done({ action: "push", rule: "urgent", code: "urgent-plan-changed", reason: "an urgent update with a new plan", attempt: 1, rebuild: false });
     if (f.mergeable === undefined) return { need: "mergeable" };
     if (f.behind === undefined) return { need: "behind" };
-    if (f.mergeable === false || (f.behind ?? 0) > 0) return done({ action: "push", rule: "urgent", reason: "an urgent update that is not on the current default branch", attempt: buildAttempt(o, planChanged, f.ci), rebuild: true });
+    if (f.mergeable === false || (f.behind ?? 0) > 0) return done({ action: "push", rule: "urgent", code: "urgent-not-current", reason: "an urgent update that is not on the current default branch", attempt: buildAttempt(o, planChanged, f.ci), rebuild: true });
   }
   if (f.ci === undefined) return { need: "ci" };
   const building = f.ci.state === "running" && !f.ci.stuck;
   const next = buildAttempt(o, planChanged, f.ci);
   // Step 2: the retry label passes R3 and R5, but not R1.
   if (o.retryLabel) {
-    if (building) return done({ action: "wait", rule: "R1", reason: `building: the label ${p.retryLabel} waits for the end of CI` });
-    return done({ action: "push", rule: "label", reason: `the label ${p.retryLabel} asks for a new build`, attempt: next, removeLabel: true, rebuild: true });
+    if (building) return done({ action: "wait", rule: "R1", code: "label-building", reason: `building: the label ${p.retryLabel} waits for the end of CI` });
+    return done({ action: "push", rule: "label", code: "label-retry", reason: `the label ${p.retryLabel} asks for a new build`, attempt: next, removeLabel: true, rebuild: true });
   }
   // Step 3: no push while CI runs.
-  if (building) return done({ action: "wait", rule: "R1", reason: "building" });
+  if (building) return done({ action: "wait", rule: "R1", code: "building", reason: "building" });
   if (f.ci.state === "green") return green(p, f, o, planChanged, next);
   if (f.ci.state === "none") return noCheck(f, planChanged, next);
   return red(p, f, o, planChanged, next);
@@ -268,56 +311,61 @@ function buildAttempt(o: OpenCandidate, planChanged: boolean, ci: CandidateCi | 
 
 /** Step 4 of the table: a green candidate. */
 function green(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChanged: boolean, next: number): CandidateStep {
-  const stale = (reason: string): CandidateStep => paced(p, f, { action: "push", rule: "R2", reason, attempt: next, rebuild: true });
+  const stale = (code: CandidateCode, reason: string): CandidateStep => paced(p, f, { action: "push", rule: "R2", code, reason, attempt: next, rebuild: true });
   // 4a: R2, exact staleness.
-  if (f.mergeRefused) return stale("GitHub refused the merge of the candidate");
+  if (f.mergeRefused) return stale("merge-refused", "GitHub refused the merge of the candidate");
   if (f.mergeable === undefined) return { need: "mergeable" };
-  if (f.mergeable === false) return stale("GitHub cannot merge the candidate");
+  if (f.mergeable === false) return stale("not-mergeable", "GitHub cannot merge the candidate");
   if (f.behind === undefined) return { need: "behind" };
   const behind = f.behind === null || f.behind > 0;
   if (behind) {
     if (f.surfaceChanged === undefined) return { need: "surface" };
-    if (f.surfaceChanged && f.surfaceCut) return stale("GitHub cut a list of files of the surface check at 300 files, so the check has no read and counts a change");
-    if (f.surfaceChanged) return stale("the default branch changed a file of the surface of the candidate");
+    if (f.surfaceChanged && f.surfaceCut) return stale("surface-cut", "GitHub cut a list of files of the surface check at 300 files, so the check has no read and counts a change");
+    if (f.surfaceChanged) return stale("surface-changed", "the default branch changed a file of the surface of the candidate");
   }
   // 4b: a change of the plan. A missing or empty items mark gives no read, and no read is not monotone.
   if (planChanged && f.plan) {
     const choice = p.planChangeOnGreen[f.kind];
     if (choice === "merge-first-when-monotone" && (o.items === null || o.items.length === 0)) {
-      return paced(p, f, { action: "push", rule: "R3", reason: "the plan changed, and the candidate has no items mark, so the monotone check has no read", attempt: 1, rebuild: false });
+      return paced(p, f, { action: "push", rule: "R3", code: "plan-changed-no-items", reason: "the plan changed, and the candidate has no items mark, so the monotone check has no read", attempt: 1, rebuild: false });
     }
     const first = choice === "merge-first-when-monotone" && o.items !== null && f.plan.items !== null && monotone(o.items, f.plan.items);
-    if (!first) return paced(p, f, { action: "push", rule: "R3", reason: "the plan changed, and the candidate goes out of date", attempt: 1, rebuild: false });
+    if (!first) return paced(p, f, { action: "push", rule: "R3", code: "plan-changed", reason: "the plan changed, and the candidate goes out of date", attempt: 1, rebuild: false });
   }
   // 4c: R0, the yield.
   const ageHours = o.createdAt === null ? 0 : (f.now - o.createdAt) / HOUR_MS;
   if (ageHours < f.yieldMaxHours) {
     if (f.otherRuns === undefined) return { need: "otherRuns" };
-    if (f.otherRuns > 0) return { decision: { action: "wait", rule: "R0", reason: `green, but ${f.otherRuns} workflow run(s) of other branches are not done` } };
+    if (f.otherRuns > 0) return { decision: { action: "wait", rule: "R0", code: "yield", reason: `green, but ${f.otherRuns} workflow run(s) of other branches are not done` } };
   }
   // 4d: R4, the red default branch.
   let note = "";
   if (behind) {
     if (f.mainHealth === undefined) return { need: "mainHealth" };
     const h = f.mainHealth;
-    if (h.lastMerge === "red" && h.head === "red") return { decision: { action: "wait", rule: "R4", reason: "the default branch is red after a train merge" } };
-    if (p.redMainBound !== null && h.redMerges >= p.redMainBound) {
-      return paced(p, f, { action: "push", rule: "R4", reason: `${h.redMerges} red train merges in ${p.redMainWindowDays} days, so the strict rule builds a candidate that is behind`, attempt: next, rebuild: true });
+    // A red head gives a new build on the default branch, not a wait. R3 paces the push, and R5 holds a red result.
+    if (h.head === "red") return paced(p, f, { action: "push", rule: "R4", code: "main-red", reason: "the default branch is red in the checks of the candidate, so the candidate gets a new build on it", attempt: next, rebuild: true });
+    if (p.redMainBound !== null && h.redMerges !== null && h.redMerges >= p.redMainBound) {
+      return paced(p, f, { action: "push", rule: "R4", code: "red-merges-bound", reason: `${h.redMerges} red train merges in ${p.redMainWindowDays} days, so the strict rule builds a candidate that is behind`, attempt: next, rebuild: true });
     }
     if (h.head === "no-read") note = ", and the default branch has no CI result (no read)";
   }
   // 4e: the merge.
   const where = behind ? `green and ${f.behind ?? "some"} commit(s) behind, with no change of its surface` : "green on the current default branch";
-  return { decision: { action: "merge", rule: "R2", reason: `${where}${planChanged ? ", and the plan change is monotone" : ""}${note}` } };
+  return { decision: { action: "merge", rule: "R2", code: behind ? "green-behind" : "green-current", reason: `${where}${planChanged ? ", and the plan change is monotone" : ""}${note}` } };
 }
 
-/** Step 6 of the table: no check started yet. The strict rule applies. */
+/**
+ * Step 6 of the table: no check started yet. A changed plan gives a push. A candidate that GitHub cannot merge, or that
+ * is behind, gives a push with a new build. Else the candidate waits. In the mode `one-candidate`, a wait keeps the open
+ * candidate, and the train does not start the updater for it. So the train does not push a new build of the same plan.
+ */
 function noCheck(f: CandidateFacts, planChanged: boolean, next: number): CandidateStep {
-  if (planChanged) return { decision: { action: "push", rule: "legacy", reason: "no check started yet, and the plan changed", attempt: 1, rebuild: false } };
+  if (planChanged) return { decision: { action: "push", rule: "legacy", code: "no-check-plan-changed", reason: "no check started yet, and the plan changed", attempt: 1, rebuild: false } };
   if (f.mergeable === undefined) return { need: "mergeable" };
   if (f.behind === undefined) return { need: "behind" };
-  if (f.mergeable === false || (f.behind ?? 0) > 0) return { decision: { action: "push", rule: "legacy", reason: "no check started yet, and the candidate is not on the current default branch", attempt: next, rebuild: true } };
-  return { decision: { action: "wait", rule: "legacy", reason: "no check started yet" } };
+  if (f.mergeable === false || (f.behind ?? 0) > 0) return { decision: { action: "push", rule: "legacy", code: "no-check-behind", reason: "no check started yet, and the candidate is not on the current default branch", attempt: next, rebuild: true } };
+  return { decision: { action: "wait", rule: "legacy", code: "no-check", reason: "no check started yet" } };
 }
 
 /** Step 5 of the table: a red candidate, or a candidate with stuck CI. */
@@ -325,16 +373,16 @@ function red(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChange
   const what = f.ci?.stuck ? "CI is stuck" : "red";
   const hint = `or add the label ${p.retryLabel}`;
   // 5a: a new plan.
-  if (planChanged) return paced(p, f, { action: "push", rule: "R5", reason: `${what}, and the plan changed`, attempt: 1, rebuild: false });
+  if (planChanged) return paced(p, f, { action: "push", rule: "R5", code: "red-plan-changed", reason: `${what}, and the plan changed`, attempt: 1, rebuild: false });
   // 5b: the default branch moved, the backoff passed and the pace permits.
   if (f.behind === undefined) return { need: "behind" };
-  if (f.behind === null || f.behind === 0) return { decision: { action: "wait", rule: "R5", reason: `${what}: the next build comes after the default branch moves, ${hint}` } };
+  if (f.behind === null || f.behind === 0) return { decision: { action: "wait", rule: "R5", code: "red-current", reason: `${what}: the next build comes after the default branch moves, ${hint}` } };
   if (f.lastPushAt === undefined) return { need: "lastPush" };
   const backoffAt = f.lastPushAt === null ? f.now : f.lastPushAt + backoffHours(p, o.attempt) * HOUR_MS;
-  if (f.now < backoffAt) return { decision: { action: "wait", rule: "R5", reason: `${what}: next retry at ${at(backoffAt)}, ${hint}`, until: backoffAt } };
-  const step = paced(p, f, { action: "push", rule: "R5", reason: `${what}, the default branch moved and the wait of attempt ${o.attempt} passed`, attempt: next, rebuild: true });
+  if (f.now < backoffAt) return { decision: { action: "wait", rule: "R5", code: "red-backoff", reason: `${what}: next retry at ${at(backoffAt)}, ${hint}`, until: backoffAt } };
+  const step = paced(p, f, { action: "push", rule: "R5", code: "red-retry", reason: `${what}, the default branch moved and the wait of attempt ${o.attempt} passed`, attempt: next, rebuild: true });
   if ("decision" in step && step.decision.action === "wait" && step.decision.until !== undefined) {
-    return { decision: { action: "wait", rule: "R5", reason: `${what}: next retry at ${at(step.decision.until)}, ${hint}`, until: step.decision.until } };
+    return { decision: { action: "wait", rule: "R5", code: "red-pace-wait", reason: `${what}: next retry at ${at(step.decision.until)}, ${hint}`, until: step.decision.until } };
   }
   return step;
 }
