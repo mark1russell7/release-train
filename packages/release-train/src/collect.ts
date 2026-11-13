@@ -101,7 +101,7 @@ export interface Collected {
   fullReads?: number;
 }
 
-interface GhRepo {
+export interface GhRepo {
   name: string;
   private: boolean;
   archived: boolean;
@@ -138,13 +138,67 @@ export async function pool<T, R>(items: readonly T[], limit: number, fn: (item: 
   return out;
 }
 
-function nextLink(header: string | null): string | null {
+/** This function gives the URL of the next page from the `link` header of a response, or null. */
+export function nextLink(header: string | null): string | null {
   if (!header) return null;
   for (const part of header.split(",")) {
     const m = /<([^>]+)>;\s*rel="next"/.exec(part);
     if (m?.[1]) return m[1];
   }
   return null;
+}
+
+/** The read of one page of the GitHub API: the data and the URL of the next page. It throws on an error. */
+export type PageRead = <T>(url: string) => Promise<{ data: T; next: string | null }>;
+
+/**
+ * This function lists the repositories of an owner that a token can read, with no archive and no fork. The token of the
+ * owner lists the private repositories with `/user/repos`. The token of a GitHub App installation lists them with
+ * `/installation/repositories`. Another token lists the public repositories.
+ */
+export async function listRepos(read: PageRead, opts: { owner: string; token: string | null; publicOnly: boolean }): Promise<GhRepo[]> {
+  const paginate = async <T>(first: string): Promise<T[]> => {
+    const all: T[] = [];
+    let url: string | null = first;
+    while (url) {
+      const page: { data: T[]; next: string | null } = await read<T[]>(url);
+      all.push(...page.data);
+      url = page.next;
+    }
+    return all;
+  };
+  let listUrl = `/users/${opts.owner}/repos?type=owner&per_page=100`;
+  if (opts.token && !opts.publicOnly) {
+    try {
+      const me = await read<{ login?: string }>("/user");
+      if (me.data.login?.toLowerCase() === opts.owner.toLowerCase()) {
+        listUrl = "/user/repos?affiliation=owner&visibility=all&per_page=100";
+      }
+    } catch {
+      // A workflow token cannot read /user. The public list is correct for it.
+    }
+  }
+  let listed: GhRepo[] | null = null;
+  if (opts.token && !opts.publicOnly && listUrl.startsWith("/users/")) {
+    // The token of a GitHub App installation lists its repositories, also the private ones.
+    try {
+      const all: GhRepo[] = [];
+      let url: string | null = "/installation/repositories?per_page=100";
+      while (url) {
+        const page: { data: { repositories: GhRepo[] }; next: string | null } = await read<{ repositories: GhRepo[] }>(url);
+        all.push(...page.data.repositories);
+        url = page.next;
+      }
+      listed = all;
+    } catch {
+      // A token that is not of an installation cannot read this list. The public list is correct for it.
+    }
+  }
+  return (listed ?? (await paginate<GhRepo>(listUrl)))
+    .filter((r) => !r.archived && !r.fork)
+    .filter((r) => !(opts.publicOnly && r.private))
+    .filter((r) => !r.owner?.login || r.owner.login.toLowerCase() === opts.owner.toLowerCase())
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** This function reads the repositories, the manifests, the lockfiles and the npm state of one owner. */
@@ -219,39 +273,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     return all;
   };
 
-  // The list of repositories. A token of the owner also lists the private repositories.
-  let listUrl = `/users/${opts.owner}/repos?type=owner&per_page=100`;
-  if (opts.token && !opts.publicOnly) {
-    try {
-      const me = await ghJson<{ login?: string }>("/user");
-      if (me.data.login?.toLowerCase() === opts.owner.toLowerCase()) {
-        listUrl = "/user/repos?affiliation=owner&visibility=all&per_page=100";
-      }
-    } catch {
-      // A workflow token cannot read /user. The public list is correct for it.
-    }
-  }
-  let listed: GhRepo[] | null = null;
-  if (opts.token && !opts.publicOnly && listUrl.startsWith("/users/")) {
-    // The token of a GitHub App installation lists its repositories, also the private ones.
-    try {
-      const all: GhRepo[] = [];
-      let url: string | null = "/installation/repositories?per_page=100";
-      while (url) {
-        const page: { data: { repositories: GhRepo[] }; next: string | null } = await ghJson<{ repositories: GhRepo[] }>(url);
-        all.push(...page.data.repositories);
-        url = page.next;
-      }
-      listed = all;
-    } catch {
-      // A token that is not of an installation cannot read this list. The public list is correct for it.
-    }
-  }
-  const ghRepos = (listed ?? (await paginate<GhRepo>(listUrl)))
-    .filter((r) => !r.archived && !r.fork)
-    .filter((r) => !(opts.publicOnly && r.private))
-    .filter((r) => !r.owner?.login || r.owner.login.toLowerCase() === opts.owner.toLowerCase())
-    .sort((a, b) => a.name.localeCompare(b.name));
+  const ghRepos = await listRepos(ghJson, { owner: opts.owner, token: opts.token ?? null, publicOnly: opts.publicOnly ?? false });
   opts.onRepos?.(ghRepos.map((r) => ({ name: r.name, private: r.private })));
   log(`repositories: ${ghRepos.length}`);
 

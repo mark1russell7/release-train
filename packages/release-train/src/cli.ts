@@ -5,12 +5,12 @@ import type { HoldReading, LagHold } from "./holds.ts";
 import { applyHolds, lagOver, lagReport, lagSummary } from "./lag.ts";
 import type { LagReport } from "./lag.ts";
 import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, pendingVersions, publicReport } from "./apply.ts";
-import { collect, pool } from "./collect.ts";
+import { collect, listRepos, pool } from "./collect.ts";
 import { writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
 import { plan } from "./plan.ts";
 import type { Plan } from "./plan.ts";
-import { type GitHub, gitHub, readRateLimit } from "./github.ts";
+import { type GitHub, gitHub, pageRead, readRateLimit } from "./github.ts";
 import { moveCheck, moveSummary } from "./move.ts";
 import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
@@ -20,6 +20,7 @@ import { needStarts, readState } from "./state.ts";
 import { SYNC_RULES, apiFiles, renovateDays, syncFacts, syncRepo, syncSummary } from "./sync.ts";
 import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
 import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tagsSummary, validDate } from "./tags.ts";
+import { versionFixRun, versionFixSummary } from "./version-fix.ts";
 import { gitUpdater } from "./workspace.ts";
 
 /** The options of the command line. */
@@ -306,11 +307,62 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (o.command === "lag") return runLag(o);
   if (o.command === "holds") return runHolds(o);
   if (o.command === "move-check") return runMoveCheck(o);
+  if (o.command === "version-fix") return runVersionFix(o);
   if (o.command !== "plan" && o.command !== "apply") {
-    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply", "await-release", "tags", "lag", "holds" and "move-check".\n`);
+    process.stderr.write(`Unknown command ${o.command}. The commands are "plan", "apply", "await-release", "tags", "lag", "holds", "move-check" and "version-fix".\n`);
     return 2;
   }
   return o.command === "apply" ? runApply(o) : runPlan(o);
+}
+
+/**
+ * The version-fix command: it reads the open pull requests of the repositories of the token. When the release check of an
+ * automated dependency update fails only because a version is on npm, the command adds the PATCH (version-fix.ts).
+ * `--dry-run` shows the decisions and changes nothing. Its output gives each private repository only as a hash, with no
+ * package name. In GitHub Actions, it also masks the private names.
+ */
+async function runVersionFix(o: CliOptions): Promise<number> {
+  const tok = token();
+  if (!tok) {
+    process.stderr.write("version-fix needs a token in GH_TOKEN.\n");
+    return 2;
+  }
+  const inActions = process.env["GITHUB_ACTIONS"] === "true";
+  const key = runKey(o);
+  if (key === null) return 2;
+  const secrets = new Set<string>();
+  const redact = (text: string): string => (o.showPrivate ? text : redactNames(text, secrets, key));
+  const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);
+  try {
+    const gh = gitHub({ token: tok });
+    const all = await listRepos(pageRead(gh), { owner: o.owner, token: tok, publicOnly: false });
+    for (const r of all.filter((x) => x.private)) {
+      if (secrets.has(r.name)) continue;
+      secrets.add(r.name);
+      if (inActions) process.stdout.write(`::add-mask::${r.name}\n`);
+    }
+    const repos = all.filter((r) => o.only === null || o.only.includes(r.name)).map((r) => ({ name: r.name, private: r.private }));
+    log(`version fix: ${repos.length} repositories, ${repos.filter((r) => r.private).length} of them private${o.dryRun ? ", dry run" : ""}`);
+    const author = parseAuthor(o.author);
+    const rows = await versionFixRun({
+      gh,
+      owner: o.owner,
+      repos,
+      fixer: o.dryRun ? null : gitUpdater({ owner: o.owner, token: tok, author }),
+      // The login of the App is the name of its commit author, for example "name[bot]".
+      trainLogin: o.author === null ? null : author.name,
+      log,
+      label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
+    });
+    const text = redact(versionFixSummary(rows, o.dryRun));
+    const summaryFile = process.env["GITHUB_STEP_SUMMARY"];
+    if (summaryFile) appendFileSync(summaryFile, ["", "```", text, "```", ""].join("\n"));
+    process.stdout.write(`${text}\n`);
+    return rows.some((r) => r.action === "error") ? 1 : 0;
+  } catch (e) {
+    process.stderr.write(`${redact(e instanceof Error ? e.message : String(e))}\n`);
+    return 1;
+  }
 }
 
 async function runPlan(o: CliOptions): Promise<number> {

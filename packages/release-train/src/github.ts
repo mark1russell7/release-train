@@ -1,4 +1,5 @@
-import type { FetchFn } from "./collect.ts";
+import { nextLink } from "./collect.ts";
+import type { FetchFn, PageRead } from "./collect.ts";
 
 /** The result of one request to the GitHub API. */
 export interface GhResponse<T> {
@@ -7,12 +8,16 @@ export interface GhResponse<T> {
   data: T | null;
   /** The message of an error response, if GitHub gives one. */
   message: string | null;
+  /** The URL of the next page, from the `link` header. A client that does not read the header does not give it. */
+  next?: string | null;
 }
 
 /** A small client for the REST API and the GraphQL API of GitHub. */
 export interface GitHub {
   request<T>(method: string, path: string, body?: unknown): Promise<GhResponse<T>>;
   graphql<T>(query: string, variables: Record<string, unknown>): Promise<{ data: T | null; errors: string[] }>;
+  /** This function reads a text response, for example the log of a job. A client with no text read does not have it. */
+  text?(path: string): Promise<GhResponse<string>>;
 }
 
 /** This function makes a GitHub client that uses the given `fetch` function and token. */
@@ -42,7 +47,13 @@ export function gitHub(opts: { token: string | null; fetch?: FetchFn; apiBase?: 
         data = null;
       }
       const message = !res.ok && data && typeof data === "object" && "message" in data ? String((data as { message: unknown }).message) : null;
-      return { status: res.status, ok: res.ok, data: res.ok ? (data as T) : null, message };
+      return { status: res.status, ok: res.ok, data: res.ok ? (data as T) : null, message, next: nextLink(res.headers.get("link")) };
+    },
+    async text(path: string): Promise<GhResponse<string>> {
+      // GitHub sends a job log as a redirect to a signed URL. The fetch follows it.
+      const res = await f(path.startsWith("http") ? path : `${api}${path}`, { method: "GET", headers: { ...headers(), accept: "application/vnd.github+json, text/plain" } });
+      const text = await res.text();
+      return { status: res.status, ok: res.ok, data: res.ok ? text : null, message: res.ok ? null : text.slice(0, 200) };
     },
     async graphql<T>(query: string, variables: Record<string, unknown>): Promise<{ data: T | null; errors: string[] }> {
       const res = await f(`${api}/graphql`, { method: "POST", headers: headers(), body: JSON.stringify({ query, variables }) });
@@ -56,6 +67,15 @@ export function gitHub(opts: { token: string | null; fetch?: FetchFn; apiBase?: 
         .concat(!res.ok && doc.message ? [doc.message] : []);
       return { data: doc.data ?? null, errors };
     },
+  };
+}
+
+/** This function gives the page read of `listRepos` from a client. It throws on an error response. */
+export function pageRead(gh: GitHub): PageRead {
+  return async <T>(url: string): Promise<{ data: T; next: string | null }> => {
+    const res = await gh.request<T>("GET", url);
+    if (!res.ok || res.data === null) throw new Error(`GitHub gave HTTP ${res.status} for ${url.split("?")[0] ?? url}.`);
+    return { data: res.data, next: res.next ?? null };
   };
 }
 

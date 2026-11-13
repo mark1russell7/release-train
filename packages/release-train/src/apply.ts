@@ -13,6 +13,7 @@ import { adoptWhy, moveSets } from "./plan.ts";
 import type { Action, ActionItem, Plan } from "./plan.ts";
 import type { DepType, LockKind } from "./types.ts";
 import { ownScopes } from "./settings.ts";
+import type { FixDone } from "./version-fix.ts";
 import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, TEMPLATE_REPO, apiFiles, renovateDays, syncBody, syncNeeds, syncRepo } from "./sync.ts";
 import type { RepoFiles, RunFacts, SyncFacts, SyncPush, SyncResult, SyncRule, SyncUpdater, WorkflowsMode } from "./sync.ts";
 
@@ -333,6 +334,8 @@ export interface UpdateResult {
   apiReports?: string[];
   /** The first error lines, when a step of that update failed. */
   apiReportError?: string;
+  /** The version fixes of the branch that the update keeps (version-fix.ts). */
+  versionFixes?: FixDone[];
   /** The step that failed. */
   apiReportStep?: string;
 }
@@ -712,7 +715,7 @@ export function prTitle(u: RepoUpdate): string {
 }
 
 /** This function gives the body of the pull request of an update. */
-export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; apiReports?: string[]; apiReportError?: string; apiReportStep?: string; fixStep?: string; fixError?: string | null; urgentAge?: string[] }) | null, marks: TrailerMarks | null = null): string {
+export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; apiReports?: string[]; apiReportError?: string; apiReportStep?: string; fixStep?: string; fixError?: string | null; urgentAge?: string[]; versionFixes?: FixDone[] }) | null, marks: TrailerMarks | null = null): string {
   const lockOf = new Map((r?.changes ?? []).map((c) => [`${c.path}|${c.dep}`, c]));
   const rows = u.items.map((i) => {
     const c = lockOf.get(`${i.path}|${i.dep}`);
@@ -757,6 +760,19 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
     );
   } else if (u.kind === "adopt-breaking") {
     lines.push("A range of a new major version changes. No published package of this repository changes a runtime range, so no release is necessary.", "");
+  }
+  const versionFixes = r?.versionFixes ?? [];
+  if (versionFixes.length > 0) {
+    lines.push(
+      "## Version fix",
+      "",
+      "The update changes the shipped files of these packages, but their version is on npm. So the release check failed, and the version fix of the train added the PATCH. After the merge, the release workflow of the repository publishes them.",
+      "",
+      "| Package | Version |",
+      "|---|---|",
+      ...versionFixes.map((x) => `| \`${x.name}\` | ${x.via === "changeset" ? "a patch changeset" : `${x.from ?? "?"} -> ${x.to ?? "?"}`} |`),
+      "",
+    );
   }
   const fixed = r?.fixed ?? [];
   if (fixed.length > 0) {
