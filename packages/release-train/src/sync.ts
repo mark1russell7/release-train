@@ -249,14 +249,117 @@ export function callsShared(text: string, owner: string, shared: string): boolea
   return text.split(/\r?\n/).some((l) => !isComment(l) && /^\s*(?:-\s+)?uses:/.test(l) && l.includes(needle));
 }
 
-/** This function gives the JSON text of a value in the format of the original text. It keeps the indent, the line ends and the last line end. */
-export function formatJson(original: string, value: unknown): string {
+/** The line width of Prettier when the repository does not set one. */
+export const PRETTIER_PRINT_WIDTH = 80;
+
+/** The files that Prettier formats with its parser `json-stringify`: each non-empty array and object open, as `JSON.stringify` does. */
+export const JSON_STRINGIFY_FILES: ReadonlySet<string> = new Set(["package.json", "package-lock.json", "composer.json"]);
+
+/**
+ * This function gives the JSON text of a value in the format of the original text and of Prettier. It keeps the indent,
+ * the line ends and the last line end of the original text. With `printWidth` null (the files of `JSON_STRINGIFY_FILES`),
+ * the text is the text of `JSON.stringify`. Else a non-empty object has one key on each line: Prettier keeps an object open
+ * when a line break follows its `{`. An array goes on one line when it has no non-empty object, it is not a list of two or
+ * more lists, and its line is not longer than `printWidth`. Prettier puts such an array on one line, so the check
+ * `prettier --check` of the repository passes on the text.
+ */
+export function formatJson(original: string, value: unknown, printWidth: number | null = null): string {
   const indent = /^[ \t]+(?=")/m.exec(original)?.[0] ?? "  ";
   const eol = original.includes("\r\n") ? "\r\n" : "\n";
-  let out = JSON.stringify(value, null, indent);
-  if (eol === "\r\n") out = out.replace(/\n/g, "\r\n");
-  if (original.endsWith("\n")) out += eol;
-  return out;
+  const end = (text: string): string => (eol === "\r\n" ? text.replace(/\n/g, "\r\n") : text) + (original.endsWith("\n") ? eol : "");
+  if (printWidth === null) return end(JSON.stringify(value, null, indent));
+  const limit = printWidth;
+  // Prettier counts a tab as `tabWidth` columns, 2 by default.
+  const width = (s: string): number => s.replace(/\t/g, "  ").length;
+  const flat = (v: unknown): string | null => {
+    if (Array.isArray(v)) {
+      if (v.length > 1 && v.every((e) => Array.isArray(e) && e.length > 1)) return null;
+      const parts = v.map((e) => flat(e));
+      return parts.some((p) => p === null) ? null : `[${parts.join(", ")}]`;
+    }
+    if (v !== null && typeof v === "object") return Object.keys(v).length === 0 ? "{}" : null;
+    return JSON.stringify(v) ?? "null";
+  };
+  // `head` is the text before the value on its line, `tail` the text after it (a comma or nothing).
+  const print = (v: unknown, depth: number, head: string, tail: string): string => {
+    const pad = indent.repeat(depth);
+    const inner = indent.repeat(depth + 1);
+    if (Array.isArray(v)) {
+      const one = flat(v);
+      if (one !== null && width(pad + head + one + tail) <= limit) return one;
+      if (v.length === 0) return "[]";
+      const lines = v.map((e, i) => inner + print(e, depth + 1, "", i < v.length - 1 ? "," : "") + (i < v.length - 1 ? "," : ""));
+      return `[\n${lines.join("\n")}\n${pad}]`;
+    }
+    if (v !== null && typeof v === "object") {
+      const entries = Object.entries(v).filter(([, e]) => e !== undefined && typeof e !== "function");
+      if (entries.length === 0) return "{}";
+      const lines = entries.map(([k, e], i) => {
+        const key = `${JSON.stringify(k)}: `;
+        const comma = i < entries.length - 1 ? "," : "";
+        return inner + key + print(e, depth + 1, key, comma) + comma;
+      });
+      return `{\n${lines.join("\n")}\n${pad}}`;
+    }
+    return JSON.stringify(v) ?? "null";
+  };
+  return end(print(value, 0, "", ""));
+}
+
+/** The Prettier config files of a repository root, in the order of the search of Prettier after the key `prettier` of `package.json`. */
+export const PRETTIER_CONFIGS = [
+  ".prettierrc",
+  ".prettierrc.json",
+  ".prettierrc.yaml",
+  ".prettierrc.yml",
+  ".prettierrc.json5",
+  ".prettierrc.js",
+  "prettier.config.js",
+  ".prettierrc.ts",
+  "prettier.config.ts",
+  ".prettierrc.mjs",
+  "prettier.config.mjs",
+  ".prettierrc.mts",
+  "prettier.config.mts",
+  ".prettierrc.cjs",
+  "prettier.config.cjs",
+  ".prettierrc.cts",
+  "prettier.config.cts",
+  ".prettierrc.toml",
+] as const;
+
+const PRINT_WIDTH = /\bprintWidth\b["']?\s*[:=]\s*(\d+)/;
+
+/**
+ * This function reads the `printWidth` of Prettier in the root of a repository: from the key `prettier` of `package.json`,
+ * else from the first config file of `PRETTIER_CONFIGS`. It reads the value as text, so a config in JSON, YAML, TOML or
+ * JavaScript gives it. It gives `PRETTIER_PRINT_WIDTH` when the config does not set it.
+ */
+export async function printWidthOf(files: RepoFiles): Promise<number> {
+  const widthIn = (text: string): number => {
+    const w = Number(PRINT_WIDTH.exec(text)?.[1]);
+    return Number.isInteger(w) && w > 0 ? w : PRETTIER_PRINT_WIDTH;
+  };
+  const manifest = files.paths.includes("package.json") ? await files.read("package.json") : null;
+  if (manifest !== null) {
+    try {
+      const prettier = (JSON.parse(manifest) as { prettier?: unknown }).prettier;
+      if (prettier !== undefined) return typeof prettier === "object" && prettier !== null ? widthIn(JSON.stringify(prettier)) : PRETTIER_PRINT_WIDTH;
+    } catch {
+      // A package.json that is not JSON has no config.
+    }
+  }
+  for (const path of PRETTIER_CONFIGS) {
+    if (!files.paths.includes(path)) continue;
+    const text = await files.read(path);
+    if (text !== null) return widthIn(text);
+  }
+  return PRETTIER_PRINT_WIDTH;
+}
+
+/** This function gives the `printWidth` argument of `formatJson` for a JSON file of a repository: null for a file of `JSON_STRINGIFY_FILES`. */
+export async function jsonWidthOf(files: RepoFiles, path: string): Promise<number | null> {
+  return JSON_STRINGIFY_FILES.has(path.split("/").pop() ?? path) ? null : printWidthOf(files);
 }
 
 interface RootManifest {
@@ -492,7 +595,7 @@ const renovateDayRule: SyncRule = {
     if (now === "own" || now === day) return null;
     return {
       changes: [`\`${RENOVATE_FILE}\` gets the schedule \`${renovateSchedule(day)}\`. The weekly Renovate pull requests of this repository start on that day.`],
-      edit: { write: { [RENOVATE_FILE]: formatJson(config.text, withSchedule(config.value, day)) } },
+      edit: { write: { [RENOVATE_FILE]: formatJson(config.text, withSchedule(config.value, day), await jsonWidthOf(files, RENOVATE_FILE)) } },
     };
   },
 };

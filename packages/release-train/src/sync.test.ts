@@ -14,11 +14,14 @@ import {
   SYNC_BRANCH,
   SYNC_KIND,
   WORKFLOWS_WAIT,
+  formatJson,
   inSurface,
+  jsonWidthOf,
   movePins,
   pinSurface,
   pinsOf,
   pinsStale,
+  printWidthOf,
   renovateDays,
   renovateInput,
   syncFacts,
@@ -367,6 +370,92 @@ describe("renovate-day", () => {
     const days = repos.map((r) => dayOf(r.repo));
     expect(new Set(days).size).toBe(7);
     expect(dayOf("empty-repo")).toBeNull();
+  });
+
+  it("writes renovate.json in the layout of Prettier with the print width of the repository", async () => {
+    // The text of Prettier 3 with printWidth 100 for this config: short arrays on one line, the objects open.
+    const prettier = [
+      "{",
+      '  "$schema": "https://docs.renovatebot.com/renovate-schema.json",',
+      `  "extends": ["${PRESET}"],`,
+      '  "packageRules": [',
+      "    {",
+      '      "matchPackageNames": ["@types/node"],',
+      '      "matchUpdateTypes": ["major"],',
+      '      "enabled": false',
+      "    }",
+      "  ]",
+      "}",
+      "",
+    ].join("\n");
+    const files = mem({ "renovate.json": prettier, ".prettierrc.json": '{ "printWidth": 100 }\n' });
+    const text = (await syncRepo(files, facts({ renovateDay: () => "thursday" }))).writes["renovate.json"] ?? "";
+    expect(text).toBe(prettier.replace(`],\n  "packageRules"`, `],\n  "schedule": ["before 6am on thursday"],\n  "packageRules"`));
+  });
+});
+
+describe("formatJson", () => {
+  const value = { name: "x", files: ["dist", "README.md"], rules: [{ id: "a", on: ["b"] }], grid: [[1, 2], [3, 4]], none: [], empty: {} };
+
+  it("gives the text of JSON.stringify for a file that Prettier formats with json-stringify", () => {
+    expect(formatJson('{\n    "a": 1\n}\n', value)).toBe(`${JSON.stringify(value, null, "    ")}\n`);
+    expect(formatJson('{\r\n  "a": 1\r\n}', value)).toBe(JSON.stringify(value, null, 2).replace(/\n/g, "\r\n"));
+  });
+
+  it("puts a short array on one line, and opens objects, lists of lists and long arrays", () => {
+    expect(formatJson("{}\n", value, 80)).toBe(
+      [
+        "{",
+        '  "name": "x",',
+        '  "files": ["dist", "README.md"],',
+        '  "rules": [',
+        "    {",
+        '      "id": "a",',
+        '      "on": ["b"]',
+        "    }",
+        "  ],",
+        '  "grid": [',
+        "    [1, 2],",
+        "    [3, 4]",
+        "  ],",
+        '  "none": [],',
+        '  "empty": {}',
+        "}",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("counts the indent, the key and the comma in the line width", () => {
+    const v = { k: ["aaaa", "bbbb"], z: 1 };
+    // '  "k": ["aaaa", "bbbb"],' has 24 characters, and 23 with no comma.
+    expect(formatJson("", v, 24)).toBe('{\n  "k": ["aaaa", "bbbb"],\n  "z": 1\n}');
+    expect(formatJson("", v, 23)).toBe('{\n  "k": [\n    "aaaa",\n    "bbbb"\n  ],\n  "z": 1\n}');
+    expect(formatJson("", { k: ["aaaa", "bbbb"] }, 23)).toBe('{\n  "k": ["aaaa", "bbbb"]\n}');
+  });
+
+  it("keeps a tab indent", () => {
+    expect(formatJson('{\n\t"a": 1\n}\n', { a: [1], b: { c: 2 } }, 80)).toBe('{\n\t"a": [1],\n\t"b": {\n\t\t"c": 2\n\t}\n}\n');
+  });
+});
+
+describe("printWidthOf and jsonWidthOf", () => {
+  it("reads printWidth from the key prettier of package.json, else from the first config file", async () => {
+    expect(await printWidthOf(mem({ "package.json": '{ "prettier": { "printWidth": 120 } }', ".prettierrc.json": '{ "printWidth": 90 }' }))).toBe(120);
+    expect(await printWidthOf(mem({ "package.json": '{ "prettier": "@example/prettier-config" }', ".prettierrc.json": '{ "printWidth": 90 }' }))).toBe(80);
+    expect(await printWidthOf(mem({ "package.json": "{}", ".prettierrc.json": '{ "printWidth": 90 }' }))).toBe(90);
+    expect(await printWidthOf(mem({ ".prettierrc": "printWidth: 110\nsemi: false\n" }))).toBe(110);
+    expect(await printWidthOf(mem({ "prettier.config.mjs": "export default { printWidth: 140 };\n" }))).toBe(140);
+    expect(await printWidthOf(mem({ ".prettierrc.json": '{ "semi": false }' }))).toBe(80);
+    expect(await printWidthOf(mem({}))).toBe(80);
+  });
+
+  it("gives null for package.json, package-lock.json and composer.json in each folder", async () => {
+    const files = mem({ ".prettierrc.json": '{ "printWidth": 100 }' });
+    expect(await jsonWidthOf(files, "package.json")).toBeNull();
+    expect(await jsonWidthOf(files, "packages/core/package.json")).toBeNull();
+    expect(await jsonWidthOf(files, "package-lock.json")).toBeNull();
+    expect(await jsonWidthOf(files, "renovate.json")).toBe(100);
   });
 });
 
