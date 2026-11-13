@@ -44,6 +44,9 @@ env:
   # The run starts the release workflows that start only by hand (for example with changesets) when RELEASE_DISPATCH
   # is "true". This needs the permission Actions: write of the GitHub App.
   RELEASE_DISPATCH: "true"
+  # The step "Version fix" changes pull requests only when VERSION_FIX_LIVE is "true" too. It stays "false" until the log of a
+  # dry run on real pull requests is read (RT23). Then a change sets it to "true".
+  VERSION_FIX_LIVE: "false"
   # The public repositories (comma-separated) whose breaking adoptions carry a cascade release, "all", or "none".
   # The adoptions of other repositories with a cascade release wait.
   CASCADE: "all"
@@ -113,7 +116,7 @@ jobs:
           AUTHOR: ${{ steps.bot.outputs.author }}
           WORKFLOWS: ${{ steps.wf.outcome == 'success' && 'yes' || 'no' }}
         run: |
-          if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ]; then dry=false; else dry=true; fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ] && [ "$VERSION_FIX_LIVE" = "true" ]; then dry=false; else dry=true; fi
           args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR" --holds lag-holds.json --state train-state.json)
           if [ "$dry" != "false" ]; then args+=(--dry-run); else args+=(--take-replaced); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
