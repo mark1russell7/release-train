@@ -22,6 +22,8 @@ import {
   longestWaitFirst,
   prBody,
   publicReport,
+  releaseCheckLets,
+  releaseCheckOf,
   rotate,
   selectUpdates,
 } from "./apply.ts";
@@ -2134,5 +2136,74 @@ describe("the candidate rules in a run of apply", () => {
       expect(summary).toContain("| merge | R2 | green-current | - | merged | 1 |");
       for (const text of [...lines, summary, JSON.stringify(publicReport(r))]) expect(text).not.toContain(S);
     });
+
+    describe("the release check of a repository that publishes", () => {
+      const publishes = (status = 200): Record<string, Handler> => ({
+        [`GET ${base}/${P}/contents/.github/workflows/release.yml`]: () => [status, status === 200 ? { content: Buffer.from("on:\n  push:\n").toString("base64") } : {}],
+        [`GET ${base}/${S}/contents/.github/workflows/release.yml`]: () => [status, status === 200 ? { content: Buffer.from("on:\n  push:\n").toString("base64") } : {}],
+      });
+      const checks = (release: string | null) => [{ name: "ci / checks", status: "completed", conclusion: "success" }, ...(release ? [{ name: "ci / release-check", status: "completed", conclusion: release }] : [])];
+
+      it("holds the merge of a public repository with no release check, and merges after the check passed", async () => {
+        const held = await run({ ...routes({ repo: P, behind: 0, checks: checks(null) }), ...publishes() }, [P]);
+        expect(held.r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+        expect(held.r.results[0]?.detail).toContain("the release check of this commit is missing");
+        expect(held.calls.some((c) => c.method === "PUT")).toBe(false);
+        expect(held.acted).toEqual([expect.stringMatching(/^lib-repo: candidate rules \(update\): acted merge by R2 \[green-current\], result unchanged, held by release-check: /)]);
+        expect(held.r.candidates?.acted).toEqual([row("merge", "R2", "green-current", "release-check", "unchanged")]);
+        const passed = await run({ ...routes({ repo: P, behind: 0, checks: checks("success") }), ...publishes() }, [P]);
+        expect(passed.r.results[0]).toMatchObject({ state: "merged", ci: "green" });
+      });
+
+      it("lets a skipped release check pass only in a private repository", async () => {
+        const pub = await run({ ...routes({ repo: P, behind: 0, checks: checks("skipped") }), ...publishes() }, [P]);
+        expect(pub.r.results[0]).toMatchObject({ state: "unchanged" });
+        expect(pub.r.results[0]?.detail).toContain("the release check of this commit is skipped");
+        const priv = await run({ ...routes({ behind: 0, checks: checks("skipped") }), ...publishes() }, [S]);
+        expect(priv.r.results[0]).toMatchObject({ state: "merged" });
+        const none = await run({ ...routes({ behind: 0, checks: checks(null) }), ...publishes() }, [S]);
+        expect(none.r.results[0]).toMatchObject({ state: "unchanged" });
+        expect(none.r.candidates?.acted).toEqual([row("merge", "R2", "green-current", "release-check", "unchanged")]);
+      });
+
+      it("holds the merge when GitHub does not tell if the repository publishes, and needs no check where nothing publishes", async () => {
+        const unknown = await run({ ...routes({ repo: P, behind: 0 }), ...publishes(502) }, [P]);
+        expect(unknown.r.results[0]).toMatchObject({ state: "unchanged" });
+        expect(unknown.r.results[0]?.detail).toContain("GitHub did not tell if the repository publishes");
+        const nothing = await run({ ...routes({ repo: P, behind: 0, checks: checks(null) }), ...publishes(404) }, [P]);
+        expect(nothing.r.results[0]).toMatchObject({ state: "merged" });
+      });
+
+      it("holds the merge of the strict rule in the mode shadow in the same way", async () => {
+        const held = await run({ ...routes({ repo: P, behind: 0, checks: checks(null) }), ...publishes() }, [P], { candidatePolicy: SHADOW, updater: updater({ status: "same", sha: "sha7" }) });
+        expect(held.r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+        expect(held.r.results[0]?.detail).toContain("the release check of this commit is missing");
+        expect(held.calls.some((c) => c.method === "PUT")).toBe(false);
+        const passed = await run({ ...routes({ repo: P, behind: 0, checks: checks("success") }), ...publishes() }, [P], { candidatePolicy: SHADOW, updater: updater({ status: "same", sha: "sha7" }) });
+        expect(passed.r.results[0]).toMatchObject({ state: "merged", ci: "green" });
+      });
+    });
+  });
+});
+
+describe("releaseCheckOf and releaseCheckLets", () => {
+  const run = (name: string, status: string, conclusion: string | null) => ({ name, status, conclusion });
+  it("reads the release check of a caller of reusable-ci.yml at each depth, and of a job of the repository", () => {
+    expect(releaseCheckOf([run("ci / release-check", "completed", "success")])).toBe("passed");
+    expect(releaseCheckOf([run("CI / ci / release-check", "completed", "skipped")])).toBe("skipped");
+    expect(releaseCheckOf([run("release-check", "in_progress", null)])).toBe("running");
+    expect(releaseCheckOf([run("release-check", "completed", "failure")])).toBe("failed");
+    expect(releaseCheckOf([run("ci / checks", "completed", "success"), run("pre-release-checker", "completed", "success")])).toBe("missing");
+    expect(releaseCheckOf([])).toBe("missing");
+    expect(releaseCheckOf([run("a / release-check", "completed", "skipped"), run("b / release-check", "completed", "success")])).toBe("passed");
+  });
+
+  it("lets a merge go after a passed check, and after a skipped check only in a private repository", () => {
+    for (const isPrivate of [false, true]) {
+      expect(releaseCheckLets("passed", isPrivate)).toBe(true);
+      for (const c of ["missing", "failed", "running"] as const) expect(releaseCheckLets(c, isPrivate)).toBe(false);
+    }
+    expect(releaseCheckLets("skipped", true)).toBe(true);
+    expect(releaseCheckLets("skipped", false)).toBe(false);
   });
 });
