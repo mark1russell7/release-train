@@ -1,7 +1,12 @@
 import { createHash, createHmac } from "node:crypto";
 import semver from "semver";
+import { candidateReader } from "./candidate-facts.ts";
+import type { CandidateTarget } from "./candidate-facts.ts";
+import { CANDIDATE_POLICY, bodyAttempt, bodyItems, candidateItems, decide, decideWith, markLines, modeFor, nextAttempt } from "./candidate-policy.ts";
+import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateKind, CandidateMode, CandidatePolicy, CandidateRule, DecideResult } from "./candidate-policy.ts";
 import { pool } from "./collect.ts";
-import type { GitHub } from "./github.ts";
+import { rateLimitLine } from "./github.ts";
+import type { GitHub, RateLimitReport } from "./github.ts";
 import { holdsUpdate } from "./holds.ts";
 import type { LagHold } from "./holds.ts";
 import { adoptWhy, moveSets } from "./plan.ts";
@@ -376,6 +381,11 @@ export interface RepoResult {
   urgent?: boolean;
   /** The count of the items of the repository that stay for a later run. A private repository gives only this count. */
   held?: number;
+  /**
+   * A merge: the count of the commits of the default branch that were not in the branch at the merge. Null when the train
+   * has no read. A count has no name, so the report keeps it also for a private repository.
+   */
+  mergedBehind?: number | null;
 }
 
 /** The result of one run of the train. */
@@ -390,6 +400,108 @@ export interface ApplyReport {
   urgentUnused?: number;
   /** The count of the updates whose need had no known start, so their wait started at the start of the run. */
   startFallbacks?: number;
+  /** The decisions of the candidate rules, as counts. Absent in the mode `strict`. The report has no names, so it stays public. */
+  candidates?: CandidateReport;
+  /** The reads of the rate limit of the token at the start and at the end of the run. The command `apply` adds them. */
+  rateLimit?: RateLimitReport;
+}
+
+/** An action of a train branch: a push, a merge or a wait. */
+export type CandidateAction = CandidateDecision["action"];
+
+/** One pair of the mode `shadow`: the action of the strict rule, the action of the candidate rules, their rule, code and count. */
+export interface CandidatePair {
+  today: CandidateAction;
+  next: CandidateAction;
+  rule: CandidateRule;
+  code: CandidateCode;
+  count: number;
+}
+
+/**
+ * A cause outside the candidate rules that stops a push or a merge. In the mode `shadow`, it stops the action of the strict
+ * rule. The mode `one-candidate` has the same causes, so a decision that such a cause holds is not a difference between the rules.
+ * In the mode `one-candidate`, it stops the applied decision of the rules.
+ * `limit`: the limit of pushes of the run. `busy`: the busy runners stop a sync push. `young`: the target versions are
+ * younger than the minimumReleaseAge of pnpm. `release-run`: a merge that changes workflow files waits for the release
+ * runs. `skip`: the update or the sync changes no file. `error`: the work in the clone failed.
+ * `merge-failed`: GitHub refused the merge of a candidate, and no push follows. Only the mode `one-candidate` gives it.
+ */
+export type HeldCause = "limit" | "busy" | "young" | "release-run" | "skip" | "error" | "merge-failed";
+
+/**
+ * A decision of the candidate rules in a count. `not read`: the run read no fact for the branch. In a held pair, the branch
+ * had no candidate. In an applied decision, the read of the facts failed.
+ */
+export type HeldNext = CandidateAction | "not read";
+
+/** One count of the decisions that a cause outside the candidate rules held, in the mode `shadow`. */
+export interface CandidateHeld {
+  cause: HeldCause;
+  next: HeldNext;
+  count: number;
+}
+
+/**
+ * One count of the decisions that the train applied in the mode `one-candidate`. The key of a count is the five values
+ * before `count`.
+ */
+export interface CandidateActed {
+  /** The decision that the run applied. `not read`: the run did not read the facts, so no decision exists. */
+  action: HeldNext;
+  /** The rule of the decision. Null for `not read`. */
+  rule: CandidateRule | null;
+  /** The code of the decision. Null for `not read`. */
+  code: CandidateCode | null;
+  /** The cause outside the candidate rules that stopped the applied decision, or null. */
+  held: HeldCause | null;
+  /** The state of the result of the repository for the branch in this run. */
+  state: RepoState;
+  count: number;
+}
+
+/**
+ * The candidate rules in one run: the mode and the share of the policy, and the GitHub requests of their reads. The report
+ * also has the pairs of the mode `shadow` and the applied decisions of the mode `one-candidate`.
+ */
+export interface CandidateReport {
+  mode: CandidateMode;
+  /** The share of the policy: the part of the repositories that gets the mode `one-candidate`. */
+  share: number;
+  /** The pairs where the candidate rules can decide differently from the strict rule. Only the mode `shadow` gives them. */
+  pairs: CandidatePair[];
+  /** The decisions that a cause outside the candidate rules held in the mode `shadow`. They are not in `pairs`. */
+  held: CandidateHeld[];
+  /** The decisions that the train applied in the mode `one-candidate`, from the largest count. The list can be empty. */
+  acted: CandidateActed[];
+  /** The count of the GitHub requests that the readers of the candidate facts made. */
+  requests: number;
+}
+
+/** The record of one decision of a train branch, in the mode `shadow` or `one-candidate`. */
+interface DecisionRecord {
+  /** The mode of the candidate rules for the branch. Null until the run reads the decision. */
+  mode: CandidateMode | null;
+  /**
+   * The decision of the candidate rules. In the mode `one-candidate`, it is the last decision that the run applied.
+   * `not read`: the run read no fact. In the mode `shadow`, an outside cause held a branch with no candidate. In the mode
+   * `one-candidate`, the read of the facts failed.
+   */
+  d: CandidateDecision | "not read" | null;
+  /** The facts of the decision. Null when the run read no fact. */
+  facts: CandidateFacts | null;
+  /**
+   * The cause outside the candidate rules that stopped a push or a merge, or null. In the mode `shadow`, it stopped the
+   * action of the strict rule. In the mode `one-candidate`, it stopped the applied decision.
+   */
+  cause: HeldCause | null;
+  /** True when settle merged the default branch into the branch. This is a push of the strict rule. */
+  caughtUp: boolean;
+}
+
+/** This function gives an empty record of a decision. */
+function decisionRecord(): DecisionRecord {
+  return { mode: null, d: null, facts: null, cause: null, caughtUp: false };
 }
 
 /** The options of `apply`. */
@@ -433,6 +545,8 @@ export interface ApplyOptions {
    * request waits from this time. Absent, or undefined: the update waits from the start of the run, and the report counts it.
    */
   needSince?: (u: RepoUpdate) => string | undefined;
+  /** The policy of the candidate rules. The default is `CANDIDATE_POLICY`. */
+  candidatePolicy?: CandidatePolicy;
 }
 
 /** The options of the template sync of `apply`. */
@@ -598,7 +712,7 @@ export function prTitle(u: RepoUpdate): string {
 }
 
 /** This function gives the body of the pull request of an update. */
-export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; apiReports?: string[]; apiReportError?: string; apiReportStep?: string; fixStep?: string; fixError?: string | null; urgentAge?: string[] }) | null): string {
+export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; apiReports?: string[]; apiReportError?: string; apiReportStep?: string; fixStep?: string; fixError?: string | null; urgentAge?: string[] }) | null, marks: TrailerMarks | null = null): string {
   const lockOf = new Map((r?.changes ?? []).map((c) => [`${c.path}|${c.dep}`, c]));
   const rows = u.items.map((i) => {
     const c = lockOf.get(`${i.path}|${i.dep}`);
@@ -710,23 +824,31 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
     const list = u.held.deps.map((d) => `\`${d}\``).join(", ");
     lines.push("", `These packages wait for a release, or move with a package that waits, so a later run adds them: ${list}.`);
   }
-  lines.push("", `The train made the lockfile with \`${r?.tool ?? "the package manager of the repository"}\`. ${prTrailer(u.fingerprint)}`);
+  lines.push("", `The train made the lockfile with \`${r?.tool ?? "the package manager of the repository"}\`. ${prTrailer(u.fingerprint, "It", marks)}`);
   return lines.join("\n");
 }
 
-/** This function gives the last lines of each pull request body of the train: the merge rule, the fingerprint and the last line. */
-export function prTrailer(fingerprint: string, subject = "It"): string {
-  return [
-    `${subject} merges this pull request when CI is green. When CI fails, it adds the label \`${BLOCKED_LABEL}\` and keeps the pull request open.`,
-    "",
-    `${MARK}${fingerprint} -->`,
-    CLAUDE_LINE,
-  ].join("\n");
+/** The marks of the candidate rules in the body of a pull request of the train. */
+export interface TrailerMarks {
+  /** The mark lines from `markLines`. The body has them after the fingerprint mark. */
+  lines: readonly string[];
+  /** The retry label. Present only when the candidate rules act, so the body tells how to ask for a new build. */
+  retryLabel?: string;
+}
+
+/**
+ * This function gives the last lines of each pull request body of the train. They are the merge rule, the fingerprint,
+ * the marks of the candidate rules and the last line.
+ */
+export function prTrailer(fingerprint: string, subject = "It", marks: TrailerMarks | null = null): string {
+  const rule = `${subject} merges this pull request when CI is green. When CI fails, it adds the label \`${BLOCKED_LABEL}\` and keeps the pull request open.`;
+  const retry = marks?.retryLabel ? ` To get one new build of a red pull request, add the label \`${marks.retryLabel}\`.` : "";
+  return [`${rule}${retry}`, "", `${MARK}${fingerprint} -->`, ...(marks?.lines ?? []), CLAUDE_LINE].join("\n");
 }
 
 /** This function gives the body of a template sync pull request. */
-export function syncPrBody(r: SyncResult, tool: string | null, rules: readonly SyncRule[] = SYNC_RULES): string {
-  const tail = tool ? `The train made the lockfile with \`${tool}\`. ${prTrailer(r.fingerprint)}` : prTrailer(r.fingerprint, "The train");
+export function syncPrBody(r: SyncResult, tool: string | null, rules: readonly SyncRule[] = SYNC_RULES, marks: TrailerMarks | null = null): string {
+  const tail = tool ? `The train made the lockfile with \`${tool}\`. ${prTrailer(r.fingerprint, "It", marks)}` : prTrailer(r.fingerprint, "The train", marks);
   return `${syncBody(r, rules)}\n\n${tail}`;
 }
 
@@ -851,6 +973,30 @@ export function applySummary(r: ApplyReport): string {
   }
   if (r.urgentUnused) lines.push(`Urgent names with no ready update: ${r.urgentUnused}.`);
   if (r.startFallbacks) lines.push(`Updates with no known start of their need, which wait from the start of this run: ${r.startFallbacks}.`);
+  if (r.candidates) {
+    const c = r.candidates;
+    const total = c.pairs.reduce((n, x) => n + x.count, 0);
+    const held = c.held.reduce((n, x) => n + x.count, 0);
+    const acted = c.acted.reduce((n, x) => n + x.count, 0);
+    lines.push(`Candidate rules (mode ${c.mode}, share ${c.share}): ${acted} decisions applied, ${total} decisions compared, ${held} held by the run before the rules, ${c.requests} GitHub requests for their facts.`);
+    if (c.pairs.length > 0) {
+      lines.push("", "| Strict rule | Candidate rules | Rule | Code | Count |", "| --- | --- | --- | --- | ---: |");
+      for (const x of c.pairs) lines.push(`| ${x.today} | ${x.next} | ${x.rule} | ${x.code} | ${x.count} |`);
+      lines.push("");
+    }
+    if (c.held.length > 0) {
+      lines.push("", "Held by the run before the rules:", "", "| Cause | Candidate decision | Count |", "| --- | --- | ---: |");
+      for (const x of c.held) lines.push(`| ${x.cause} | ${x.next} | ${x.count} |`);
+      lines.push("");
+    }
+    if (c.acted.length > 0) {
+      // An empty value shows as "-", so each row has six cells.
+      lines.push("", "Applied decisions:", "", "| Decision | Rule | Code | Held by | Result | Count |", "| --- | --- | --- | --- | --- | ---: |");
+      for (const x of c.acted) lines.push(`| ${x.action} | ${x.rule ?? "-"} | ${x.code ?? "-"} | ${x.held ?? "-"} | ${x.state} | ${x.count} |`);
+      lines.push("");
+    }
+  }
+  if (r.rateLimit) lines.push(rateLimitLine(r.rateLimit));
   const counts = new Map<RepoState, number>();
   for (const x of r.results) counts.set(x.state, (counts.get(x.state) ?? 0) + 1);
   lines.push(`States: ${[...counts].map(([k, v]) => `${v} ${k}`).join(", ") || "none"}`, "");
@@ -932,10 +1078,13 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   const open = await openOf(TRAIN_BRANCH);
 
   const ensureLabels = async (repo: string): Promise<void> => {
-    for (const [name, color, description] of [
+    const labels: (readonly [string, string, string])[] = [
       [TRAIN_LABEL, "1d76db", "A pull request of the release train."],
       [BLOCKED_LABEL, "b60205", "CI failed on a pull request of the release train."],
-    ] as const) {
+    ];
+    // Only the mode one-candidate reads the retry label, so only that mode makes it.
+    if (modeOf(repo, privateOf.get(repo) ?? true) === "one-candidate") labels.push([policy.retryLabel, "fbca04", "Add this label for one new build of a red pull request of the release train."]);
+    for (const [name, color, description] of labels) {
       await gh.request("POST", `${base}/${repo}/labels`, { name, color, description });
     }
   };
@@ -1008,32 +1157,41 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
    * rebase box, because Renovate rebases it. The API refuses a change of the head after the read (HTTP 422).
    *
    * The merge starts CI, so it counts as a push in the limit of the run. The queue of the run gives it its place (see
-   * `catchUps`). The function gives the text to add to the detail.
+   * `catchUps`). The function gives the text to add to the detail, and `pushed` is true when it merged in this call.
    */
-  const catchUp = async (repo: string, pr: Pull, main: string): Promise<string> => {
-    if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX)) return "";
-    if (pr.head.repo === null || (pr.head.repo !== undefined && pr.head.repo.full_name !== `${owner}/${repo}`)) return "";
+  const catchUp = async (repo: string, pr: Pull, main: string): Promise<{ note: string; pushed: boolean }> => {
+    const no = (note: string) => ({ note, pushed: false });
+    if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX)) return no("");
+    if (pr.head.repo === null || (pr.head.repo !== undefined && pr.head.repo.full_name !== `${owner}/${repo}`)) return no("");
     const conflict = ` The branch has a conflict with ${main}: its author must merge ${main} into it.`;
     const full = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${pr.number}`)).data;
-    if (full?.mergeable === false || full?.mergeable_state === "dirty") return conflict;
+    if (full?.mergeable === false || full?.mergeable_state === "dirty") return no(conflict);
     // The merge starts CI as a push does, so it counts in the limit of pushes of the run.
     const done = caught.get(`${repo}#${pr.number}`);
-    if (done !== undefined) return done;
+    if (done !== undefined) return no(done);
     const wait = limitWait();
-    if (wait !== null) return ` The merge of ${main} into the branch waits: ${wait}`;
+    if (wait !== null) return no(` The merge of ${main} into the branch waits: ${wait}`);
     const r = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/update-branch`, { expected_head_sha: pr.head.sha });
     if (r.ok) {
       pushes += 1;
-      return ` The train merged ${main} into the branch, so CI runs again.`;
+      return { note: ` The train merged ${main} into the branch, so CI runs again.`, pushed: true };
     }
-    return r.status === 422 ? conflict : ` The update of the branch failed (HTTP ${r.status}).`;
+    return no(r.status === 422 ? conflict : ` The update of the branch failed (HTTP ${r.status}).`);
   };
 
   /**
    * This function merges a green pull request, or labels a red one. It gives the new state. It merges only a branch that
    * has each commit of the default branch, so CI ran on the current base. A branch that is behind waits for a new build.
+   * `caughtUp` is true when it merged the default branch into the branch: that is a push. `held` names a cause outside
+   * the candidate rules that stopped the merge.
    */
-  const settle = async (repo: string, pr: Pull, meta: RepoMeta | null, branch: string = TRAIN_BRANCH, deleteBranch = true): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number }> => {
+  const settle = async (
+    repo: string,
+    pr: Pull,
+    meta: RepoMeta | null,
+    branch: string = TRAIN_BRANCH,
+    deleteBranch = true,
+  ): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number; caughtUp?: boolean; held?: HeldCause; mergedBehind?: number }> => {
     const ci = await ciOf(repo, pr.head.sha);
     if (ci === "failed") {
       if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
@@ -1050,27 +1208,36 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       if (cmp === null) return { state: "unchanged", ci, detail: `CI is green, but GitHub did not compare the branch with ${main}. The train does not merge it now.` };
       if (cmp.behind > 0) {
         const caught = await catchUp(repo, pr, main);
-        return { state: "unchanged", ci, behind: cmp.behind, detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.${caught}` };
+        return {
+          state: "unchanged",
+          ci,
+          behind: cmp.behind,
+          detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.${caught.note}`,
+          ...(caught.pushed ? { caughtUp: true } : {}),
+        };
       }
       // A release run tags the commit of its version. When a merge changes a workflow file before the tag, GitHub refuses the
       // tag (HTTP 403): the token of a workflow cannot write workflow files. So a change of a workflow file waits for the run.
       if (cmp.workflows) {
         const open = await releaseRunsOpen(repo, main);
-        if (open === null) return { state: "unchanged", ci, detail: `CI is green and the branch changes workflow files, but GitHub did not list the release runs of ${main}. The train does not merge it now.` };
+        if (open === null) return { state: "unchanged", ci, held: "release-run", detail: `CI is green and the branch changes workflow files, but GitHub did not list the release runs of ${main}. The train does not merge it now.` };
         if (open > 0) {
-          return { state: "unchanged", ci, detail: `CI is green, but the branch changes workflow files and ${open} release run(s) of ${main} are not done. The train merges after the release, so GitHub does not refuse its tag.` };
+          return { state: "unchanged", ci, held: "release-run", detail: `CI is green, but the branch changes workflow files and ${open} release run(s) of ${main} are not done. The train merges after the release, so GitHub does not refuse its tag.` };
         }
       }
       const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
         if (deleteBranch) await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);
-        return { state: "merged", ci, detail: "CI was green. The train merged the pull request." };
+        return { state: "merged", ci, detail: "CI was green. The train merged the pull request.", mergedBehind: cmp.behind };
       }
       return { state: "unchanged", ci, detail: `CI is green, but the merge failed (HTTP ${m.status}${m.message ? `: ${m.message}` : ""}).` };
     }
     const why = ci === "none" ? "No CI check started yet." : "CI runs.";
     return { state: "unchanged", ci, detail: why };
   };
+
+  /** This function gives the field `mergedBehind` of a result of settle that merged, and no field for another result. */
+  const mergedOf = (s: { state: RepoState; mergedBehind?: number }): Pick<RepoResult, "mergedBehind"> => (s.state === "merged" ? { mergedBehind: s.mergedBehind ?? null } : {});
 
   /** This function closes a pull request of the train with a comment, marks it as closed by the train and deletes the branch. */
   const closeTrainPr = async (repo: string, pr: Pull, why: string, branch: string = TRAIN_BRANCH): Promise<void> => {
@@ -1113,6 +1280,15 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     title: string;
     body: string;
     note: string;
+    /** False: the candidate rules decided, so a branch with no push does not go through `settle`. The default is true. */
+    settle?: boolean;
+    /** A label that the train removes from the pull request after a push: the retry label. */
+    removeLabel?: string;
+    /**
+     * The record of the decision. In the mode `shadow`, settle adds its catch-up push and its held merge. In the mode
+     * `one-candidate`, a branch with no new commit gets the cause `skip`.
+     */
+    record?: DecisionRecord;
   }): Promise<void> => {
     const repo = p.common.repo;
     let pr: Pull;
@@ -1131,6 +1307,11 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           await gh.request("DELETE", `${base}/${repo}/issues/${existing.number}/labels/${encodeURIComponent(BLOCKED_LABEL)}`);
           pr = { ...pr, labels: (pr.labels ?? []).filter((l) => l.name !== BLOCKED_LABEL) };
         }
+        if (p.removeLabel && hasLabel(existing, p.removeLabel)) {
+          await gh.request("DELETE", `${base}/${repo}/issues/${existing.number}/labels/${encodeURIComponent(p.removeLabel)}`);
+          const gone = p.removeLabel;
+          pr = { ...pr, labels: (pr.labels ?? []).filter((l) => l.name !== gone) };
+        }
       }
     } else {
       const made = await gh.request<Pull>("POST", `${base}/${repo}/pulls`, { title: p.title, body: p.body, head: p.branch, base: p.meta.default_branch });
@@ -1146,8 +1327,246 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       result({ ...p.common, state, pr: prRef(pr), autoMerge, ci: "none", detail: `${how}${p.note}` });
       return;
     }
+    if (p.settle === false) {
+      // The candidate rules decided a push, but the run pushed no commit: the update or the sync gave no change.
+      if (p.record) p.record.cause = "skip";
+      result({ ...p.common, state, pr: prRef(pr), autoMerge, ci: null, detail: `The branch has these changes already. ${how}${p.note}` });
+      return;
+    }
     const s = await settle(repo, pr, p.meta, p.branch);
-    result({ ...p.common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: s.state === "merged" ? s.detail : `${s.detail} ${how}` });
+    if (p.record) {
+      p.record.caughtUp = s.caughtUp === true;
+      p.record.cause = s.held ?? null;
+    }
+    result({ ...p.common, state: s.state, pr: prRef(pr), autoMerge, ci: s.ci, detail: s.state === "merged" ? s.detail : `${s.detail} ${how}`, ...mergedOf(s) });
+  };
+
+  // The candidate rules (see candidate-policy.ts). The mode `shadow` acts as `strict` and logs the decision of the rules
+  // next to the action of the strict rule. The mode `one-candidate` acts on the decision and logs a record of it. The
+  // share of the policy selects the repositories of the mode `one-candidate`. The other repositories stay in `shadow`.
+  const policy = o.candidatePolicy ?? CANDIDATE_POLICY;
+  const nowMs = (o.now ?? new Date()).getTime();
+  const reader = candidateReader(gh, owner, policy, nowMs, [TRAIN_BRANCH, SYNC_BRANCH]);
+  const pairs = new Map<string, CandidatePair>();
+  const heldPairs = new Map<string, CandidateHeld>();
+  const actedCounts = new Map<string, CandidateActed>();
+  /** This function gives the mode of the candidate rules for a repository. The share uses the label of the log, so it reads no private name. */
+  const modeOf = (repo: string, isPrivate: boolean): CandidateMode => modeFor(policy, label(repo, isPrivate));
+  /** This function gives the marks of the candidate rules for the body of a pull request, or null in the mode `strict`. */
+  const marksOf = (mode: CandidateMode, attempt: number, items: readonly CandidateItem[] | null): TrailerMarks | null => {
+    if (mode === "strict") return null;
+    return { lines: markLines(items ? { attempt, items } : { attempt }), ...(mode === "one-candidate" ? { retryLabel: policy.retryLabel } : {}) };
+  };
+  /**
+   * This function gives the `attempt` number for the body after the work of a run. The value `red` is true when the CI of
+   * the head before the push failed: only then a push of the same plan counts up.
+   */
+  const attemptOf = (existing: Pull | null, fp: string, pushed: boolean, act: CandidateDecision | null, red: boolean): number =>
+    act && pushed ? (act.attempt ?? 1) : nextAttempt(existing ? { fingerprint: bodyFingerprint(existing.body), attempt: bodyAttempt(existing.body) } : null, fp, pushed, red);
+  /**
+   * This function reads the facts that the candidate rules need for a branch, and gives their decision. A failed read gives
+   * null. With `read` false, it reads no fact: it gives a decision that needs no fact, or `not read`.
+   */
+  const candidateOf = async (
+    kind: CandidateKind,
+    t: CandidateTarget & { pr: Pull | null },
+    plan: { fingerprint: string; items: CandidateItem[] | null },
+    urgent: boolean,
+    read = true,
+  ): Promise<DecideResult | "not read" | null> => {
+    const pr = t.pr;
+    const facts: CandidateFacts = {
+      kind,
+      private: t.private,
+      now: nowMs,
+      urgent,
+      only: o.only?.includes(t.repo) ?? false,
+      yieldMaxHours: YIELD_MAX_HOURS,
+      plan,
+      open: pr
+        ? { fingerprint: bodyFingerprint(pr.body), attempt: bodyAttempt(pr.body), items: bodyItems(pr.body), createdAt: pr.created_at ? Date.parse(pr.created_at) : null, retryLabel: hasLabel(pr, policy.retryLabel) }
+        : null,
+    };
+    if (!read) {
+      const step = decide(policy, facts);
+      return "decision" in step ? { decision: step.decision, facts, needs: [] } : "not read";
+    }
+    try {
+      return await decideWith(policy, facts, (need) => reader.read(need, t));
+    } catch (e) {
+      log(`${label(t.repo, t.private)}: the candidate rules did not decide${t.private ? "." : `: ${e instanceof Error ? e.message : String(e)}`}`);
+      return null;
+    }
+  };
+  /** This function gives the action of the strict rule from the result of a repository, or null for a result with no such action. */
+  const strictAction = (x: RepoResult): CandidateAction | null => {
+    if (x.state === "opened" || x.state === "updated") return "push";
+    if (x.state === "merged") return "merge";
+    if (x.state === "unchanged" || x.state === "blocked" || x.state === "waiting") return "wait";
+    if (x.state === "planned") return /^The run (opens|updates)/.test(x.detail) ? "push" : "wait";
+    return null;
+  };
+  /**
+   * This function counts the pair of the strict action and the decision of the candidate rules, and logs it. The log of a
+   * private repository has its label and no reason. A cause outside the rules can hold a decision. That decision goes to
+   * the held counts and not to the pairs. A catch-up merge of settle is a push of the strict rule.
+   *
+   * A record of the mode `one-candidate` goes to `actedOf`. In that mode, the rules act, so it has no pair to compare.
+   */
+  const pairOf = (repo: string, isPrivate: boolean, kind: CandidateKind, rec: DecisionRecord, added: readonly RepoResult[]): void => {
+    if (rec.mode === "one-candidate") {
+      actedOf(repo, isPrivate, kind, rec, added);
+      return;
+    }
+    const d = rec.d;
+    if (!d) return;
+    const why = (x: CandidateDecision): string => ` by ${x.rule} [${x.code}]${isPrivate ? "" : `: ${x.reason}`}`;
+    if (rec.cause !== null) {
+      const next: HeldNext = d === "not read" ? d : d.action;
+      const key = `${rec.cause}|${next}`;
+      const held = heldPairs.get(key) ?? { cause: rec.cause, next, count: 0 };
+      held.count += 1;
+      heldPairs.set(key, held);
+      log(`${label(repo, isPrivate)}: candidate rules (${kind}): held by ${rec.cause} before the rules, candidate ${next}${d === "not read" ? "" : why(d)}.`);
+      return;
+    }
+    if (d === "not read") return;
+    const last = added[added.length - 1];
+    const today = rec.caughtUp ? "push" : last ? strictAction(last) : null;
+    if (!today) return;
+    const key = `${today}|${d.action}|${d.rule}|${d.code}`;
+    const pair = pairs.get(key) ?? { today, next: d.action, rule: d.rule, code: d.code, count: 0 };
+    pair.count += 1;
+    pairs.set(key, pair);
+    log(`${label(repo, isPrivate)}: candidate rules (${kind}): strict ${today}, candidate ${d.action}${why(d)}.`);
+  };
+  /**
+   * This function counts the decision that the run applied in the mode `one-candidate`, and logs it. The result is the
+   * state of the last result that the step added. The log of a private repository has its label and no reason.
+   */
+  const actedOf = (repo: string, isPrivate: boolean, kind: CandidateKind, rec: DecisionRecord, added: readonly RepoResult[]): void => {
+    const d = rec.d;
+    const last = added[added.length - 1];
+    if (!d || !last) return;
+    const row: CandidateActed =
+      d === "not read"
+        ? { action: d, rule: null, code: null, held: null, state: last.state, count: 0 }
+        : { action: d.action, rule: d.rule, code: d.code, held: rec.cause, state: last.state, count: 0 };
+    const key = `${row.action}|${row.rule}|${row.code}|${row.held}|${row.state}`;
+    const count = actedCounts.get(key) ?? row;
+    count.count += 1;
+    actedCounts.set(key, count);
+    const at = `${label(repo, isPrivate)}: candidate rules (${kind}): acted`;
+    if (d === "not read") {
+      log(`${at} not read, result ${row.state}.`);
+      return;
+    }
+    log(`${at} ${d.action} by ${d.rule} [${d.code}], result ${row.state}${row.held ? `, held by ${row.held}` : ""}${isPrivate ? "" : `: ${d.reason}`}.`);
+  };
+  type Common = Omit<RepoResult, "state" | "pr" | "autoMerge" | "ci" | "detail">;
+  /**
+   * This function applies a decision of the candidate rules that is not a push: a wait or a merge. When GitHub refuses the
+   * merge of a candidate that is behind, the candidate is stale (R2) in the same run. The function then gives the next
+   * decision when it is a push. Else it gives null, and the result of the repository is in the report. The function writes
+   * the last decision into `record`, with the cause outside the rules that stopped it.
+   */
+  const settleCandidate = async (common: Common, t: CandidateTarget & { pr: Pull | null }, meta: RepoMeta, dr: DecideResult, record: DecisionRecord): Promise<CandidateDecision | null> => {
+    const repo = common.repo;
+    const pr = t.pr;
+    const d = dr.decision;
+    const ci = dr.facts.ci?.state ?? null;
+    if (o.dryRun) {
+      const what = !pr ? "The run waits" : d.action === "merge" ? `The run merges PR #${pr.number}` : `The run keeps PR #${pr.number}`;
+      result({ ...common, state: "planned", pr: prRef(pr), autoMerge: null, ci, detail: `${what}: ${d.reason}.` });
+      return null;
+    }
+    if (!pr) {
+      result({ ...common, state: "waiting", paced: true, pr: null, autoMerge: null, ci: null, detail: `${d.reason}.` });
+      return null;
+    }
+    const autoMerge = await disableAutoMerge(pr);
+    if (d.action === "wait") {
+      // A red candidate keeps the blocked label, as in the strict rule.
+      const failed = ci === "failed";
+      if (failed && !hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
+      result({ ...common, state: failed ? "blocked" : "unchanged", pr: prRef(pr), autoMerge, ci, detail: `${d.reason}.` });
+      return null;
+    }
+    // A change of a workflow file waits for the release runs of the default branch, as in settle.
+    const main = meta.default_branch;
+    const cmp = await reader.compare(repo, pr.head.sha, main);
+    if (cmp === null || cmp.cut || cmp.files.some((f) => f.startsWith(WORKFLOWS_DIR))) {
+      const runs = await releaseRunsOpen(repo, main);
+      if (runs === null || runs > 0) {
+        const why = runs === null ? `GitHub did not list the release runs of ${main}` : `${runs} release run(s) of ${main} are not done`;
+        record.cause = "release-run";
+        result({ ...common, state: "unchanged", pr: prRef(pr), autoMerge, ci, detail: `CI is green, but the branch can change workflow files and ${why}. The train merges after the release, so GitHub does not refuse its tag.` });
+        return null;
+      }
+    }
+    const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
+    if (m.ok) {
+      await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${t.branch}`);
+      result({ ...common, state: "merged", pr: prRef(pr), autoMerge, ci, detail: `The train merged the pull request: ${d.reason}.`, mergedBehind: dr.facts.behind ?? null });
+      return null;
+    }
+    const failed = `the merge failed (HTTP ${m.status}${m.message ? `: ${m.message}` : ""})`;
+    if (dr.facts.behind === null || (dr.facts.behind ?? 0) > 0) {
+      try {
+        const next = await decideWith(policy, { ...dr.facts, mergeRefused: true }, (need) => reader.read(need, t));
+        // The record has the second decision: the decision that counts is the last one of the run.
+        record.d = next.decision;
+        record.facts = next.facts;
+        if (next.decision.action === "push") return next.decision;
+        record.cause = "merge-failed";
+        result({ ...common, state: "unchanged", pr: prRef(pr), autoMerge, ci, detail: `CI is green, but ${failed}. ${next.decision.reason}.` });
+        return null;
+      } catch {
+        // The result below tells the failed merge.
+      }
+    }
+    record.cause = "merge-failed";
+    result({ ...common, state: "unchanged", pr: prRef(pr), autoMerge, ci, detail: `CI is green, but ${failed}.` });
+    return null;
+  };
+  /**
+   * This function reads the decision of the candidate rules for a branch in the modes `shadow` and `one-candidate`. In the
+   * mode `one-candidate`, it applies a wait or a merge, and gives a push for the caller. The value `done` is true when the
+   * result of the repository is in the report. In the mode `shadow`, `held` names a cause outside the rules that holds a
+   * branch with no candidate. Then the run reads no fact for the branch.
+   *
+   * In both modes, `record` gets the mode and the decision. In the mode `one-candidate`, a failed read gives the decision
+   * `not read`.
+   */
+  const candidateStep = async (
+    mode: CandidateMode,
+    kind: CandidateKind,
+    common: Common,
+    t: CandidateTarget & { pr: Pull | null },
+    meta: RepoMeta,
+    plan: { fingerprint: string; items: CandidateItem[] | null },
+    urgent: boolean,
+    record: DecisionRecord,
+    held: HeldCause | null = null,
+  ): Promise<{ act: CandidateDecision | null; done: boolean }> => {
+    if (mode === "strict") return { act: null, done: false };
+    record.mode = mode;
+    if (mode === "shadow") {
+      const decided = await candidateOf(kind, t, plan, urgent, !(held !== null && t.pr === null));
+      record.d = decided === "not read" ? decided : (decided?.decision ?? null);
+      record.facts = decided === "not read" ? null : (decided?.facts ?? null);
+      return { act: null, done: false };
+    }
+    const decided = await candidateOf(kind, t, plan, urgent);
+    if (decided === "not read" || !decided) {
+      record.d = "not read";
+      result({ ...common, state: "error", pr: prRef(t.pr), autoMerge: null, ci: null, detail: "The candidate rules did not read their facts. A later run tries again." });
+      return { act: null, done: true };
+    }
+    record.d = decided.decision;
+    record.facts = decided.facts;
+    const act = decided.decision.action === "push" ? decided.decision : await settleCandidate(common, t, meta, decided, record);
+    return { act, done: act === null };
   };
 
   const pacing = o.maxPushes !== undefined || o.runnersBusy !== undefined;
@@ -1238,7 +1657,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
             detail += r.ok ? " The train ticked the rebase box, so Renovate rebases the branch." : ` The tick of the rebase box failed (HTTP ${r.status}).`;
           }
         }
-        result({ ...base0, state: s.state, pr: prRef(pr), ci: s.ci, detail });
+        result({ ...base0, state: s.state, pr: prRef(pr), ci: s.ci, detail, ...mergedOf(s) });
       } catch (e) {
         result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
       }
@@ -1289,7 +1708,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       items.push({
         at: inherit(waitMs(await pushTime(repo, pr)), releases),
         tie: tie0 + items.length,
-        run: async () => void caught.set(key, await catchUp(repo, pr, main)),
+        run: async () => void caught.set(key, (await catchUp(repo, pr, main)).note),
       });
     }
     return items;
@@ -1315,7 +1734,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       const meta = (await gh.request<RepoMeta>("GET", `${base}/${w.repo}`)).data;
       await disableAutoMerge(pr);
       const s = await settle(w.repo, pr, meta);
-      result({ ...base0, state: s.state === "unchanged" ? "waiting" : s.state, pr: { number: pr.number, url: pr.html_url }, ci: s.ci, detail: `${s.detail} The rest of the update waits for ${w.dependsOn.join(", ") || "npm"}.` });
+      result({ ...base0, state: s.state === "unchanged" ? "waiting" : s.state, pr: { number: pr.number, url: pr.html_url }, ci: s.ci, detail: `${s.detail} The rest of the update waits for ${w.dependsOn.join(", ") || "npm"}.`, ...mergedOf(s) });
       continue;
     }
     result({ ...base0, state: "waiting", pr: pr ? { number: pr.number, url: pr.html_url } : null, ci: null, detail: `It waits for ${w.dependsOn.join(", ") || "the target versions on npm"}.` });
@@ -1367,8 +1786,16 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     });
   }
 
-  /** This function applies one adoption: one branch and one pull request for the repository. */
+  /** This function applies one adoption, and counts the pair of the mode `shadow` or the applied decision of the mode `one-candidate`. */
   async function updateOne(u: RepoUpdate): Promise<void> {
+    const record = decisionRecord();
+    const before = results.length;
+    await updateRepo(u, record);
+    pairOf(u.repo, u.private, "update", record, results.slice(before));
+  }
+
+  /** This function applies one adoption: one branch and one pull request for the repository. */
+  async function updateRepo(u: RepoUpdate, record: DecisionRecord): Promise<void> {
     const existing = open.get(u.repo) ?? null;
     const urgent = isUrgent(u);
     const common = { repo: u.repo, private: u.private, actionId: u.actionId, kind: u.kind, wave: u.wave, items: u.items.length, ...(urgent ? { urgent } : {}), ...(u.held ? { held: u.held.items } : {}) };
@@ -1394,9 +1821,17 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           return;
         }
       }
-      const rebuild = await needsRebuild(u.repo, existing, meta.default_branch);
+      const mode = modeOf(u.repo, u.private);
+      const target = { repo: u.repo, private: u.private, branch: TRAIN_BRANCH, defaultBranch: meta.default_branch, pr: existing };
+      // A branch with no candidate always gets a push from the strict rule. When the limit of the run holds that push, it
+      // is held before the rules, so the mode shadow reads no fact for it.
+      const heldFirst: HeldCause | null = !existing && !urgent && limitWait() !== null ? "limit" : null;
+      const step = await candidateStep(mode, "update", common, target, meta, { fingerprint: u.fingerprint, items: candidateItems(u.items) }, urgent, record, heldFirst);
+      if (step.done) return;
+      const act = step.act;
+      const rebuild = act ? act.rebuild === true : await needsRebuild(u.repo, existing, meta.default_branch);
       // A branch with these changes on the current default branch needs no push.
-      const due = !existing || rebuild || bodyFingerprint(existing.body) !== u.fingerprint;
+      const due = act !== null || !existing || rebuild || bodyFingerprint(existing.body) !== u.fingerprint;
       const wait = urgent ? null : limitWait();
       if (o.dryRun && (wait === null || !due)) {
         const what = !existing ? "The run opens a pull request" : due ? `The run updates PR #${existing.number}` : `The run keeps PR #${existing.number}`;
@@ -1404,23 +1839,34 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length === 0 ? "the pnpm settings" : `${u.items.length} ${u.items.length === 1 ? "change" : "changes"}`}${u.items.length > 0 && u.ageScopes ? " and the pnpm settings" : ""}${u.releases?.length ? `, with the release of ${u.releases.map((x) => x.name).join(", ")}` : ""}.` });
         return;
       }
+      if (wait !== null && act) {
+        // The candidate rules decided the push, so the branch waits with no settle. The limit of the run holds the push.
+        record.cause = "limit";
+        if (existing && !o.dryRun) await disableAutoMerge(existing);
+        result({ ...common, state: "waiting", paced: true, pr: prRef(existing), autoMerge: existing ? "train" : null, ci: null, detail: `${act.reason}. ${wait}` });
+        return;
+      }
       if (wait !== null) {
         // No clone: each clone can push. The next run reads the plan again, so it pushes the newest versions.
         if (existing && !o.dryRun) await disableAutoMerge(existing);
         const s = existing && !o.dryRun ? await settle(u.repo, existing, meta) : null;
         const state: RepoState = !s || (due && s.state === "unchanged") ? "waiting" : s.state;
+        record.cause = state === "waiting" ? "limit" : (s?.held ?? null);
+        record.caughtUp = s?.caughtUp === true;
         const detail = state === "waiting" ? `${s ? `${s.detail} ` : ""}${wait}` : (s?.detail ?? wait);
-        result({ ...common, state, ...(state === "waiting" ? { paced: true } : {}), pr: prRef(existing), autoMerge: s ? "train" : null, ci: s?.ci ?? null, detail });
+        result({ ...common, state, ...(state === "waiting" ? { paced: true } : {}), pr: prRef(existing), autoMerge: s ? "train" : null, ci: s?.ci ?? null, detail, ...(s ? mergedOf(s) : {}) });
         return;
       }
       const urgentDeps = [...new Set(u.items.map((i) => i.dep).filter((dep) => urgentNames.has(dep)))];
       const r = await o.updater.update(urgent ? { ...u, urgentDeps } : u, { defaultBranch: meta.default_branch, rebuild });
       if (r.status === "pushed" && !urgent) pushes += 1;
       if (r.status === "failed") {
+        record.cause = "error";
         result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: `The update failed: ${r.error ?? "unknown error"}` });
         return;
       }
       if (r.status === "young") {
+        record.cause = "young";
         // CI refuses a lockfile with a version younger than the minimumReleaseAge of pnpm. The update waits for its age.
         const ready = r.young.map((y) => `${y.dep}@${y.version} at ${y.readyAt}`).join(", ");
         if (existing) await closeTrainPr(u.repo, existing, `its versions are younger than the minimumReleaseAge of pnpm. A later run opens it again (ready: ${ready})`);
@@ -1429,22 +1875,28 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       }
       if ((r.status === "no-change" || r.status === "unresolved") && !existing) {
         const why = r.status === "no-change" ? "The update changes no file." : `The lockfile does not get the target versions (${r.unresolved.join(", ")}).`;
+        record.cause = "skip";
         result({ ...common, state: "skipped", pr: null, autoMerge: null, ci: null, detail: why });
         return;
       }
       const shown: RepoUpdate = { ...u, items: u.items.filter((i) => !r.young.some((y) => y.dep === i.dep)) };
+      const pushed = r.status === "pushed";
       await publish({
         common,
         branch: TRAIN_BRANCH,
         existing,
         meta,
-        pushed: r.status === "pushed",
+        pushed,
         sha: r.sha,
         title: prTitle(shown),
-        body: prBody(shown, r),
+        body: prBody(shown, r, marksOf(mode, attemptOf(existing, u.fingerprint, pushed, act, record.facts?.ci?.state === "failed"), candidateItems(shown.items))),
         note: r.unresolved.length > 0 ? ` Unresolved: ${r.unresolved.join(", ")}.` : "",
+        settle: act === null,
+        ...(act?.removeLabel ? { removeLabel: policy.retryLabel } : {}),
+        record,
       });
     } catch (e) {
+      record.cause = "error";
       result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
     }
   }
@@ -1487,7 +1939,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     const changesets = new Set(o.plan.repos.filter((r) => (r.pendingChangesets ?? 0) > 0).map((r) => r.name));
     let workflows = s.workflows !== "no";
     /** This function syncs the template files of one repository. */
-    const syncOne = async (repo: string): Promise<void> => {
+    const syncOne = async (repo: string, record: DecisionRecord): Promise<void> => {
       const isPrivate = privateOf.get(repo) ?? true;
       const existing = syncOpen.get(repo) ?? null;
       const facts: SyncFacts = { ...facts0, repo, releaseInFlight: pending.has(repo) || changesets.has(repo) };
@@ -1500,7 +1952,10 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         items: r.outcomes.filter((x) => x.state === "applied").reduce((n, x) => n + x.changes.length, 0),
         needs: syncNeeds(r),
       });
-      const fail = (detail: string) => result({ repo, private: isPrivate, actionId: `sync:${repo}`, kind: SYNC_KIND, wave: null, items: 0, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail });
+      const fail = (detail: string) => {
+        record.cause = "error";
+        result({ repo, private: isPrivate, actionId: `sync:${repo}`, kind: SYNC_KIND, wave: null, items: 0, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail });
+      };
       try {
         const files = await filesOf(repo);
         if (!files) return;
@@ -1530,11 +1985,27 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
             return;
           }
         }
-        const rebuild = await needsRebuild(repo, existing, meta.default_branch);
-        const same = existing !== null && !rebuild && bodyFingerprint(existing.body) === planned.fingerprint;
-        const wait = same ? null : (limitWait() ?? (await busyWait()));
+        const mode = modeOf(repo, isPrivate);
+        const target = { repo, private: isPrivate, branch: SYNC_BRANCH, defaultBranch: meta.default_branch, pr: existing };
+        // A branch with no candidate always gets a push from the strict rule. When the limit of the run or the busy runners
+        // hold that push, it is held before the rules, so the mode shadow reads no fact for it. The wait is read one time.
+        const waitOf = async (): Promise<{ wait: string | null; cause: HeldCause | null }> => {
+          const limit = limitWait();
+          if (limit !== null) return { wait: limit, cause: "limit" };
+          const busy = await busyWait();
+          return { wait: busy, cause: busy !== null ? "busy" : null };
+        };
+        const early = mode === "shadow" && !existing ? await waitOf() : null;
+        const step = await candidateStep(mode, "sync", commonOf(planned), target, meta, { fingerprint: planned.fingerprint, items: null }, false, record, early?.cause ?? null);
+        if (step.done) return;
+        const act = step.act;
+        const rebuild = act ? act.rebuild === true : await needsRebuild(repo, existing, meta.default_branch);
+        const same = act === null && existing !== null && !rebuild && bodyFingerprint(existing.body) === planned.fingerprint;
+        const held = same ? { wait: null, cause: null } : (early ?? (await waitOf()));
+        const wait = held.wait;
         if (wait !== null) {
-          result({ ...commonOf(planned), state: "waiting", paced: true, pr: prRef(existing), autoMerge: null, ci: null, detail: wait });
+          record.cause = held.cause;
+          result({ ...commonOf(planned), state: "waiting", paced: true, pr: prRef(existing), autoMerge: null, ci: null, detail: act ? `${act.reason}. ${wait}` : wait });
           return;
         }
         if (o.dryRun) {
@@ -1564,27 +2035,38 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         }
         const done = r.result ?? planned;
         if (r.status === "no-change" || applied(done).length === 0) {
+          record.cause = "skip";
           await nothing(done);
           return;
         }
+        const pushed = r.status === "pushed";
         await publish({
           common: commonOf(done),
           branch: SYNC_BRANCH,
           existing,
           meta,
-          pushed: r.status === "pushed",
+          pushed,
           sha: r.sha,
           title: SYNC_TITLE,
           // Without a new clone, the body keeps the name of the tool that made the lockfile.
-          body: existing && r.status === "same" && r.tool === null && existing.body ? existing.body : syncPrBody(done, r.tool, rules),
+          body: existing && r.status === "same" && r.tool === null && existing.body ? existing.body : syncPrBody(done, r.tool, rules, marksOf(mode, attemptOf(existing, done.fingerprint, pushed, act, record.facts?.ci?.state === "failed"), null)),
           note: "",
+          settle: act === null,
+          ...(act?.removeLabel ? { removeLabel: policy.retryLabel } : {}),
+          record,
         });
       } catch (e) {
         fail(e instanceof Error ? e.message : String(e));
       }
     };
     const list = pacing ? rotate(scan, slot) : scan;
-    return list.map((repo, i) => ({ at: waitMs(syncPushed.get(repo) ?? syncSince), tie: tie0 + i, run: () => syncOne(repo) }));
+    const syncPaired = async (repo: string): Promise<void> => {
+      const record = decisionRecord();
+      const before = results.length;
+      await syncOne(repo, record);
+      pairOf(repo, privateOf.get(repo) ?? true, "sync", record, results.slice(before));
+    };
+    return list.map((repo, i) => ({ at: waitMs(syncPushed.get(repo) ?? syncSince), tie: tie0 + i, run: () => syncPaired(repo) }));
   }
 
   // 5. The releases. A public package whose version on main is newer than npm is in flight: its release workflow publishes it.
@@ -1622,7 +2104,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           continue;
         }
         const s = await settle(repo, vpr, meta, VERSION_BRANCH);
-        result({ ...base0, state: s.state, pr: { number: vpr.number, url: vpr.html_url }, ci: s.ci, detail: `Version pull request: ${s.detail}` });
+        result({ ...base0, state: s.state, pr: { number: vpr.number, url: vpr.html_url }, ci: s.ci, detail: `Version pull request: ${s.detail}`, ...mergedOf(s) });
         continue;
       }
       const runs = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(meta.default_branch)}&per_page=5`);
@@ -1670,6 +2152,18 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     inFlight,
     ...(urgentUnused > 0 ? { urgentUnused } : {}),
     ...(startFallbacks > 0 ? { startFallbacks } : {}),
+    ...(policy.mode !== "strict"
+      ? {
+          candidates: {
+            mode: policy.mode,
+            share: policy.share,
+            pairs: [...pairs.values()].sort((a, b) => b.count - a.count),
+            held: [...heldPairs.values()].sort((a, b) => b.count - a.count),
+            acted: [...actedCounts.values()].sort((a, b) => b.count - a.count),
+            requests: reader.requests(),
+          },
+        }
+      : {}),
   };
 }
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package",
   "name": "@release-train/release-train",
-  "version": "0.2.25",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "main": "./src/index.ts",
@@ -21,10 +21,10 @@
     "vitest": "^5.0.3"
   },
   "dependencies": {
-    "@mark1russell7/conventions": "^0.40.6",
+    "@mark1russell7/conventions": "^0.41.0",
     "@mark1russell7/service": "^0.8.6",
     "@mark1russell7/text": "^0.0.2",
-    "@procedures/shell": "^0.52.0",
+    "@procedures/shell": "^0.55.0",
     "semver": "^7.8.5",
     "yaml": "^2.9.1"
   },
