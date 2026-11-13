@@ -93,6 +93,35 @@ describe("the urgent input of train.yml", () => {
   });
 });
 
+/** This function starts the shell of the step "Version fix" with a fake `node`, and gives the arguments of the command. */
+function argsOfVersionFix(env: Record<string, string>): string[] {
+  const block = /name: Version fix[\s\S]*?run: \|\n((?: {10}.*\n)+)/.exec(workflow)?.[1];
+  if (!block) throw new Error("The workflow has no step Version fix.");
+  const script = `node() { shift; printf '%s\\n' "$@"; }\n${block.replace(/^ {10}/gm, "")}`;
+  const output = execFileSync("bash", ["-c", script], {
+    encoding: "utf8",
+    env: { ...process.env, OWNER: "ex", AUTHOR: "a <a@ex>", ONLY: "", INPUT_DRY: "", ...env },
+  });
+  return output.split("\n").filter(Boolean);
+}
+
+describe("the step Version fix of train.yml", () => {
+  it("changes pull requests from the schedule only when LIVE and VERSION_FIX_LIVE are both true", () => {
+    expect(argsOfVersionFix({ EVENT: "schedule", LIVE: "true", VERSION_FIX_LIVE: "false" })).toContain("--dry-run");
+    expect(argsOfVersionFix({ EVENT: "schedule", LIVE: "false", VERSION_FIX_LIVE: "true" })).toContain("--dry-run");
+    expect(argsOfVersionFix({ EVENT: "schedule", LIVE: "true", VERSION_FIX_LIVE: "true" })).not.toContain("--dry-run");
+  });
+
+  it("follows the dry-run input in a start by hand", () => {
+    expect(argsOfVersionFix({ EVENT: "workflow_dispatch", INPUT_DRY: "true", LIVE: "true", VERSION_FIX_LIVE: "false" })).toContain("--dry-run");
+    expect(argsOfVersionFix({ EVENT: "workflow_dispatch", INPUT_DRY: "false", LIVE: "true", VERSION_FIX_LIVE: "false" })).not.toContain("--dry-run");
+  });
+
+  it("does not change the step Plan and apply", () => {
+    expect(parseArgs(argsOfStep({ EVENT: "schedule", VERSION_FIX_LIVE: "false" })).takeReplaced).toBe(true);
+  });
+});
+
 describe("the key of the private-name hashes", () => {
   it("comes from its own secret, not from the private key of the app", () => {
     expect(workflow).toContain("RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_HASH_KEY }}");

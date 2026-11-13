@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { summary } from "./cli.ts";
 import { retryAfterDelay, type Clock } from "@mark1russell7/service";
-import { collect, HttpError, manifestFolder, patchVersion, runtimeRanges } from "./collect.ts";
+import { collect, HttpError, manifestFolder, nextLink, patchVersion, runtimeRanges } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { docId, writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
@@ -477,5 +477,26 @@ describe("the retries of the GitHub reads", () => {
     expect(retryAfterDelay("Thu, 01 Jan 2026 00:00:10 GMT", now)).toBe(10_000);
     expect(retryAfterDelay("soon", now)).toBeNull();
     expect(retryAfterDelay(null, now)).toBeNull();
+  });
+});
+
+describe("nextLink", () => {
+  it("gives the URL of the part with rel=\"next\"", () => {
+    const header = '<https://api.example/x?page=2>; rel="next", <https://api.example/x?page=9>; rel="last"';
+    expect(nextLink(header)).toBe("https://api.example/x?page=2");
+  });
+
+  it("gives null with no header, no next part or a part with no URL", () => {
+    expect(nextLink(null)).toBeNull();
+    expect(nextLink('<https://api.example/x?page=1>; rel="prev"')).toBeNull();
+    expect(nextLink('<>; rel="next"')).toBeNull();
+    expect(nextLink('https://api.example/x; rel="next"')).toBeNull();
+  });
+
+  it("reads a long header with no closing bracket in linear time", () => {
+    const header = `<${"<=".repeat(200_000)}`;
+    const start = performance.now();
+    expect(nextLink(header)).toBeNull();
+    expect(performance.now() - start).toBeLessThan(1000);
   });
 });

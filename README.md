@@ -377,6 +377,21 @@ GitHub refuses a change to a workflow file from an App without the permission Wo
 - `--workflows auto|yes|no` tells if the App can change workflow files. With `auto` (the default), the train tries, and when GitHub refuses the push, it pushes again without the workflow changes.
 - `plan` lists the sync actions of each repository and the count for each rule.
 
+## The version fix
+
+An automated dependency update can change the shipped files of a package and keep a version that npm has. Then the release check of the template fails with "The release skips a version that is on npm". In a repository with Changesets, the changeset check fails. The command `version-fix` adds the missing PATCH (`src/version-fix.ts`).
+
+```sh
+node packages/release-train/src/bin.ts version-fix --owner <owner> --author "<name> <email>" --dry-run
+```
+
+- The command reads the open pull requests of each repository of the token. It acts only on the Renovate groups `npm-patch`, `npm-minor`, `npm-dev-minor` and `lock-file-maintenance`, and on an update of the train that is not a breaking adoption. A 0.x minor update, a major update, the template sync and a pull request of a person stay as they are.
+- It acts only when CI of the head is complete. Each failed check must give the message of the release check or of the changeset check, or only the results of other jobs. When the annotations of a job give only its last line, the command reads the log of the job. Each other error stops the fix.
+- A repository with `.changeset/config.json` gets one patch changeset. Another repository gets the PATCH of the version on npm in `package.json`, and a section in `CHANGELOG.md` when the file exists. The `version` script of the package starts, as for a release of the cascade. The command refuses a PATCH that npm has, or a PATCH that is not greater than the `latest` version on npm.
+- The fix is one commit of the App on the head branch, pushed with no force. Its message has one trailer line for each package (`Release-Train-Version-Fix:`). A second run reads the trailers in the commits of the pull request and does not raise a version two times. When the head has a new commit, the command does nothing.
+- When the train builds its branch again, the update keeps each fix of the head commit. It keeps a version while the default branch has the old version and npm does not have the new one. Thus the next run does not push the branch back without the fix. The body of the pull request shows the fix under "Version fix".
+- The command writes one log line for each open pull request. It gives a private repository only as a hash, with no package name and no detail.
+
 ## The train workflow
 
 `train.yml` starts every 30 minutes, on a manual start and on the `released` event of `repository_dispatch`. It makes a token of the GitHub App `mark1russell7-release-train` with `actions/create-github-app-token`. Pull requests with that token start CI in the repositories.
@@ -387,6 +402,7 @@ GitHub refuses a change to a workflow file from an App without the permission Wo
 - The schedule and `repository_dispatch` change repositories only when `LIVE` in `train.yml` is `"true"`. It is `"true"` since 2026-10-25. Set it to `"false"` to stop the train.
 - The log, the step summary and the artifact `apply` give each private repository only as a count or a hash. The run also masks each private name in the log.
 - The hash uses the secret `RELEASE_TRAIN_HASH_KEY`, a separate random key. In Actions, the run stops when the key is empty. It also stops on a PEM private key.
+- After `apply`, the step "Version fix" starts `version-fix` with the same dry-run rule and `only`. A failure of this step does not stop the run.
 - After `apply`, the step "Wait for a release" waits up to 15 minutes for a version in flight.
 - `CASCADE` in `train.yml` gives the value of `--cascade`.
 - The run starts release workflows only when `RELEASE_DISPATCH` in `train.yml` is `"true"`.

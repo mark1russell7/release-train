@@ -44,6 +44,9 @@ env:
   # The run starts the release workflows that start only by hand (for example with changesets) when RELEASE_DISPATCH
   # is "true". This needs the permission Actions: write of the GitHub App.
   RELEASE_DISPATCH: "true"
+  # The step "Version fix" changes pull requests only when VERSION_FIX_LIVE is "true" too. It stays "false" until the log of a
+  # dry run on real pull requests is read (RT23). Then a change sets it to "true".
+  VERSION_FIX_LIVE: "false"
   # The public repositories (comma-separated) whose breaking adoptions carry a cascade release, "all", or "none".
   # The adoptions of other repositories with a cascade release wait.
   CASCADE: "all"
@@ -128,6 +131,27 @@ jobs:
         with:
           path: train-state.json
           key: train-state-${{ github.run_id }}-${{ github.run_attempt }}
+      # The version fix (packages/release-train/src/version-fix.ts): an automated dependency update can change the shipped
+      # files and keep a version that npm has. Then the release check fails. This step adds the PATCH to such a pull request
+      # of Renovate or of the train, with the token and the commit author of the App. The log gives each private repository
+      # only as a hash. A failure of this step does not stop the wait for a release.
+      - name: Version fix
+        if: ${{ !cancelled() && steps.app.outcome == 'success' && steps.bot.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_HASH_KEY }}
+          EVENT: ${{ github.event_name }}
+          INPUT_DRY: ${{ inputs.dry-run }}
+          ONLY: ${{ inputs.only }}
+          OWNER: ${{ github.repository_owner }}
+          AUTHOR: ${{ steps.bot.outputs.author }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ] && [ "$VERSION_FIX_LIVE" = "true" ]; then dry=false; else dry=true; fi
+          args=(version-fix --owner "$OWNER" --author "$AUTHOR")
+          if [ "$dry" != "false" ]; then args+=(--dry-run); fi
+          if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
+          node packages/release-train/src/bin.ts "${args[@]}"
       # When npm has a version in flight, the next wave starts at once with the released event.
       - name: Wait for a release
         if: steps.apply.outcome == 'success'

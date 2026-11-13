@@ -18,3 +18,4 @@ export * from "./holds.ts";
 export * from "./lag.ts";
 export * from "./attest.ts";
 export * from "./move.ts";
+export * from "./version-fix.ts";

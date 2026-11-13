@@ -23,7 +23,9 @@ export function changesetName(exists: (name: string) => boolean, fingerprint: st
 import { parseNpmLock, parsePnpmLock } from "./parse.ts";
 import { SYNC_BRANCH, syncCommitMessage, syncRepo, workflowsRefused } from "./sync.ts";
 import type { RepoFiles, SyncJob, SyncPush, SyncResult, SyncUpdater } from "./sync.ts";
-import type { Resolved } from "./types.ts";
+import type { LockKind, Resolved } from "./types.ts";
+import { FIX_TEXT, fixCommitMessage, fixFingerprint, fixTrailer, parseFixMarks, patchTarget } from "./version-fix.ts";
+import type { FixDone, FixJob, FixMark, FixResult, VersionFixer } from "./version-fix.ts";
 
 /** The result of one command. */
 export interface RunResult {
@@ -254,13 +256,14 @@ interface FixOutcome {
  * again and a frozen check. For npm, it uses the npm equivalents. Then it checks the lockfile and pushes one commit to the branch
  * of the train. The token goes to git in the environment, not in a URL.
  */
-export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
+export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & VersionFixer {
   const run = o.run ?? runCommand;
   const f: FetchFn = o.fetch ?? ((u, i) => fetch(u, i));
   const registry = o.registry ?? "https://registry.npmjs.org";
   const now = o.now ?? Date.now;
   interface Packument {
     time?: Record<string, string>;
+    "dist-tags"?: Record<string, string>;
     versions?: Record<string, { dist?: { tarball?: string } }>;
   }
   const packuments = new Map<string, Promise<Packument>>();
@@ -489,7 +492,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
   };
 
   /** This function gives the install of one clone: the packages with no install scripts, at most one time. */
-  const installer = (dir: string, u: RepoUpdate, e: NodeJS.ProcessEnv): (() => Promise<void>) => {
+  const installer = (dir: string, u: Pick<RepoUpdate, "lockKind">, e: NodeJS.ProcessEnv): (() => Promise<void>) => {
     let done: Promise<void> | null = null;
     return () =>
       (done ??= (async () => {
@@ -504,7 +507,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    * entry and the version of a package that releases with it. In crawler (11-02), a test compared the constant with package.json, and the
    * train changed only package.json. The function gives the folders of the scripts that ran, or the first error.
    */
-  const versionScripts = async (dir: string, u: RepoUpdate, paths: readonly string[], e: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<{ ran: string[]; error: string | null }> => {
+  const versionScripts = async (dir: string, u: Pick<RepoUpdate, "lockKind">, paths: readonly string[], e: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<{ ran: string[]; error: string | null }> => {
     const ran: string[] = [];
     for (const path of paths) {
       if (typeof readScripts(join(dir, path, "package.json"))?.["version"] !== "string") continue;
@@ -538,7 +541,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
    * its format check passes (crawler, 11-02: a line that conventions fix wrote was longer than the print width). Prettier reads
    * the configuration and the ignore file of the repository. The lockfiles do not change.
    */
-  const formatChanged = async (dir: string, u: RepoUpdate, extra: readonly string[], e: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<void> => {
+  const formatChanged = async (dir: string, u: Pick<RepoUpdate, "lockKind">, extra: readonly string[], e: NodeJS.ProcessEnv, install: () => Promise<void>): Promise<void> => {
     let manifest: { dependencies?: Record<string, unknown>; devDependencies?: Record<string, unknown> };
     try {
       manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as typeof manifest;
@@ -552,6 +555,105 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
     await install();
     const args = ["prettier", "--write", "--ignore-unknown", "--", ...files];
     await run(u.lockKind === "npm" ? "npx" : "pnpm", u.lockKind === "npm" ? ["--no-install", ...args] : ["exec", ...args], { cwd: dir, env: e });
+  };
+
+  /** This function maps the name of each package of a clone to its folder. A package nearer the root wins. */
+  const packageFolders = async (sh: Sh, dir: string): Promise<Map<string, string>> => {
+    const files = (await sh("git", ["ls-files", "-z"], "git ls-files")).stdout
+      .split("\0")
+      .filter((f) => f === "package.json" || f.endsWith("/package.json"))
+      .sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
+    const folders = new Map<string, string>();
+    for (const file of files) {
+      try {
+        const name = (JSON.parse(readFileSync(join(dir, file), "utf8")) as { name?: unknown }).name;
+        if (typeof name === "string" && !folders.has(name)) folders.set(name, file === "package.json" ? "" : file.slice(0, -"/package.json".length));
+      } catch {
+        // A file that is not JSON names no package.
+      }
+    }
+    return folders;
+  };
+  /** This function reads the SemVer version in the package.json of a folder, or null. */
+  const versionAt = (dir: string, path: string): string | null => {
+    try {
+      const v = (JSON.parse(readFileSync(join(dir, path, "package.json"), "utf8")) as { version?: unknown }).version;
+      return typeof v === "string" && semver.valid(v) !== null ? v : null;
+    } catch {
+      return null;
+    }
+  };
+  /** One version fix to write: a new version from `from` to `to`, or a patch changeset when they are null. */
+  interface FixPlan {
+    name: string;
+    path: string;
+    from: string | null;
+    to: string | null;
+  }
+  /**
+   * This function writes the version fixes into a clone. A repository with Changesets gets one patch changeset for the
+   * packages. Another repository gets the new version in each package.json and a section in each CHANGELOG.md. The function
+   * gives the fixes, the folders with a new version and the new files.
+   */
+  const writeFixes = (dir: string, plans: readonly FixPlan[], viaChangeset: boolean): { done: FixDone[]; bumped: string[]; added: string[] } => {
+    const done: FixDone[] = [];
+    const bumped: string[] = [];
+    const added: string[] = [];
+    if (plans.length === 0) return { done, bumped, added };
+    if (viaChangeset) {
+      const names = [...new Set(plans.map((p) => p.name))].sort();
+      const name = changesetName((n) => existsSync(join(dir, ".changeset", n)), fixFingerprint(names));
+      writeFileSync(join(dir, ".changeset", name), changesetText(names.map((n) => ({ name: n, type: "patch" as const })), FIX_TEXT));
+      added.push(`.changeset/${name}`);
+      for (const p of plans) done.push({ name: p.name, path: p.path, via: "changeset", from: null, to: null });
+      return { done, bumped, added };
+    }
+    for (const p of plans) {
+      if (p.to === null) continue;
+      const file = join(dir, p.path, "package.json");
+      const text = setManifestVersion(readFileSync(file, "utf8"), p.to);
+      if (text === null) continue;
+      writeFileSync(file, text);
+      bumped.push(p.path);
+      const log = join(dir, p.path, "CHANGELOG.md");
+      if (existsSync(log)) {
+        const section = addChangelogSection(readFileSync(log, "utf8"), p.to, FIX_TEXT);
+        if (section !== null) writeFileSync(log, section);
+      }
+      done.push({ name: p.name, path: p.path, via: "version", from: p.from, to: p.to });
+    }
+    return { done, bumped, added };
+  };
+  /**
+   * This function keeps the version fixes of a branch of the train when the train builds the branch again. The head commit
+   * of the branch names each fix in a trailer line. A new version stays only while the default branch has the old version
+   * and npm does not have the new one. Else the default branch holds the change already. The packages in `skip` get their
+   * version from the cascade.
+   */
+  const carryFixes = async (dir: string, sh: Sh, remoteRef: string, skip: ReadonlySet<string>): Promise<{ done: FixDone[]; bumped: string[]; added: string[]; marks: FixMark[] }> => {
+    const none = { done: [], bumped: [], added: [], marks: [] };
+    const head = await run("git", ["log", "-1", "--format=%B", remoteRef], { cwd: dir, env });
+    if (head.code !== 0) return none;
+    const marks = parseFixMarks([head.stdout]).filter((m) => !skip.has(m.name));
+    if (marks.length === 0) return none;
+    // A build with no change of its own keeps no fix: a fix alone is not an update.
+    if ((await sh("git", ["status", "--porcelain"], "git status")).stdout.trim() === "") return none;
+    const folders = await packageFolders(sh, dir);
+    const viaChangeset = existsSync(join(dir, ".changeset", "config.json"));
+    const plans: FixPlan[] = [];
+    for (const m of marks) {
+      const path = folders.get(m.name);
+      if (path === undefined) continue;
+      if (viaChangeset) {
+        if (m.from === null) plans.push({ name: m.name, path, from: null, to: null });
+        continue;
+      }
+      if (m.from === null || m.to === null || versionAt(dir, path) !== m.from) continue;
+      if ((await packument(m.name)).versions?.[m.to] !== undefined) continue;
+      plans.push({ name: m.name, path, from: m.from, to: m.to });
+    }
+    const w = writeFixes(dir, plans, viaChangeset);
+    return { ...w, marks: w.done.map((d) => ({ name: d.name, from: d.from, to: d.to })) };
   };
 
   return {
@@ -715,6 +817,12 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           const failed = editAll(breaking.map((i) => ({ path: i.path, type: i.type, dep: i.dep, range: i.range, newRange: i.newRange ?? i.range })));
           if (failed.size > 0) return fail(notPlanRange(failed));
         }
+        // 1b. The version fix of the train (version-fix.ts) can add a PATCH to the branch. A new build of the branch keeps
+        // it, so the next run does not push the branch back without it.
+        const carried: Awaited<ReturnType<typeof carryFixes>> = remote.hasRemote ? await carryFixes(dir, sh, remote.remoteRef, new Set(releases.map((r) => r.name))) : { done: [], bumped: [], added: [], marks: [] };
+        bumped.push(...carried.bumped);
+        added.push(...carried.added);
+
         // 2. The version script of each package with a new version. A script can change the version of another package of
         // the workspace, so the lockfile gets the new versions.
         const fixEnv = scriptEnv(u.repo);
@@ -764,6 +872,8 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
           ...(reverted.length > 0 ? [`- conventions fix removed, it broke ${fixStep ?? "typecheck"}: ${reverted.join(", ")}`] : []),
           ...(apiReports.length > 0 ? [`- api-report update: ${apiReports.length} ${apiReports.length === 1 ? "report" : "reports"}`] : []),
           ...(apiReportError !== null ? [`- api-report update did not finish, it failed at ${apiReportStep ?? "a step"}`] : []),
+          ...carried.done.map((d) => (d.via === "changeset" ? `- version fix ${d.name}: a patch changeset` : `- version fix ${d.name}: ${d.from ?? "?"} -> ${d.to ?? "?"} (package.json)`)),
+          ...(carried.marks.length > 0 ? ["", ...carried.marks.map(fixTrailer)] : []),
         ].join("\n");
         await sh("git", ["add", "-u"], "git add");
         if (added.length > 0) await sh("git", ["add", "--", ...added], "git add");
@@ -775,7 +885,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
 
         // 7. No push when the branch already has the same content in the files of the train.
         const pushed = await pushHead(dir, sh, TRAIN_BRANCH, remote, ctx.rebuild);
-        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(urgentAge.size > 0 ? { urgentAge: [...urgentAge].sort() } : {}), ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError, ...(fixStep === undefined ? {} : { fixStep }) } : {}), ...(apiReports.length > 0 ? { apiReports } : {}), ...(apiReportError !== null ? { apiReportError, ...(apiReportStep === undefined ? {} : { apiReportStep }) } : {}) };
+        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(urgentAge.size > 0 ? { urgentAge: [...urgentAge].sort() } : {}), ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError, ...(fixStep === undefined ? {} : { fixStep }) } : {}), ...(apiReports.length > 0 ? { apiReports } : {}), ...(apiReportError !== null ? { apiReportError, ...(apiReportStep === undefined ? {} : { apiReportStep }) } : {}), ...(carried.done.length > 0 ? { versionFixes: carried.done } : {}) };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       } finally {
@@ -819,6 +929,90 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater {
       } catch (e) {
         const error = e instanceof Error ? e.message : String(e);
         return { status: workflowsRefused(error) ? "workflows-denied" : "failed", sha: null, result, tool, error };
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+
+    /**
+     * The version fix: this function clones the head branch of a pull request and adds the PATCH of each package that the
+     * failed check names. A repository with Changesets gets one patch changeset. Another repository gets the PATCH of the
+     * version on npm in package.json, and a CHANGELOG section. The function pushes one commit with no force, so a new head of
+     * the branch wins. A head with another commit than the CI result gets no change.
+     */
+    async versionFix(job: FixJob): Promise<FixResult> {
+      const dir = mkdtempSync(join(o.tmpRoot ?? tmpdir(), "rt-"));
+      const sh = shell(dir);
+      const left: { name: string; reason: string }[] = [];
+      try {
+        await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", job.branch, `https://github.com/${o.owner}/${job.repo}.git`, "."], "git clone");
+        const head = (await sh("git", ["rev-parse", "HEAD"], "git rev-parse")).stdout.trim();
+        if (head !== job.sha) return { status: "moved", sha: head, done: [], left, error: null };
+        const folders = await packageFolders(sh, dir);
+        const viaChangeset = existsSync(join(dir, ".changeset", "config.json"));
+        const plans: FixPlan[] = [];
+        for (const need of job.needs) {
+          const path = folders.get(need.name);
+          if (path === undefined) {
+            left.push({ name: need.name, reason: "no package.json of the branch has this name" });
+            continue;
+          }
+          if (viaChangeset) {
+            plans.push({ name: need.name, path, from: null, to: null });
+            continue;
+          }
+          if (need.version === null) {
+            left.push({ name: need.name, reason: "the check names no version on npm, and the repository has no Changesets" });
+            continue;
+          }
+          const current = versionAt(dir, path);
+          if (current === null) {
+            left.push({ name: need.name, reason: "package.json has no SemVer version" });
+            continue;
+          }
+          // A greater version on the branch holds the fix already: a second run does nothing.
+          if (semver.gt(current, need.version)) {
+            left.push({ name: need.name, reason: `the branch has ${current} already, greater than ${need.version} on npm` });
+            continue;
+          }
+          if (current !== need.version) {
+            left.push({ name: need.name, reason: `the branch has ${current}, not the version ${need.version} of the check` });
+            continue;
+          }
+          const doc = await packument(need.name);
+          const target = patchTarget(need.version, doc.versions ? { versions: Object.keys(doc.versions), latest: doc["dist-tags"]?.["latest"] ?? null } : null);
+          if ("reason" in target) {
+            left.push({ name: need.name, reason: target.reason });
+            continue;
+          }
+          plans.push({ name: need.name, path, from: need.version, to: target.to });
+        }
+        if (plans.length === 0) return { status: "no-change", sha: head, done: [], left, error: null };
+        const w = writeFixes(dir, plans, viaChangeset);
+        const lockKind: LockKind = existsSync(join(dir, "pnpm-lock.yaml")) ? "pnpm" : existsSync(join(dir, "package-lock.json")) ? "npm" : "none";
+        const e = scriptEnv(job.repo);
+        const install = installer(dir, { lockKind }, e);
+        const hooks = await versionScripts(dir, { lockKind }, w.bumped, e, install);
+        if (hooks.error !== null) return { status: "failed", sha: null, done: [], left, error: hooks.error };
+        if (hooks.ran.length > 0 && lockKind === "pnpm") await sh("pnpm", ["install", "--lockfile-only"], "pnpm install --lockfile-only");
+        if (hooks.ran.length > 0 && lockKind === "npm") await sh("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], "npm install --package-lock-only");
+        await formatChanged(dir, { lockKind }, w.added, e, install);
+        if ((await sh("git", ["status", "--porcelain"], "git status")).stdout.trim() === "") return { status: "no-change", sha: head, done: [], left, error: null };
+        await sh("git", ["add", "-u"], "git add");
+        if (w.added.length > 0) await sh("git", ["add", "--", ...w.added], "git add");
+        const marks = w.done.map((d) => ({ name: d.name, from: d.from, to: d.to }));
+        await sh("git", ["-c", `user.name=${o.author.name}`, "-c", `user.email=${o.author.email}`, "commit", "--quiet", "--no-verify", "-m", fixCommitMessage(marks)], "git commit");
+        const sha = (await sh("git", ["rev-parse", "HEAD"], "git rev-parse")).stdout.trim();
+        const pushArgs = ["push", "--quiet", "--no-verify", "origin", `HEAD:refs/heads/${job.branch}`];
+        const pushed = await run("git", pushArgs, { cwd: dir, env: envFor("git", pushArgs) });
+        if (pushed.code !== 0) {
+          // A push with no force fails when the branch has a new head. Then the next run reads the CI of that head.
+          if (/\[rejected\]|non-fast-forward|fetch first/.test(`${pushed.stderr}\n${pushed.stdout}`)) return { status: "moved", sha: null, done: [], left, error: null };
+          return { status: "failed", sha: null, done: [], left, error: `git push failed (exit ${pushed.code}): ${tail(pushed.stderr || pushed.stdout)}` };
+        }
+        return { status: "pushed", sha, done: w.done, left, error: null };
+      } catch (e) {
+        return { status: "failed", sha: null, done: [], left, error: e instanceof Error ? e.message : String(e) };
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
