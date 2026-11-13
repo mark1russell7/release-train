@@ -44,9 +44,10 @@ env:
   # The run starts the release workflows that start only by hand (for example with changesets) when RELEASE_DISPATCH
   # is "true". This needs the permission Actions: write of the GitHub App.
   RELEASE_DISPATCH: "true"
-  # The step "Version fix" changes pull requests only when VERSION_FIX_LIVE is "true" too. It stays "false" until the log of a
-  # dry run on real pull requests is read (RT23). Then a change sets it to "true".
-  VERSION_FIX_LIVE: "false"
+  # The step "Version fix" changes pull requests only when VERSION_FIX_LIVE is "true" too. "false" makes the step a dry run
+  # again. The dry run of 2026-11-13 (run 43374721065) planned 10 fixes, and each one agreed with the release check of its
+  # pull request (RT23).
+  VERSION_FIX_LIVE: "true"
   # The public repositories (comma-separated) whose breaking adoptions carry a cascade release, "all", or "none".
   # The adoptions of other repositories with a cascade release wait.
   CASCADE: "all"
