@@ -138,12 +138,19 @@ export async function pool<T, R>(items: readonly T[], limit: number, fn: (item: 
   return out;
 }
 
-/** This function gives the URL of the next page from the `link` header of a response, or null. */
+/**
+ * This function gives the URL of the next page from the `link` header of a response, or null.
+ * It reads each part with string operations and no regular expression, so its time is linear in the length of the header.
+ */
 export function nextLink(header: string | null): string | null {
   if (!header) return null;
   for (const part of header.split(",")) {
-    const m = /<([^>]+)>;\s*rel="next"/.exec(part);
-    if (m?.[1]) return m[1];
+    const text = part.trim();
+    if (!text.startsWith("<")) continue;
+    const end = text.indexOf(">");
+    if (end < 2) continue;
+    const params = text.slice(end + 1).split(";").map((p) => p.trim());
+    if (params.includes('rel="next"')) return text.slice(1, end);
   }
   return null;
 }
