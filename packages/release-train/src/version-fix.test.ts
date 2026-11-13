@@ -1,4 +1,4 @@
-// The check texts in the first tests are real texts of public repositories (11-13). The other names are made up.
+// The check texts in the first tests have the form of real check texts (11-13), with made-up names.
 import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,31 +30,31 @@ import type { RunFn } from "./workspace.ts";
 const GENERIC = "Process completed with exit code 1.";
 const HEAD = "The release skips a version that is on npm, so these changes would not ship. Set a greater version (SemVer) in each package.json:";
 
-// lag-hud#90, the check "ci / release-check" (template scripts/release/pack.ts)
-const LAG_HUD = `${HEAD}\n  @mark1russell7/lag-hud@0.3.0 is on npm, but these shipped files differ from it:\n    build/index.d.ts (changed)\n    build/index.d.ts.map (changed)`;
+// A meter repository, the check "ci / release-check" (template scripts/release/pack.ts)
+const LAG_HUD = `${HEAD}\n  @acme/meter@0.3.0 is on npm, but these shipped files differ from it:\n    build/index.d.ts (changed)\n    build/index.d.ts.map (changed)`;
 // collections#119, the check "ci / release-check"
-const COLLECTIONS = `${HEAD}\n  @mark1russell7/collections@0.10.0 is on npm, but these shipped files differ from it:\n    build/dag/index.d.ts (changed)\n    build/dag/index.d.ts.map (changed)\n    build/graph/index.d.ts (changed)\n    build/graph/index.d.ts.map (changed)\n    build/index.d.ts (changed)\n    build/index.d.ts.map (changed)\n    build/index.js (changed)\n    build/index.js.map (changed)\n    build/summary-tree/index.d.ts (changed)\n    build/testing/index.d.ts (changed)\n    build/testing/index.d.ts.map (changed)\n    build/testing/index.js.map (changed)`;
+const COLLECTIONS = `${HEAD}\n  @acme/lists@0.10.0 is on npm, but these shipped files differ from it:\n    build/dag/index.d.ts (changed)\n    build/dag/index.d.ts.map (changed)\n    build/graph/index.d.ts (changed)\n    build/graph/index.d.ts.map (changed)\n    build/index.d.ts (changed)\n    build/index.d.ts.map (changed)\n    build/index.js (changed)\n    build/index.js.map (changed)\n    build/summary-tree/index.d.ts (changed)\n    build/testing/index.d.ts (changed)\n    build/testing/index.d.ts.map (changed)\n    build/testing/index.js.map (changed)`;
 // strategy-space#23, a pull request of the train: conventions fix changed package.json
-const STRATEGY_SPACE = `${HEAD}\n  @mark1russell7/strategy-space@0.0.5 is on npm, but these shipped files differ from it:\n    package.json (changed)`;
-// systems#167, the check "checks / release-check"
-const SYSTEMS = `${HEAD}\n  @mark1russell7/harness@0.15.6 is on npm, but these shipped files differ from it:\n    package.json (changed)\n  @mark1russell7/kind@0.14.3 is on npm, but these shipped files differ from it:\n    package.json (changed)`;
-// systems#167, the end of the job log of "pack / Build, pack and plan the tags": the annotations of that job hold only the last line.
+const STRATEGY_SPACE = `${HEAD}\n  @acme/grid@0.0.5 is on npm, but these shipped files differ from it:\n    package.json (changed)`;
+// A bench repository, the check "checks / release-check"
+const SYSTEMS = `${HEAD}\n  @acme/bench@0.15.6 is on npm, but these shipped files differ from it:\n    package.json (changed)\n  @acme/cluster@0.14.3 is on npm, but these shipped files differ from it:\n    package.json (changed)`;
+// A bench repository, the end of the job log of "pack / Build, pack and plan the tags": the annotations of that job hold only the last line.
 const SYSTEMS_PACK_LOG = [
-  "2026-11-13T02:14:17.2377863Z /home/runner/work/_temp/release/mark1russell7-kind-0.14.3.tgz",
-  "2026-11-13T02:14:17.2874778Z @mark1russell7/kind@0.14.3: mark1russell7-kind-0.14.3.tgz",
-  "2026-11-13T02:14:17.3306953Z package: @mark1russell7/machines@0.3.33",
+  "2026-11-13T02:14:17.2377863Z /home/runner/work/_temp/release/acme-cluster-0.14.3.tgz",
+  "2026-11-13T02:14:17.2874778Z @acme/cluster@0.14.3: acme-cluster-0.14.3.tgz",
+  "2026-11-13T02:14:17.3306953Z package: @acme/fsm@0.3.33",
   "2026-11-13T02:14:17.3307252Z Tarball Contents",
-  "2026-11-13T02:14:17.3308720Z /home/runner/work/_temp/release/mark1russell7-machines-0.3.33.tgz",
+  "2026-11-13T02:14:17.3308720Z /home/runner/work/_temp/release/acme-fsm-0.3.33.tgz",
   `2026-11-13T02:14:17.3868646Z ${HEAD}`,
-  "2026-11-13T02:14:17.3869672Z @mark1russell7/machines@0.3.33: mark1russell7-machines-0.3.33.tgz",
-  "2026-11-13T02:14:17.3870414Z   @mark1russell7/harness@0.15.6 is on npm, but these shipped files differ from it:",
+  "2026-11-13T02:14:17.3869672Z @acme/fsm@0.3.33: acme-fsm-0.3.33.tgz",
+  "2026-11-13T02:14:17.3870414Z   @acme/bench@0.15.6 is on npm, but these shipped files differ from it:",
   "2026-11-13T02:14:17.3870995Z     package.json (changed)",
-  "2026-11-13T02:14:17.3871407Z   @mark1russell7/kind@0.14.3 is on npm, but these shipped files differ from it:",
+  "2026-11-13T02:14:17.3871407Z   @acme/cluster@0.14.3 is on npm, but these shipped files differ from it:",
   "2026-11-13T02:14:17.3871757Z     package.json (changed)",
   "2026-11-13T02:14:17.3961815Z ##[error]Process completed with exit code 1.",
   "2026-11-13T02:14:17.4083861Z Post job cleanup.",
 ].join("\n");
-// systems#167, the job log of the summary job "ci": its annotations hold only the last line.
+// A bench repository, the job log of the summary job "ci": its annotations hold only the last line.
 const SYSTEMS_CI_LOG = [
   '2026-11-13T02:17:11.6792544Z \u001b[36;1mecho "checks: $CHECKS, pack: $PACK, site: $SITE, checker: $CHECKER, native: $NATIVE"\u001b[0m',
   "2026-11-13T02:17:14.5172158Z env:",
@@ -70,22 +70,22 @@ const CLIENT_CHANGESETS =
 
 describe("parseUnshipped", () => {
   it("reads the package and the version on npm from the message of the release check", () => {
-    expect(parseUnshipped(LAG_HUD)).toEqual([{ name: "@mark1russell7/lag-hud", version: "0.3.0" }]);
-    expect(parseUnshipped(COLLECTIONS)).toEqual([{ name: "@mark1russell7/collections", version: "0.10.0" }]);
-    expect(parseUnshipped(STRATEGY_SPACE)).toEqual([{ name: "@mark1russell7/strategy-space", version: "0.0.5" }]);
+    expect(parseUnshipped(LAG_HUD)).toEqual([{ name: "@acme/meter", version: "0.3.0" }]);
+    expect(parseUnshipped(COLLECTIONS)).toEqual([{ name: "@acme/lists", version: "0.10.0" }]);
+    expect(parseUnshipped(STRATEGY_SPACE)).toEqual([{ name: "@acme/grid", version: "0.0.5" }]);
     expect(parseUnshipped(SYSTEMS)).toEqual([
-      { name: "@mark1russell7/harness", version: "0.15.6" },
-      { name: "@mark1russell7/kind", version: "0.14.3" },
+      { name: "@acme/bench", version: "0.15.6" },
+      { name: "@acme/cluster", version: "0.14.3" },
     ]);
   });
 
   it("reads a job log with time stamps, and not the output lines of pnpm pack", () => {
     const found = parseUnshipped(SYSTEMS_PACK_LOG);
     expect(found).toEqual([
-      { name: "@mark1russell7/harness", version: "0.15.6" },
-      { name: "@mark1russell7/kind", version: "0.14.3" },
+      { name: "@acme/bench", version: "0.15.6" },
+      { name: "@acme/cluster", version: "0.14.3" },
     ]);
-    expect(found.map((x) => x.name)).not.toContain("@mark1russell7/machines");
+    expect(found.map((x) => x.name)).not.toContain("@acme/fsm");
   });
 
   it("reads no package outside the error block: a pending changeset is not an error", () => {
@@ -116,7 +116,7 @@ describe("readCheck", () => {
 
   it("reads the message from the log when the annotations hold only the last line", () => {
     const r = readCheck({ name: "pack", annotations: [GENERIC], log: SYSTEMS_PACK_LOG });
-    expect(r.unshipped.map((x) => x.name)).toEqual(["@mark1russell7/harness", "@mark1russell7/kind"]);
+    expect(r.unshipped.map((x) => x.name)).toEqual(["@acme/bench", "@acme/cluster"]);
     expect(r.other).toEqual([]);
   });
 
@@ -166,13 +166,13 @@ const failed = (...checks: CiFacts["failed"]): CiFacts => ({ state: "failed", st
 describe("decideFix", () => {
   it("acts when each failed check is a known message or a summary job", () => {
     const ci = failed({ name: "CI OK", annotations: [GENERIC, "ci: failure"] }, { name: "ci / release-check", annotations: [GENERIC, LAG_HUD] });
-    expect(decideFix("renovate", ci, [])).toEqual({ act: true, source: "renovate", needs: [{ name: "@mark1russell7/lag-hud", version: "0.3.0" }] });
+    expect(decideFix("renovate", ci, [])).toEqual({ act: true, source: "renovate", needs: [{ name: "@acme/meter", version: "0.3.0" }] });
     const systems = failed(
       { name: "ci", annotations: [GENERIC], log: SYSTEMS_CI_LOG },
       { name: "pack / Build, pack and plan the tags", annotations: [GENERIC], log: SYSTEMS_PACK_LOG },
       { name: "checks / release-check", annotations: [GENERIC, SYSTEMS] },
     );
-    expect(decideFix("renovate", systems, [])).toMatchObject({ act: true, needs: [{ name: "@mark1russell7/harness", version: "0.15.6" }, { name: "@mark1russell7/kind", version: "0.14.3" }] });
+    expect(decideFix("renovate", systems, [])).toMatchObject({ act: true, needs: [{ name: "@acme/bench", version: "0.15.6" }, { name: "@acme/cluster", version: "0.14.3" }] });
     const changesets = failed({ name: "CI OK", annotations: [GENERIC, "changesets: failure", "ci: failure"] }, { name: "CI / changesets", annotations: [GENERIC, CLIENT_CHANGESETS] }, { name: "Changesets", annotations: [GENERIC, CLIENT_CHANGESETS] });
     expect(decideFix("renovate", changesets, [])).toMatchObject({ act: true, needs: [{ name: "@procedures/s3", version: null }] });
   });
@@ -194,8 +194,8 @@ describe("decideFix", () => {
 
   it("never raises a version two times: a mark of the package on the head stops the fix", () => {
     const ci = failed({ name: "ci / release-check", annotations: [LAG_HUD] });
-    const marks = parseFixMarks([fixCommitMessage([{ name: "@mark1russell7/lag-hud", from: "0.3.0", to: "0.3.1" }])]);
-    expect(decideFix("renovate", ci, marks)).toEqual({ act: false, reason: "the head has a version fix for a package already, so a person decides", detail: "@mark1russell7/lag-hud" });
+    const marks = parseFixMarks([fixCommitMessage([{ name: "@acme/meter", from: "0.3.0", to: "0.3.1" }])]);
+    expect(decideFix("renovate", ci, marks)).toEqual({ act: false, reason: "the head has a version fix for a package already, so a person decides", detail: "@acme/meter" });
   });
 });
 
