@@ -428,9 +428,10 @@ export interface CandidatePair {
  * `limit`: the limit of pushes of the run. `busy`: the busy runners stop a sync push. `young`: the target versions are
  * younger than the minimumReleaseAge of pnpm. `release-run`: a merge that changes workflow files waits for the release
  * runs. `skip`: the update or the sync changes no file. `error`: the work in the clone failed.
+ * `release-check`: the repository publishes, and no release check passed on the head commit (see `releaseCheckLets`).
  * `merge-failed`: GitHub refused the merge of a candidate, and no push follows. Only the mode `one-candidate` gives it.
  */
-export type HeldCause = "limit" | "busy" | "young" | "release-run" | "skip" | "error" | "merge-failed";
+export type HeldCause = "limit" | "busy" | "young" | "release-run" | "release-check" | "skip" | "error" | "merge-failed";
 
 /**
  * A decision of the candidate rules in a count. `not read`: the run read no fact for the branch. In a held pair, the branch
@@ -890,9 +891,41 @@ export function bodyFingerprint(body: string | null | undefined): string | null 
 }
 
 interface CheckRun {
+  /** The name of the check run. A job of a called workflow has the name `<caller job> / <job>`. */
+  name?: string;
   status: string;
   conclusion: string | null;
   check_suite?: { id: number } | null;
+}
+
+/** The job of the release check: the action release-check of the template, or the job release-check of reusable-ci.yml. */
+export const RELEASE_CHECK_JOB = "release-check";
+
+/** The state of the release check on a commit. `missing`: no check run of the release check is on the commit. */
+export type ReleaseCheck = "passed" | "skipped" | "missing" | "failed" | "running";
+
+/**
+ * This function reads the release check from the check runs of a commit, after `latestRuns`. A check run counts when its
+ * name is `release-check` or ends with ` / release-check`, so a caller of reusable-ci.yml at each depth counts.
+ */
+export function releaseCheckOf(runs: readonly CheckRun[]): ReleaseCheck {
+  const checks = runs.filter((r) => r.name === RELEASE_CHECK_JOB || (r.name ?? "").endsWith(` / ${RELEASE_CHECK_JOB}`));
+  if (checks.length === 0) return "missing";
+  if (checks.some((r) => r.status !== "completed")) return "running";
+  if (checks.some((r) => r.conclusion !== "success" && r.conclusion !== "skipped")) return "failed";
+  return checks.some((r) => r.conclusion === "success") ? "passed" : "skipped";
+}
+
+/**
+ * This function tells if the release check lets the train merge in a repository that publishes. The release check starts
+ * the release build on the commit of the pull request. Thus a merge cannot stop the release on the default branch. On
+ * 2026-11-13 in ireko, an update changed a shipped file, and that version was already on npm. A passed check lets the merge
+ * go. A skipped check lets it go only in a private repository. There, reusable-ci.yml runs the check only with the input
+ * release-check-private, because the minutes of a private repository cost money. A public repository with no check waits
+ * until its CI has one.
+ */
+export function releaseCheckLets(check: ReleaseCheck, isPrivate: boolean): boolean {
+  return check === "passed" || (check === "skipped" && isPrivate);
 }
 
 /** A workflow run of a commit, as far as `latestRuns` reads it. */
@@ -1141,11 +1174,41 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     return (res.data.workflow_runs ?? []).filter((r) => r.status !== "completed").length;
   };
 
-  const ciOf = async (repo: string, sha: string): Promise<CiState> => {
+  /** The CI state of a commit, and its release check, from one read of its check runs. */
+  const checksOf = async (repo: string, sha: string): Promise<{ ci: CiState; release: ReleaseCheck }> => {
     const runs = await gh.request<{ check_runs: CheckRun[] }>("GET", `${base}/${repo}/commits/${sha}/check-runs?per_page=100`);
     const status = await gh.request<{ state: string; total_count: number }>("GET", `${base}/${repo}/commits/${sha}/status`);
     const workflows = await gh.request<{ workflow_runs: WorkflowRun[] }>("GET", `${base}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
-    return ciState(latestRuns(runs.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []), status.data);
+    const latest = latestRuns(runs.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []);
+    return { ci: ciState(latest, status.data), release: releaseCheckOf(latest) };
+  };
+  const ciOf = async (repo: string, sha: string): Promise<CiState> => (await checksOf(repo, sha)).ci;
+
+  /**
+   * This function tells if a repository publishes: its default branch has `.github/workflows/release.yml`. A read that
+   * fails gives null, and the merge waits: a gate that cannot read gives no pass. One read for each repository in a run.
+   */
+  const publishesOf = new Map<string, boolean | null>();
+  const publishes = async (repo: string): Promise<boolean | null> => {
+    if (!publishesOf.has(repo)) {
+      const res = await gh.request("GET", `${base}/${repo}/contents/.github/workflows/release.yml`);
+      publishesOf.set(repo, res.ok ? true : res.status === 404 ? false : null);
+    }
+    return publishesOf.get(repo) ?? null;
+  };
+
+  /**
+   * This function gives the reason why a green pull request waits for its release check, or null when the merge can go.
+   * In a repository that publishes, a merge needs a passed release check on the head commit (releaseCheckLets). Each merge
+   * of the train goes through it. `known`: the release check that the caller read with the CI state, if it has one.
+   */
+  const releaseHold = async (repo: string, sha: string, known?: ReleaseCheck): Promise<string | null> => {
+    const pub = await publishes(repo);
+    if (pub === null) return "CI is green, but GitHub did not tell if the repository publishes (.github/workflows/release.yml). The train does not merge it now.";
+    if (!pub) return null;
+    const release = known ?? (await checksOf(repo, sha)).release;
+    if (releaseCheckLets(release, privateOf.get(repo) ?? false)) return null;
+    return `CI is green, but the repository publishes and the release check of this commit is ${release}. The release check starts the release build on a pull request (the job release-check of reusable-ci.yml, or the action release-check of the template). The train merges after it passes.`;
   };
 
   /**
@@ -1208,7 +1271,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     branch: string = TRAIN_BRANCH,
     deleteBranch = true,
   ): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number; caughtUp?: boolean; held?: HeldCause; mergedBehind?: number }> => {
-    const ci = await ciOf(repo, pr.head.sha);
+    const { ci, release } = await checksOf(repo, pr.head.sha);
     if (ci === "failed") {
       if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
       return { state: "blocked", ci, detail: "CI failed. The pull request stays open with the blocked label." };
@@ -1241,6 +1304,8 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
           return { state: "unchanged", ci, held: "release-run", detail: `CI is green, but the branch changes workflow files and ${open} release run(s) of ${main} are not done. The train merges after the release, so GitHub does not refuse its tag.` };
         }
       }
+      const hold = await releaseHold(repo, pr.head.sha, release);
+      if (hold !== null) return { state: "unchanged", ci, held: "release-check", detail: hold };
       const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
         if (deleteBranch) await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);
@@ -1519,6 +1584,12 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         result({ ...common, state: "unchanged", pr: prRef(pr), autoMerge, ci, detail: `CI is green, but the branch can change workflow files and ${why}. The train merges after the release, so GitHub does not refuse its tag.` });
         return null;
       }
+    }
+    const hold = await releaseHold(repo, pr.head.sha);
+    if (hold !== null) {
+      record.cause = "release-check";
+      result({ ...common, state: "unchanged", pr: prRef(pr), autoMerge, ci, detail: hold });
+      return null;
     }
     const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
     if (m.ok) {
