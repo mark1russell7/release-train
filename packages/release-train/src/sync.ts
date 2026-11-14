@@ -705,12 +705,23 @@ async function evaluate(files: RepoFiles, facts: SyncFacts, rules: readonly Sync
   return { overlay, install, outcomes };
 }
 
-/** This function gives a short fingerprint of the applied changes of a sync. */
-export function syncFingerprint(outcomes: readonly RuleOutcome[], install: boolean): string {
+const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
+
+/**
+ * This function gives a short fingerprint of the applied changes of a sync. It covers the text of each applied change, the
+ * install, the content of each written file and each removed path. So a new content of a written file gives a new
+ * fingerprint, also when the change texts stay the same. An example is a fix of the train that writes `renovate.json` in
+ * another layout. The train then pushes a new build of the open pull request. Before, the train kept a red build with the
+ * old content until the default branch moved.
+ */
+export function syncFingerprint(outcomes: readonly RuleOutcome[], install: boolean, writes: Readonly<Record<string, string>> = {}, removes: readonly string[] = []): string {
   const keys = outcomes.filter((o) => o.state === "applied").flatMap((o) => o.changes.map((c) => `${o.rule}|${c}`)).sort();
   if (keys.length === 0) return "";
   if (install) keys.push("install");
-  return createHash("sha256").update(keys.join("\n")).digest("hex").slice(0, 12);
+  const paths = Object.keys(writes).sort();
+  for (const p of paths) keys.push(`write|${p}|${sha256(writes[p] ?? "")}`);
+  for (const r of [...removes].sort()) keys.push(`remove|${r}`);
+  return sha256(keys.join("\n")).slice(0, 12);
 }
 
 /**
@@ -733,13 +744,15 @@ export async function syncRepo(files: RepoFiles, facts: SyncFacts, rules: readon
       else if (b) outcomes.push(b);
     }
   }
+  const writes = Object.fromEntries(real.overlay.writes);
+  const removes = [...real.overlay.removes];
   return {
     repo: facts.repo,
     outcomes,
-    writes: Object.fromEntries(real.overlay.writes),
-    removes: [...real.overlay.removes],
+    writes,
+    removes,
     install: real.install,
-    fingerprint: syncFingerprint(outcomes, real.install),
+    fingerprint: syncFingerprint(outcomes, real.install, writes, removes),
   };
 }
 

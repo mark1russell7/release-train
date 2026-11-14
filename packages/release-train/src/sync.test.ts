@@ -25,6 +25,7 @@ import {
   renovateDays,
   renovateInput,
   syncFacts,
+  syncFingerprint,
   syncRepo,
   workflowsRefused,
 } from "./sync.ts";
@@ -352,6 +353,16 @@ describe("renovate-day", () => {
     expect(outcome(await syncRepo(mem({ "renovate.json": renovate() }), facts({ repo: "template", renovateDay: () => "friday" })), "renovate-day")).toBeUndefined();
   });
 
+  it("gives a new fingerprint for a new content of a written file with the same change texts, and the same one for the same content", async () => {
+    const day = facts({ renovateDay: () => "thursday" });
+    const a = await syncRepo(mem({ "renovate.json": renovate() }), day);
+    const b = await syncRepo(mem({ "renovate.json": renovate({ labels: ["deps"] }) }), day);
+    expect(outcome(a, "renovate-day")?.changes).toEqual(outcome(b, "renovate-day")?.changes);
+    expect(a.writes["renovate.json"]).not.toBe(b.writes["renovate.json"]);
+    expect(a.fingerprint).not.toBe(b.fingerprint);
+    expect((await syncRepo(mem({ "renovate.json": renovate() }), day)).fingerprint).toBe(a.fingerprint);
+  });
+
   it("weighs a repository by the jobs of one pull request, with the shared workflows of the template", async () => {
     const shared = "on: workflow_call\njobs:\n  checks:\n    strategy:\n      matrix:\n        os: [a, b]\n  changesets: {}\n";
     const f = facts({ readTemplate: async (p) => (p === ".github/workflows/reusable-ci.yml" ? shared : null) });
@@ -467,6 +478,17 @@ describe("fingerprint", () => {
     expect((await syncRepo(files, facts())).fingerprint).toBe(a.fingerprint);
     expect((await syncRepo(files, facts({ templateSha: MID }))).fingerprint).not.toBe(a.fingerprint);
     expect(bodyFingerprint(syncPrBody(a, null))).toBe(a.fingerprint);
+  });
+
+  it("covers the content of each write and each remove, in no order of the keys", () => {
+    const applied = [{ rule: "pins", state: "applied" as const, changes: ["x"], needs: [], waits: [] }];
+    const base = syncFingerprint(applied, false, { "a.json": "1", "b.yml": "2" }, ["old"]);
+    expect(syncFingerprint(applied, false, { "b.yml": "2", "a.json": "1" }, ["old"])).toBe(base);
+    expect(syncFingerprint(applied, false, { "a.json": "1 ", "b.yml": "2" }, ["old"])).not.toBe(base);
+    expect(syncFingerprint(applied, false, { "a.json": "1", "b.yml": "2" }, ["other"])).not.toBe(base);
+    expect(syncFingerprint(applied, false, { "a.json": "1" }, ["old"])).not.toBe(base);
+    expect(syncFingerprint(applied, true, { "a.json": "1", "b.yml": "2" }, ["old"])).not.toBe(base);
+    expect(syncFingerprint([], false, { "a.json": "1" })).toBe("");
   });
 });
 
