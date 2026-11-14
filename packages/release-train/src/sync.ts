@@ -259,8 +259,9 @@ export const JSON_STRINGIFY_FILES: ReadonlySet<string> = new Set(["package.json"
  * This function gives the JSON text of a value in the format of the original text and of Prettier. It keeps the indent,
  * the line ends and the last line end of the original text. With `printWidth` null (the files of `JSON_STRINGIFY_FILES`),
  * the text is the text of `JSON.stringify`. Else a non-empty object has one key on each line: Prettier keeps an object open
- * when a line break follows its `{`. An array goes on one line when it has no non-empty object, it is not a list of two or
- * more lists, and its line is not longer than `printWidth`. Prettier puts such an array on one line, so the check
+ * when a line break follows its `{`. An array goes on one line only when three conditions are true. It has no non-empty
+ * object. It is not a list of two or more lists. Its line is not longer than `printWidth`. Prettier puts such an array
+ * on one line, so the check
  * `prettier --check` of the repository passes on the text.
  */
 export function formatJson(original: string, value: unknown, printWidth: number | null = null): string {
@@ -331,8 +332,8 @@ export const PRETTIER_CONFIGS = [
 const PRINT_WIDTH = /\bprintWidth\b["']?\s*[:=]\s*(\d+)/;
 
 /**
- * This function reads the `printWidth` of Prettier in the root of a repository: from the key `prettier` of `package.json`,
- * else from the first config file of `PRETTIER_CONFIGS`. It reads the value as text, so a config in JSON, YAML, TOML or
+ * This function reads the `printWidth` of Prettier in the root of a repository. It reads the key `prettier` of
+ * `package.json`, else the first config file of `PRETTIER_CONFIGS`. It reads the value as text, so a config in JSON, YAML, TOML or
  * JavaScript gives it. It gives `PRETTIER_PRINT_WIDTH` when the config does not set it.
  */
 export async function printWidthOf(files: RepoFiles): Promise<number> {
