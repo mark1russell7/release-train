@@ -918,10 +918,11 @@ export function releaseCheckOf(runs: readonly CheckRun[]): ReleaseCheck {
 
 /**
  * This function tells if the release check lets the train merge in a repository that publishes. The release check starts
- * the release build on the commit of the pull request, so a merge cannot stop the release on the default branch (ireko on
- * 2026-11-13: an update changed a shipped file and the version was on npm). A passed check lets the merge go. A skipped check
- * lets it go only in a private repository: reusable-ci.yml runs the check there only with the input release-check-private,
- * because the minutes of a private repository cost money. A public repository with no check waits until its CI has one.
+ * the release build on the commit of the pull request. Thus a merge cannot stop the release on the default branch. On
+ * 2026-11-13 in ireko, an update changed a shipped file, and that version was already on npm. A passed check lets the merge
+ * go. A skipped check lets it go only in a private repository. There, reusable-ci.yml runs the check only with the input
+ * release-check-private, because the minutes of a private repository cost money. A public repository with no check waits
+ * until its CI has one.
  */
 export function releaseCheckLets(check: ReleaseCheck, isPrivate: boolean): boolean {
   return check === "passed" || (check === "skipped" && isPrivate);
