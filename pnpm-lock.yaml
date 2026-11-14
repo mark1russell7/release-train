@@ -204,7 +204,7 @@ importers:
         version: 0.0.5
       '@procedures/shell':
         specifier: ^0.55.0
-        version: 0.55.0
+        version: 0.55.2
       semver:
         specifier: ^7.8.5
         version: 7.8.6
@@ -456,15 +456,6 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@mark1russell7/algebra@0.8.4':
-    resolution: {integrity: sha512-jNwuJZWGUrjaowNJ0WCk6+cIIBXot3DQ8W2Rs4vMeYhDHhyU+gnqY35jcAwG5ZjzCgfM1AICA4eHquc1p10ZGw==}
-    engines: {node: '>=22.19'}
-    peerDependencies:
-      zod: ^4.1.0
-    peerDependenciesMeta:
-      zod:
-        optional: true
-
   '@mark1russell7/algebra@0.8.5':
     resolution: {integrity: sha512-Psq8pJ9a8fDpfwxXg3N6OuJObfg9FYlu1RDNismMh19OtEQvOpYml07QniSn1jdQ1r++dKNOCRiw4j78iygOOQ==}
     engines: {node: '>=22.19'}
@@ -583,8 +574,8 @@ packages:
   '@oxc-project/types@0.156.0':
     resolution: {integrity: sha512-1Duyg48TdJNdyhEB8Xn1L36bT9Pv6GUtlKjHxOys8xkaF/rQq3XJE+bAurSK/AgIz5mGFsb77cn9Pb20+WCScw==}
 
-  '@procedures/client@0.55.0':
-    resolution: {integrity: sha512-+JU/TDgY9umJtX0XFR7X4v8pHRdseBGm7fSWRGJ7hoXkqBcQVszMP7OCZWdhNkK2rfUvBscrWTHCN0O8DaZYYw==}
+  '@procedures/client@0.55.2':
+    resolution: {integrity: sha512-yzT4KH/WZe9yx8YICr83jE+UYZJFuzFwmsEYGx32hxRKCTgrx6xKg9RE9laxJMeKiXS9DQNq/33Zjx1ku7Em3Q==}
     engines: {node: '>=22'}
     peerDependencies:
       express: ^4.0.0 || ^5.0.0
@@ -592,8 +583,8 @@ packages:
       express:
         optional: true
 
-  '@procedures/shell@0.55.0':
-    resolution: {integrity: sha512-DpYaAgr3zfVlBsNW++VBF2IurWYdaxRxhL+5KWPkJpJdcixnUdP3CZU002tqIA8ysjPKc54ERfPM4OF/gvuiLQ==}
+  '@procedures/shell@0.55.2':
+    resolution: {integrity: sha512-JQ9PnVhwqoLki5IBKgko8FAKcejr0g07ksLOpJX8mQ3+r4H5351Sb8Hvtlen3O9FtF6tG/nX4zip2r9Xg3Kwjw==}
     engines: {node: '>=22'}
 
   '@publint/pack@0.1.7':
@@ -1326,12 +1317,6 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.6.0
 
-  '@mark1russell7/algebra@0.8.4(zod@4.6.7)':
-    dependencies:
-      '@mark1russell7/quantity': 0.3.5(zod@4.6.7)
-    optionalDependencies:
-      zod: 4.6.7
-
   '@mark1russell7/algebra@0.8.5(zod@4.6.7)':
     dependencies:
       '@mark1russell7/quantity': 0.4.0(zod@4.6.7)
@@ -1411,9 +1396,9 @@ snapshots:
 
   '@oxc-project/types@0.156.0': {}
 
-  '@procedures/client@0.55.0':
+  '@procedures/client@0.55.2':
     dependencies:
-      '@mark1russell7/algebra': 0.8.4(zod@4.6.7)
+      '@mark1russell7/algebra': 0.8.5(zod@4.6.7)
       '@mark1russell7/coeval': 0.29.0(zod@4.6.7)
       '@mark1russell7/collections': 0.10.0(zod@4.6.7)
       '@mark1russell7/quantity': 0.3.5(zod@4.6.7)
@@ -1431,9 +1416,9 @@ snapshots:
       - pg
       - utf-8-validate
 
-  '@procedures/shell@0.55.0':
+  '@procedures/shell@0.55.2':
     dependencies:
-      '@procedures/client': 0.55.0
+      '@procedures/client': 0.55.2
       zod: 4.6.7
     transitivePeerDependencies:
       - '@grpc/grpc-js'
