@@ -40,7 +40,7 @@ export interface RetryOptions {
   attempts?: number;
   /** This policy gives the delay before each new try. The default starts at 1 s, doubles, and stops at 15 s, with the full jitter. */
   backoff?: Backoff;
-  /** This time is the most wait that a `Retry-After` header can ask for. The default is 60 s. */
+  /** This time is the most wait that a rate limit can ask for, with `Retry-After` or `X-RateLimit-Reset`. The default is 60 s. */
   maxRetryAfter?: number;
   /** This clock waits between the tries. Tests give a clock that does not wait. */
   clock?: Clock;
@@ -54,11 +54,59 @@ export const DEFAULT_BACKOFF: Backoff = { base: 1000, factor: 2, cap: 15000, jit
 /** This function tells if a status can pass with time: 429 (too many requests) and each 5xx status. */
 export const retryableStatus = (status: number): boolean => status === 429 || status >= 500;
 
-/** A GitHub answer with a status that can pass with time. The retries of `retry` catch it. */
+/** The status and the headers of an HTTP answer. */
+export type HttpAnswer = Pick<Response, "status" | "headers">;
+
+/**
+ * This function tells if a GitHub answer is a rate limit. GitHub answers a spent rate limit with 403 or 429. A secondary
+ * rate limit sends `retry-after`. A spent primary rate limit sends `x-ratelimit-remaining: 0`. A 403 with neither header is
+ * a real permission error.
+ */
+export const rateLimited = (answer: HttpAnswer): boolean =>
+  (answer.status === 403 || answer.status === 429) &&
+  (answer.headers.has("retry-after") || answer.headers.get("x-ratelimit-remaining")?.trim() === "0");
+
+/** This function tells if a GitHub answer can pass with time: a status of `retryableStatus`, or a rate limit. */
+export const retryableAnswer = (answer: HttpAnswer): boolean => retryableStatus(answer.status) || rateLimited(answer);
+
+/** This function gives the time of `x-ratelimit-reset` in epoch milliseconds when `x-ratelimit-remaining` is 0, or null. */
+function resetTime(headers: Headers): number | null {
+  if (headers.get("x-ratelimit-remaining")?.trim() !== "0") return null;
+  const reset = headers.get("x-ratelimit-reset")?.trim() ?? "";
+  return /^\d+$/.test(reset) ? Number(reset) * 1000 : null;
+}
+
+/**
+ * This function gives the wait in milliseconds that a rate limit asks for, or null. The `retry-after` header comes first.
+ * Else a spent primary rate limit waits until `x-ratelimit-reset`. A time before `now` gives 0.
+ */
+export function rateLimitWait(headers: Headers, now: number): number | null {
+  const after = retryAfterDelay(headers.get("retry-after"), now);
+  if (after !== null) return after;
+  const reset = resetTime(headers);
+  return reset === null ? null : Math.max(0, reset - now);
+}
+
+/** This function gives the cause of a rate limit in plain words, or null for an answer that is not a rate limit. */
+export function rateLimitText(answer: HttpAnswer, now: number): string | null {
+  if (!rateLimited(answer)) return null;
+  const after = retryAfterDelay(answer.headers.get("retry-after"), now);
+  if (after !== null) return `the rate limit of GitHub asks for a wait of ${Math.ceil(after / 1000)} s (retry-after)`;
+  const reset = resetTime(answer.headers);
+  // The text rounds the time up to the next whole minute, so that it does not give a time before the reset.
+  if (reset !== null) return `the rate limit of the token is spent until ${new Date(Math.ceil(reset / 60_000) * 60_000).toISOString().slice(11, 16)}Z (x-ratelimit-reset)`;
+  return answer.headers.has("retry-after") ? "the rate limit of GitHub asks for a wait (retry-after)" : "the rate limit of the token is spent (x-ratelimit-remaining)";
+}
+
+/** This function gives the text of a failed request: the status, the URL, the count of tries and the cause of a rate limit. */
+const failureText = (status: number, url: string, tries: number, limit: string | null): string =>
+  `HTTP ${status} for ${url}${tries > 1 ? ` after ${tries} tries` : ""}${limit ? `: ${limit}` : ""}`;
+
+/** A GitHub answer that can pass with time. The retries of `retry` catch it. */
 class BusyAnswer extends Error {
   readonly response: Response;
   constructor(response: Response, url: string) {
-    super(`HTTP ${response.status} for ${url}`);
+    super(failureText(response.status, url, 1, rateLimitText(response, Date.now())));
     this.response = response;
   }
 }
@@ -115,11 +163,11 @@ interface TreeEntry {
   type: string;
 }
 
-/** This error holds the HTTP status of a failed request. */
+/** This error holds the HTTP status of a failed request. Its text names the cause of a rate limit, from `rateLimitText`. */
 export class HttpError extends Error {
   readonly status: number;
-  constructor(status: number, url: string, tries = 1) {
-    super(`HTTP ${status} for ${url}${tries > 1 ? ` after ${tries} tries` : ""}`);
+  constructor(status: number, url: string, tries = 1, rateLimit: string | null = null) {
+    super(failureText(status, url, tries, rateLimit));
     this.status = status;
   }
 }
@@ -219,13 +267,14 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   // Only the GitHub reads get the retries. A failed npm read is a warning already.
   const attempts = Math.max(1, Math.floor(opts.retry?.attempts ?? 4));
   const maxAfter = opts.retry?.maxRetryAfter ?? 60_000;
-  // retry of @mark1russell7/service makes the tries. A 429 or a 5xx throws BusyAnswer, so that it gets a new try.
+  // retry of @mark1russell7/service makes the tries. A 429, a 5xx or a 403 of a rate limit throws BusyAnswer, so that it gets
+  // a new try. A 403 with no rate limit is a real permission error, so it gets no new try.
   // After the last try, the read gives the last answer, and the caller throws HttpError with the count of tries.
   const gh: FetchFn = (url, init) =>
     retry(
       async () => {
         const res = await f(url, init);
-        if (retryableStatus(res.status)) throw new BusyAnswer(res, url);
+        if (retryableAnswer(res)) throw new BusyAnswer(res, url);
         return res;
       },
       {
@@ -235,9 +284,10 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
         ...(opts.retry?.random ? { random: opts.retry.random } : {}),
         delayOf: (error, attempt) => {
           log(`retry ${attempt} of ${attempts - 1}: ${error instanceof Error ? error.message : String(error)}${error instanceof BusyAnswer ? "" : ` for ${url}`}`);
-          if (!(error instanceof BusyAnswer) || error.response.status !== 429) return null;
-          const after = retryAfterDelay(error.response.headers.get("retry-after"), Date.now());
-          return after === null ? null : Math.min(after, maxAfter);
+          // A 5xx and a 429 with no rate limit header wait for the backoff. A rate limit waits for its header, up to the cap.
+          if (!(error instanceof BusyAnswer) || (error.response.status !== 429 && error.response.status !== 403)) return null;
+          const wait = rateLimitWait(error.response.headers, Date.now());
+          return wait === null ? null : Math.min(wait, maxAfter);
         },
       },
     ).then(
@@ -247,7 +297,8 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
         return error.response;
       },
     );
-  const tries = (status: number): number => (retryableStatus(status) ? attempts : 1);
+  const failure = (res: Response, url: string): HttpError =>
+    new HttpError(res.status, url, retryableAnswer(res) ? attempts : 1, rateLimitText(res, Date.now()));
 
   const ghHeaders = (accept: string): Record<string, string> => {
     const h: Record<string, string> = { accept, "x-github-api-version": "2022-11-28", "user-agent": "release-train" };
@@ -257,7 +308,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
 
   const ghJson = async <T>(url: string): Promise<{ data: T; next: string | null }> => {
     const res = await gh(url.startsWith("http") ? url : `${api}${url}`, { headers: ghHeaders("application/vnd.github+json") });
-    if (!res.ok) throw new HttpError(res.status, url, tries(res.status));
+    if (!res.ok) throw failure(res, url);
     return { data: (await res.json()) as T, next: nextLink(res.headers.get("link")) };
   };
 
@@ -265,7 +316,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     const url = `${api}/repos/${opts.owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`;
     const res = await gh(url, { headers: ghHeaders("application/vnd.github.raw") });
     if (res.status === 404) return null;
-    if (!res.ok) throw new HttpError(res.status, url, tries(res.status));
+    if (!res.ok) throw failure(res, url);
     return res.text();
   };
 

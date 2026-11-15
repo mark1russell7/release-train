@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { summary } from "./cli.ts";
 import { retryAfterDelay, type Clock } from "@mark1russell7/service";
-import { collect, HttpError, manifestFolder, nextLink, patchVersion, runtimeRanges } from "./collect.ts";
+import { collect, HttpError, manifestFolder, nextLink, patchVersion, rateLimited, rateLimitText, rateLimitWait, runtimeRanges } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { docId, writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
@@ -459,6 +459,99 @@ describe("the retries of the GitHub reads", () => {
     const data = await collect({ owner: "example-owner", token: null, fetch: f, retry: { clock: instant(waits), maxRetryAfter: 30_000 } });
     expect(data.repos.length).toBeGreaterThan(0);
     expect(waits).toEqual([2000, 30_000]);
+  });
+
+  // The first read of a run with no token is the list of the repositories of the owner. Its error gives the path.
+  const LIST_PATH = "/users/example-owner/repos?type=owner&per_page=100";
+  const LIST = `${API}${LIST_PATH}`;
+  const nowSeconds = (): number => Math.floor(Date.now() / 1000);
+
+  it("tries again after a 403 of a spent primary rate limit, and waits until its reset, up to the cap", async () => {
+    const waits: number[] = [];
+    const lines: string[] = [];
+    const inner = fakeFetch(REPOS, { "@ex/core": "1.4.0" });
+    const answers = [
+      // The reset is in one hour, so the wait stops at the cap.
+      new Response("", { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(nowSeconds() + 3600) } }),
+      // The reset is in the past, so the next try starts at once.
+      new Response("", { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(nowSeconds() - 10) } }),
+    ];
+    let listReads = 0;
+    const f: FetchFn = async (url, init) => {
+      if (url !== LIST) return inner(url, init);
+      listReads++;
+      return answers.shift() ?? inner(url, init);
+    };
+    const data = await collect({ owner: "example-owner", token: null, fetch: f, retry: { clock: instant(waits), maxRetryAfter: 30_000 }, log: (line) => lines.push(line) });
+    expect(data.repos.length).toBeGreaterThan(0);
+    expect(listReads).toBe(3);
+    expect(waits).toEqual([30_000, 0]);
+    expect(lines.filter((line) => line.startsWith("retry ") && line.includes("the rate limit of the token is spent until"))).toHaveLength(2);
+  });
+
+  it("tries again after a 403 with Retry-After, and waits for its seconds", async () => {
+    const waits: number[] = [];
+    const inner = fakeFetch(REPOS, { "@ex/core": "1.4.0" });
+    const answers = [new Response("", { status: 403, headers: { "retry-after": "2", "x-ratelimit-remaining": "4000" } })];
+    const f: FetchFn = async (url, init) => (url === LIST && answers.length > 0 ? (answers.shift() as Response) : inner(url, init));
+    const data = await collect({ owner: "example-owner", token: null, fetch: f, retry: { clock: instant(waits) } });
+    expect(data.repos.length).toBeGreaterThan(0);
+    expect(waits).toEqual([2000]);
+  });
+
+  it("fails at once on a 403 that is not a rate limit, with no new try", async () => {
+    let n = 0;
+    const lines: string[] = [];
+    const f: FetchFn = async () => {
+      n++;
+      // GitHub sends the rate limit headers with each answer. A token with reads left gets a real permission error.
+      return new Response("no", { status: 403, headers: { "x-ratelimit-remaining": "4999", "x-ratelimit-reset": String(nowSeconds() + 3600) } });
+    };
+    const error = await collect({ owner: "example-owner", token: null, fetch: f, retry: noWait(), log: (line) => lines.push(line) }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(HttpError);
+    expect((error as HttpError).message).toBe(`HTTP 403 for ${LIST_PATH}`);
+    expect(n).toBe(1);
+    expect(lines.some((line) => line.startsWith("retry "))).toBe(false);
+  });
+
+  it("names the spent rate limit in the error after the last try", async () => {
+    // 15:39:30Z rounds up to 15:40Z, so the text gives no time before the reset.
+    const reset = String(Date.parse("2026-11-15T15:39:30Z") / 1000);
+    let n = 0;
+    const f: FetchFn = async () => {
+      n++;
+      return new Response("", { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": reset } });
+    };
+    const error = await collect({ owner: "example-owner", token: null, fetch: f, retry: { ...noWait(), attempts: 3 } }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(HttpError);
+    expect((error as HttpError).status).toBe(403);
+    expect((error as HttpError).message).toBe(`HTTP 403 for ${LIST_PATH} after 3 tries: the rate limit of the token is spent until 15:40Z (x-ratelimit-reset)`);
+    expect(n).toBe(3);
+
+    const busy: FetchFn = async () => new Response("", { status: 429, headers: { "retry-after": "120" } });
+    const second = await collect({ owner: "example-owner", token: null, fetch: busy, retry: { ...noWait(), attempts: 2 } }).catch((e: unknown) => e);
+    expect((second as HttpError).message).toBe(`HTTP 429 for ${LIST_PATH} after 2 tries: the rate limit of GitHub asks for a wait of 120 s (retry-after)`);
+  });
+
+  it("finds a rate limit and its wait in the headers of an answer", () => {
+    const now = Date.parse("2026-11-15T15:00:00Z");
+    const answer = (status: number, headers: Record<string, string>) => ({ status, headers: new Headers(headers) });
+    const spent = { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(now / 1000 + 90) };
+    expect(rateLimited(answer(403, spent))).toBe(true);
+    expect(rateLimited(answer(429, { "retry-after": "5" }))).toBe(true);
+    expect(rateLimited(answer(403, { "x-ratelimit-remaining": "12" }))).toBe(false);
+    expect(rateLimited(answer(403, {}))).toBe(false);
+    expect(rateLimited(answer(500, spent))).toBe(false);
+    // Retry-After comes first. Else the wait lasts until the reset, and a reset in the past gives 0.
+    expect(rateLimitWait(new Headers({ ...spent, "retry-after": "5" }), now)).toBe(5000);
+    expect(rateLimitWait(new Headers(spent), now)).toBe(90_000);
+    expect(rateLimitWait(new Headers({ "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(now / 1000 - 5) }), now)).toBe(0);
+    expect(rateLimitWait(new Headers({ "x-ratelimit-remaining": "3", "x-ratelimit-reset": String(now / 1000 + 90) }), now)).toBeNull();
+    expect(rateLimitWait(new Headers({ "x-ratelimit-remaining": "0", "x-ratelimit-reset": "soon" }), now)).toBeNull();
+    expect(rateLimitText(answer(403, spent), now)).toBe("the rate limit of the token is spent until 15:02Z (x-ratelimit-reset)");
+    expect(rateLimitText(answer(403, { "x-ratelimit-remaining": "0" }), now)).toBe("the rate limit of the token is spent (x-ratelimit-remaining)");
+    expect(rateLimitText(answer(403, { "retry-after": "soon" }), now)).toBe("the rate limit of GitHub asks for a wait (retry-after)");
+    expect(rateLimitText(answer(403, {}), now)).toBeNull();
   });
 
   it("tries again after a network error, and throws the last error after the cap", async () => {
