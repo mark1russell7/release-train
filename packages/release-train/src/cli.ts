@@ -5,7 +5,10 @@ import type { HoldReading, LagHold } from "./holds.ts";
 import { applyHolds, lagOver, lagReport, lagSummary } from "./lag.ts";
 import type { LagReport } from "./lag.ts";
 import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, pendingVersions, publicReport } from "./apply.ts";
+import type { ApplyReport } from "./apply.ts";
+import { budgetGate, DEFAULT_NEED, DEFAULT_WAIT_MINUTES, goOnUrgent } from "./budget.ts";
 import { collect, listRepos, pool } from "./collect.ts";
+import type { FetchFn } from "./collect.ts";
 import { writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
 import { plan } from "./plan.ts";
@@ -22,6 +25,7 @@ import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
 import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tagsSummary, validDate } from "./tags.ts";
 import { versionFixRun, versionFixSummary } from "./version-fix.ts";
 import { gitUpdater } from "./workspace.ts";
+import { requestMeter } from "./meter.ts";
 
 /** The options of the command line. */
 export interface CliOptions {
@@ -54,6 +58,10 @@ export interface CliOptions {
   workflows: WorkflowsMode;
   /** `apply`: the most branches that one run pushes, for the update pushes and the sync pushes together. */
   maxPushes: number;
+  /** `apply`: the GitHub requests that a run needs at its start. With fewer requests, the run waits for the reset or stops. 0 turns off the gate. */
+  rateNeed: number;
+  /** `apply`: the longest wait for the reset of the rate limit, in minutes. */
+  rateWait: number;
   /** `apply`: the public packages with a security fix. Their updates go first and pass the limit of pushes. */
   urgent: string[] | null;
   /** `apply`: the run takes the urgent names of each run that it replaced. Only a live run sets this option. */
@@ -109,6 +117,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     sync: true,
     workflows: "auto",
     maxPushes: MAX_PUSHES,
+    rateNeed: DEFAULT_NEED,
+    rateWait: DEFAULT_WAIT_MINUTES,
     urgent: null,
     takeReplaced: false,
     since: defaultSince(),
@@ -166,6 +176,16 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       const v = Number(value());
       if (!Number.isInteger(v) || v < 0) throw new Error(`--max-pushes needs a whole number of 0 or more.`);
       o.maxPushes = v;
+    }
+    else if (a === "--rate-need") {
+      const v = Number(value());
+      if (!Number.isInteger(v) || v < 0) throw new Error(`--rate-need needs a whole number of 0 or more.`);
+      o.rateNeed = v;
+    }
+    else if (a === "--rate-wait") {
+      const v = Number(value());
+      if (!Number.isFinite(v) || v < 0) throw new Error(`--rate-wait needs a number of minutes of 0 or more.`);
+      o.rateWait = v;
     }
     else if (a === "--workflows") {
       const v = value().trim();
@@ -404,11 +424,25 @@ async function planSync(p: Plan, tok: string | null, workflows: WorkflowsMode, l
   return items.filter((i): i is SyncPlanItem => i !== null);
 }
 
+/** The parts of the command `apply` that a test replaces. */
+export interface ApplyDeps {
+  /** The `fetch` of the run. The default is the global `fetch`. */
+  fetch?: FetchFn;
+  /** This function gives the current time, in milliseconds after the epoch. The default is `Date.now`. */
+  now?: () => number;
+  /** This function waits for a time in milliseconds. The default timer keeps the Node process alive (budget.ts). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
 /**
  * The apply command: it plans with all repositories of the token, then applies the adoptions of the current wave.
  * Its output and its report give each private repository only as a hash. In GitHub Actions, it also masks the private names.
+ *
+ * - Before the first read of a repository, the gate of the rate budget waits for the reset or stops the run (budget.ts).
+ * - A stop gives the exit code 0. The run still writes the report, so the next steps of `train.yml` can read it.
+ * - The meter counts each GitHub request of the run by its route (meter.ts). The report and the summary give the counts.
  */
-async function runApply(o: CliOptions): Promise<number> {
+export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<number> {
   const tok = token();
   if (!tok) {
     process.stderr.write("apply needs a token in GH_TOKEN.\n");
@@ -429,15 +463,58 @@ async function runApply(o: CliOptions): Promise<number> {
     return o.showPrivate ? text : redactNames(text, secrets, key);
   };
   const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);
+  const now = deps.now ?? Date.now;
+  // The end of each run: the report without private names, the step summary and the summary on standard output.
+  const finish = (report: ApplyReport): number => {
+    const out = o.showPrivate ? report : publicReport(report, key);
+    const text = redact(applySummary(out));
+    if (o.report) writeFileSync(o.report, `${redact(JSON.stringify(out, null, 2))}\n`);
+    const summaryFile = process.env["GITHUB_STEP_SUMMARY"];
+    if (summaryFile) appendFileSync(summaryFile, ["", "```", text, "```", ""].join("\n"));
+    process.stdout.write(`${text}\n`);
+    return 0;
+  };
   try {
     const read = o.state === undefined ? null : readState(o.state);
     if (read?.note) log(read.note);
-    const gh = gitHub({ token: tok });
+    // The meter counts each GitHub request of the run by its route. Each part of the run that takes a fetch gets its fetch.
+    const meter = requestMeter(deps.fetch);
+    const gh = gitHub({ token: tok, fetch: meter.fetch });
+    // The gate reads the rate limit (GitHub does not count GET /rate_limit). With too few requests left, it waits for the
+    // reset on a timer that keeps Node alive, or it gives a stop. Its last read is the read at the start of the run.
+    const gate = await budgetGate({
+      need: o.rateNeed,
+      maxWaitMs: o.rateWait * 60_000,
+      read: () => readRateLimit(gh),
+      ...(deps.now ? { now: deps.now } : {}),
+      ...(deps.sleep ? { sleep: deps.sleep } : {}),
+    });
+    let gateRecord = gate.record;
+    log(gateRecord.note);
+    let urgent: string[] | null | undefined;
+    if (gateRecord.outcome === "stop") {
+      urgent = await urgentNames(o, gh, log);
+      if (urgent === null || urgent.length === 0) {
+        if (inActions) process.stdout.write(`::notice::${gateRecord.note}\n`);
+        // The state file stays as the cache gave it. The step "Wait for a release" reads the report: it has no version in flight.
+        return finish({
+          owner: o.owner,
+          at: new Date(now()).toISOString(),
+          dryRun: o.dryRun,
+          results: [],
+          inFlight: [],
+          rateLimit: { start: gate.read, end: await readRateLimit(gh), routes: meter.routes(), gate: gateRecord },
+        });
+      }
+      gateRecord = goOnUrgent(gateRecord);
+      log(gateRecord.note);
+    }
     // The reads of the rate limit at the start and at the end give the GitHub requests of the run. A failed read is no read.
-    const rateStart = await readRateLimit(gh);
+    const rateStart = gate.read;
     const data = await collect({
       owner: o.owner,
       token: tok,
+      fetch: meter.fetch,
       log,
       onRepos: (repos) => hide(repos.filter((r) => r.private).map((r) => r.name)),
       ...(read ? { npmTimes: read.state.npm } : {}),
@@ -447,7 +524,7 @@ async function runApply(o: CliOptions): Promise<number> {
     const p = plan(graph);
     // Without a state file the train keeps no first sight of a need, so the run gives no start for a need with no publish time.
     const starts = read ? needStarts(data.npm, read.state.seen, (o.now ?? new Date()).toISOString(), (k) => hashName(k, key)) : null;
-    const updater = gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author) });
+    const updater = gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author), fetch: meter.fetch });
     const report = await apply({
       owner: o.owner,
       plan: p,
@@ -456,11 +533,11 @@ async function runApply(o: CliOptions): Promise<number> {
       sync: o.sync
         ? {
             updater,
-            facts: await syncFacts({ gh, owner: o.owner }),
+            facts: await syncFacts({ gh, owner: o.owner, fetch: meter.fetch }),
             workflows: o.workflows,
           }
         : null,
-      ...paceOptions({ ...o, urgent: await urgentNames(o, gh, log) }),
+      ...paceOptions({ ...o, urgent: urgent !== undefined ? urgent : await urgentNames(o, gh, log) }),
       runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
       dryRun: o.dryRun,
       only: o.only,
@@ -471,19 +548,13 @@ async function runApply(o: CliOptions): Promise<number> {
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
       ...(starts ? { needSince: (u) => starts.since(u.repo, u.items) } : {}),
     });
-    report.rateLimit = { start: rateStart, end: await readRateLimit(gh) };
+    report.rateLimit = { start: rateStart, end: await readRateLimit(gh), routes: meter.routes(), gate: gateRecord };
     if (o.state !== undefined && starts) {
       writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen() })}\n`);
       const c = starts.counts();
       log(`need starts: ${c.npm} from npm, ${c.state} from the state`);
     }
-    const out = o.showPrivate ? report : publicReport(report, key);
-    const text = redact(applySummary(out));
-    if (o.report) writeFileSync(o.report, `${redact(JSON.stringify(out, null, 2))}\n`);
-    const summaryFile = process.env["GITHUB_STEP_SUMMARY"];
-    if (summaryFile) appendFileSync(summaryFile, ["", "```", text, "```", ""].join("\n"));
-    process.stdout.write(`${text}\n`);
-    return 0;
+    return finish(report);
   } catch (e) {
     process.stderr.write(`${redact(e instanceof Error ? e.message : String(e))}\n`);
     return 1;
