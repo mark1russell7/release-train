@@ -8,6 +8,7 @@ import { pool } from "./collect.ts";
 import { rateLimitLine } from "./github.ts";
 import type { GitHub, RateLimitReport } from "./github.ts";
 import { holdsUpdate } from "./holds.ts";
+import { routeLines } from "./meter.ts";
 import type { LagHold } from "./holds.ts";
 import { adoptWhy, moveSets } from "./plan.ts";
 import type { Action, ActionItem, Plan } from "./plan.ts";
@@ -1045,7 +1046,11 @@ export function applySummary(r: ApplyReport): string {
       lines.push("");
     }
   }
-  if (r.rateLimit) lines.push(rateLimitLine(r.rateLimit));
+  if (r.rateLimit) {
+    if (r.rateLimit.gate) lines.push(r.rateLimit.gate.note);
+    lines.push(rateLimitLine(r.rateLimit));
+    if (r.rateLimit.routes) lines.push(...routeLines(r.rateLimit.routes));
+  }
   const counts = new Map<RepoState, number>();
   for (const x of r.results) counts.set(x.state, (counts.get(x.state) ?? 0) + 1);
   lines.push(`States: ${[...counts].map(([k, v]) => `${v} ${k}`).join(", ") || "none"}`, "");

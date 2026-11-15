@@ -95,6 +95,8 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 - `--release-dispatch` starts the release workflows that start only by hand. Refer to "Releases".
 - `--max-pushes <n>` is the most branches that one run pushes (default 5). The update branches and the sync branches share this limit. The other repositories get `waiting`, and a later run pushes them.
 - `--urgent <packages>` names public packages with a security fix (comma-separated). Refer to "An urgent update".
+- `--rate-need <n>` is the count of GitHub requests that a run needs at its start (default 6000). `0` turns off the gate. Refer to "The rate budget".
+- `--rate-wait <minutes>` is the longest wait for the reset of the rate limit (default 20). Refer to "The rate budget".
 
 ### A partial update
 
@@ -196,6 +198,21 @@ The facts cost GitHub requests, all with GET. CI costs 3, mergeable 1, behind 1,
 Each result with the state `merged` has the field `mergedBehind` in the report. It is the count of the commits of the default branch that were not in the branch at the merge. Null tells that the train has no read. The strict rule merges only at 0. The field is a count, so the report keeps it for a private repository.
 
 The run also reads `GET /rate_limit` at the start and at the end. The summary and the report give the limit, the used count at the start and at the end, the count left and the reset time. A failed read shows "no read" and does not stop the run.
+
+### The rate budget
+
+The token of the GitHub App has 10,200 requests in one hour. On 2026-11-15, one run used 73 to 9,768 requests, and the median was approximately 2,600. Three runs used the full limit, and the run after each one failed. Thus each run has a gate and a meter.
+
+The gate (`src/budget.ts`) reads the rate limit before the first read of a repository. GitHub does not count this read.
+
+- When the count left is the need or more, the run goes on. The need is `--rate-need` (default 6000, approximately the 90th percentile of the runs), but not more than the limit of the token.
+- When fewer requests are left and the reset comes in `--rate-wait` minutes or less (default 20), the run waits until the reset plus 15 seconds. Then it reads the limit again and goes on. The timer of the wait keeps the Node process alive, so the run does not end during the wait.
+- When the reset comes later, the run stops with a note and the exit code 0. It writes the report with no result, so the next steps of the workflow can read it. A run with urgent names does not stop, because only the title of a run holds them.
+- When the read fails, the run goes on.
+
+The job of `train.yml` stops after 60 minutes. The longest of 60 runs before 2026-11-15 took 31 minutes, with the wait for a release. Thus the default wait of 20 minutes and such a run stay below 60 minutes.
+
+The meter (`src/meter.ts`) counts each GitHub request of the run by its route. A route is the method and the path, and each segment that is not a word of the API becomes a placeholder, for example `GET /repos/{owner}/{repo}/pulls/{number}`. Thus a route has no name of a repository, a branch or a file. The meter counts the answers 304 and the failures, and each try of a retry. It does not count `GET /rate_limit` and the requests to npm. The report (`rateLimit.routes`) and the summary give the routes, with the largest count first.
 
 Some steps still use the strict rule in each mode. They are the open update pull request of a repository that waits for a release, the pull requests with the label `train-merge` and the releases.
 

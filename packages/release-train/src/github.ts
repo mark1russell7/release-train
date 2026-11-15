@@ -1,5 +1,7 @@
 import { nextLink } from "./collect.ts";
 import type { FetchFn, PageRead } from "./collect.ts";
+import type { GateRecord } from "./budget.ts";
+import type { RouteCount } from "./meter.ts";
 
 /** The result of one request to the GitHub API. */
 export interface GhResponse<T> {
@@ -92,6 +94,10 @@ export interface RateLimitRead {
 export interface RateLimitReport {
   start: RateLimitRead | null;
   end: RateLimitRead | null;
+  /** The GitHub requests of the run by route, with the largest count first. A route template has no name (meter.ts). */
+  routes?: RouteCount[];
+  /** The decision of the rate budget at the start of the run (budget.ts). */
+  gate?: GateRecord;
 }
 
 /**
