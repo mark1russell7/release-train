@@ -168,10 +168,10 @@ importers:
     devDependencies:
       '@mark1russell7/api-report':
         specifier: ^0.5.3
-        version: 0.5.7
+        version: 0.5.8
       '@mark1russell7/conventions':
-        specifier: ^0.41.0
-        version: 0.41.14
+        specifier: ^0.42.2
+        version: 0.42.2
       '@mark1russell7/cue':
         specifier: github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8
         version: https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8
@@ -180,7 +180,7 @@ importers:
         version: https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905
       '@mark1russell7/template-cli':
         specifier: ^0.1.0
-        version: 0.1.7
+        version: 0.1.8
       publint:
         specifier: ^0.3.25
         version: 0.3.25
@@ -194,14 +194,14 @@ importers:
   packages/release-train:
     dependencies:
       '@mark1russell7/conventions':
-        specifier: ^0.41.0
-        version: 0.41.14
+        specifier: ^0.42.2
+        version: 0.42.2
       '@mark1russell7/service':
         specifier: ^0.9.0
         version: 0.9.0(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
       '@mark1russell7/text':
-        specifier: ^0.0.6
-        version: 0.0.6
+        specifier: ^0.0.9
+        version: 0.0.9
       '@procedures/shell':
         specifier: ^0.55.0
         version: 0.55.2
@@ -483,8 +483,8 @@ packages:
       zod:
         optional: true
 
-  '@mark1russell7/api-report@0.5.7':
-    resolution: {integrity: sha512-Oe69KbJhZL6GIrbEwNVIFN+Yz5XLjgEt78CrQZFX7vdeGANWuRyDCoLQaebumVuyip52WpPt19ZQU7n3Oj5WmQ==}
+  '@mark1russell7/api-report@0.5.8':
+    resolution: {integrity: sha512-HS395EG0QBs2uA4EZ8gLak2m6YMqkC8XqPagNuE36uY8F6YZmb9Xz5SEr52Gv/6fb6J8JTXpw/zfkZeDAXcdHQ==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -499,8 +499,8 @@ packages:
     resolution: {integrity: sha512-s2DyC8i8JhP0Ue6oG+dLUHrjwvUjz+UQrrSIViLkDdU0t+LhLChLrkRpcwr/eof62ffOSPXifLVYuzM7alEEPw==}
     engines: {node: '>=22.12'}
 
-  '@mark1russell7/conventions@0.41.14':
-    resolution: {integrity: sha512-GqmF9TE9SWnkj+heyy8addISBS7Q+q3tbvof40QpaxNmulixVoUROUIullzuvfl27yUBVED2RL/eBUaXe/AZFg==}
+  '@mark1russell7/conventions@0.42.2':
+    resolution: {integrity: sha512-eBY4JGYEqALMfORcQIHr//VFM3W4H+4qYzYJkWkoG+VPEy0nObFU+jYf9OOv48wAou4ZSFBrxl+vOw1ciDEtxA==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -627,13 +627,17 @@ packages:
     engines: {node: '>=22'}
     hasBin: true
 
-  '@mark1russell7/template-cli@0.1.7':
-    resolution: {integrity: sha512-Wy4xa6OgNXyMunSyXOArxmrspLSCuyw1pf1P5X45Uiwe1aWHzn0LJptUYVGUSwT3GTp9FGVDhFMeOnKlapD3Xw==}
+  '@mark1russell7/template-cli@0.1.8':
+    resolution: {integrity: sha512-uGzXp++PCRl+jTwVPZHGm9PkH4jmRx//xbphjE/KP2JA/WyWJ9XTyjRRQvWcVzoUN/hTDnfMNaGBFlT8wdwhUg==}
     engines: {node: '>=22.12'}
     hasBin: true
 
   '@mark1russell7/text@0.0.6':
     resolution: {integrity: sha512-IwKQHx9U+k5AbEzZ8q4CxImQCuYXSFhvzMOSgy5UGYrZRIBO9RES7SYrXDrKqQFtMl5qD2QbibffevUPsrUW+A==}
+    engines: {node: '>=22.12'}
+
+  '@mark1russell7/text@0.0.9':
+    resolution: {integrity: sha512-/3ADyx7QaRMWkQZ118NPzVmciSZg6awrSilZBpzB7LzjQxwVjRaK6R5/fobscKgKWWqGP7NkoKVhZNfx0S1tUA==}
     engines: {node: '>=22.12'}
 
   '@opentelemetry/api@1.10.0':
@@ -1404,9 +1408,9 @@ snapshots:
     optionalDependencies:
       zod: 4.6.7
 
-  '@mark1russell7/api-report@0.5.7':
+  '@mark1russell7/api-report@0.5.8':
     dependencies:
-      '@mark1russell7/conventions': 0.41.14
+      '@mark1russell7/conventions': 0.42.2
 
   '@mark1russell7/coeval@0.29.0(zod@4.6.7)':
     dependencies:
@@ -1431,7 +1435,7 @@ snapshots:
     transitivePeerDependencies:
       - zod
 
-  '@mark1russell7/conventions@0.41.14':
+  '@mark1russell7/conventions@0.42.2':
     dependencies:
       yaml: 2.9.1
 
@@ -1501,11 +1505,13 @@ snapshots:
     dependencies:
       typescript: 6.0.3
 
-  '@mark1russell7/template-cli@0.1.7':
+  '@mark1russell7/template-cli@0.1.8':
     dependencies:
       '@clack/prompts': 1.8.1
 
   '@mark1russell7/text@0.0.6': {}
+
+  '@mark1russell7/text@0.0.9': {}
 
   '@opentelemetry/api@1.10.0': {}
 

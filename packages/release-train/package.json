@@ -21,9 +21,9 @@
     "vitest": "^5.0.3"
   },
   "dependencies": {
-    "@mark1russell7/conventions": "^0.41.0",
+    "@mark1russell7/conventions": "^0.42.2",
     "@mark1russell7/service": "^0.9.0",
-    "@mark1russell7/text": "^0.0.6",
+    "@mark1russell7/text": "^0.0.9",
     "@procedures/shell": "^0.55.0",
     "semver": "^7.8.5",
     "yaml": "^2.9.1"
