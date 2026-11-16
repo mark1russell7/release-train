@@ -1,6 +1,6 @@
 // The rate budget of a run of apply. Before the run reads a repository, the gate compares the requests that are left with
 // the requests that a run needs. When too few are left, the run waits for the reset, or it stops with a note.
-import { platformClock } from "@mark1russell7/service/clock";
+import { realClock } from "@mark1russell7/service/clock";
 import type { RateLimitRead } from "./github.ts";
 
 /**
@@ -90,16 +90,13 @@ export interface GateResult {
   read: RateLimitRead | null;
 }
 
-/** The clock of the waits. Its timers keep the Node process alive. */
-const waitClock = platformClock({ unref: false });
-
 /**
- * This function waits on a timer of `platformClock` of `@mark1russell7/service`. The timer keeps the Node process alive.
- * A timer with `unref` lets Node end the process during the wait with the exit code 0, and the work of the run stops.
+ * This function waits on a timer of `realClock` of `@mark1russell7/service`. Since 0.9.0, the timer keeps the Node process
+ * alive. A timer with `unref` lets Node end the process during the wait with the exit code 0, and the work of the run stops.
  */
 export function keepAliveSleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    waitClock.after(ms, resolve);
+    realClock.after(ms, resolve);
   });
 }
 
