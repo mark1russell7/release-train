@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { summary } from "./cli.ts";
 import { retryAfterDelay, type Clock } from "@mark1russell7/service";
-import { collect, HttpError, manifestFolder, nextLink, patchVersion, rateLimited, rateLimitText, rateLimitWait, runtimeRanges } from "./collect.ts";
-import type { FetchFn } from "./collect.ts";
+import { collect, HttpError, listRepos, manifestFolder, nextLink, patchVersion, rateLimited, rateLimitText, rateLimitWait, runtimeRanges, tokenKind } from "./collect.ts";
+import type { FetchFn, GhRepo, PageRead } from "./collect.ts";
 import { docId, writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
 import { matchWorkspaces, parseNpmLock, parsePnpmLock, parseSpec } from "./parse.ts";
@@ -591,5 +591,80 @@ describe("nextLink", () => {
     const start = performance.now();
     expect(nextLink(header)).toBeNull();
     expect(performance.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe("listRepos", () => {
+  const INSTALL = "/installation/repositories?per_page=100";
+  const PUBLIC = "/users/example-owner/repos?type=owner&per_page=100";
+  const OWNER_LIST = "/user/repos?affiliation=owner&visibility=all&per_page=100";
+  const repo = (name: string, extra: Partial<GhRepo> = {}): GhRepo => ({ name, private: false, archived: false, fork: false, default_branch: "main", owner: { login: "example-owner" }, ...extra });
+  // A page read with fixed pages, which records each URL. A URL with no page throws, as a failed read of GitHub.
+  const pages = (table: Record<string, { data: unknown; next?: string }>, seen: string[]): PageRead =>
+    async <T>(url: string): Promise<{ data: T; next: string | null }> => {
+      seen.push(url);
+      const page = table[url];
+      if (page === undefined) throw new HttpError(403, url);
+      return { data: page.data as T, next: page.next ?? null };
+    };
+  const opts = (token: string | null, publicOnly = false) => ({ owner: "example-owner", token, publicOnly });
+
+  it("gives the kind of a token from its prefix", () => {
+    expect(tokenKind("ghs_abc")).toBe("installation");
+    for (const token of ["ghp_abc", "github_pat_abc", "gho_abc", "ghu_abc"]) expect(tokenKind(token)).toBe("user");
+    expect(tokenKind("0123456789abcdef0123456789abcdef01234567")).toBe("unknown");
+    expect(tokenKind("t")).toBe("unknown");
+  });
+
+  it("lists each page of the installation of an installation token, also the private repositories", async () => {
+    const seen: string[] = [];
+    const read = pages({
+      [INSTALL]: { data: { repositories: [repo("b"), repo("secret-app", { private: true })] }, next: `${INSTALL}&page=2` },
+      [`${INSTALL}&page=2`]: { data: { repositories: [repo("a"), repo("old", { archived: true })] } },
+    }, seen);
+    expect((await listRepos(read, opts("ghs_x"))).map((r) => r.name)).toEqual(["a", "b", "secret-app"]);
+    expect(seen).toEqual([INSTALL, `${INSTALL}&page=2`]);
+  });
+
+  it("throws the error of the installation list of an installation token, and does not read the public list", async () => {
+    // The fault of 2026-11-15: a 403 of the installation list gave the public list, with no private repository
+    const seen: string[] = [];
+    const error = await listRepos(pages({ [PUBLIC]: { data: [repo("a")] } }, seen), opts("ghs_x")).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(HttpError);
+    expect((error as HttpError).message).toBe(`HTTP 403 for ${INSTALL}`);
+    expect(seen).toEqual([INSTALL]);
+  });
+
+  it("lists each repository of the owner with the token of the owner, and the public list with the token of another person", async () => {
+    const own: string[] = [];
+    const mine = await listRepos(pages({ "/user": { data: { login: "Example-Owner" } }, [OWNER_LIST]: { data: [repo("secret-app", { private: true })] } }, own), opts("gho_x"));
+    expect(mine.map((r) => r.name)).toEqual(["secret-app"]);
+    expect(own).toEqual(["/user", OWNER_LIST]);
+    const other: string[] = [];
+    const theirs = await listRepos(pages({ "/user": { data: { login: "someone-else" } }, [PUBLIC]: { data: [repo("a")] } }, other), opts("ghp_x"));
+    expect(theirs.map((r) => r.name)).toEqual(["a"]);
+    expect(other).toEqual(["/user", PUBLIC]);
+  });
+
+  it("throws the error of /user for the token of a person", async () => {
+    const seen: string[] = [];
+    const error = await listRepos(pages({ [PUBLIC]: { data: [repo("a")] } }, seen), opts("github_pat_x")).catch((e: unknown) => e);
+    expect((error as HttpError).message).toBe("HTTP 403 for /user");
+    expect(seen).toEqual(["/user"]);
+  });
+
+  it("finds the list of a token with no known prefix by its reads", async () => {
+    const seen: string[] = [];
+    const list = await listRepos(pages({ [PUBLIC]: { data: [repo("a"), repo("copy", { fork: true })] } }, seen), opts("t"));
+    expect(list.map((r) => r.name)).toEqual(["a"]);
+    expect(seen).toEqual(["/user", INSTALL, PUBLIC]);
+  });
+
+  it("reads only the public list with no token or with publicOnly, and publicOnly removes the private repositories", async () => {
+    const seen: string[] = [];
+    const read = pages({ [PUBLIC]: { data: [repo("a"), repo("secret-app", { private: true })] } }, seen);
+    expect((await listRepos(read, opts("ghs_x", true))).map((r) => r.name)).toEqual(["a"]);
+    expect((await listRepos(read, opts(null))).map((r) => r.name)).toEqual(["a", "secret-app"]);
+    expect(seen).toEqual([PUBLIC, PUBLIC]);
   });
 });

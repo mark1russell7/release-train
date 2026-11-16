@@ -207,9 +207,21 @@ export function nextLink(header: string | null): string | null {
 export type PageRead = <T>(url: string) => Promise<{ data: T; next: string | null }>;
 
 /**
- * This function lists the repositories of an owner that a token can read, with no archive and no fork. The token of the
- * owner lists the private repositories with `/user/repos`. The token of a GitHub App installation lists them with
- * `/installation/repositories`. Another token lists the public repositories.
+ * The kind of a GitHub token, from its prefix. `installation` is a token of a GitHub App installation (`ghs_`), also the
+ * token of a workflow. `user` is a token of a person (`ghp_`, `github_pat_`, `gho_`, `ghu_`). `unknown` is another text.
+ */
+export type TokenKind = "installation" | "user" | "unknown";
+
+/** This function gives the kind of a GitHub token from the prefix that GitHub gives each kind of token. */
+export function tokenKind(token: string): TokenKind {
+  if (token.startsWith("ghs_")) return "installation";
+  return ["ghp_", "github_pat_", "gho_", "ghu_"].some((prefix) => token.startsWith(prefix)) ? "user" : "unknown";
+}
+
+/**
+ * This function lists the repositories of an owner that a token can read, with no archive and no fork. The prefix of the
+ * token gives the list. An installation token reads `/installation/repositories`. The token of the owner reads `/user/repos`.
+ * Another token reads the public repositories. An error of the read throws, because a different list is not a correct answer.
  */
 export async function listRepos(read: PageRead, opts: { owner: string; token: string | null; publicOnly: boolean }): Promise<GhRepo[]> {
   const paginate = async <T>(first: string): Promise<T[]> => {
@@ -222,38 +234,50 @@ export async function listRepos(read: PageRead, opts: { owner: string; token: st
     }
     return all;
   };
-  let listUrl = `/users/${opts.owner}/repos?type=owner&per_page=100`;
-  if (opts.token && !opts.publicOnly) {
-    try {
-      const me = await read<{ login?: string }>("/user");
-      if (me.data.login?.toLowerCase() === opts.owner.toLowerCase()) {
-        listUrl = "/user/repos?affiliation=owner&visibility=all&per_page=100";
-      }
-    } catch {
-      // A workflow token cannot read /user. The public list is correct for it.
+  const installationList = async (): Promise<GhRepo[]> => {
+    const all: GhRepo[] = [];
+    let url: string | null = "/installation/repositories?per_page=100";
+    while (url) {
+      const page: { data: { repositories: GhRepo[] }; next: string | null } = await read<{ repositories: GhRepo[] }>(url);
+      all.push(...page.data.repositories);
+      url = page.next;
     }
+    return all;
+  };
+  const keep = (repos: GhRepo[]): GhRepo[] =>
+    repos
+      .filter((r) => !r.archived && !r.fork)
+      .filter((r) => !(opts.publicOnly && r.private))
+      .filter((r) => !r.owner?.login || r.owner.login.toLowerCase() === opts.owner.toLowerCase())
+      .sort((a, b) => a.name.localeCompare(b.name));
+  const publicList = `/users/${opts.owner}/repos?type=owner&per_page=100`;
+  const ownerList = "/user/repos?affiliation=owner&visibility=all&per_page=100";
+  if (!opts.token || opts.publicOnly) return keep(await paginate<GhRepo>(publicList));
+  const kind = tokenKind(opts.token);
+  // The public list has no private repository, so it is not a correct answer for an installation token after a failed read
+  if (kind === "installation") return keep(await installationList());
+  if (kind === "user") {
+    const me = await read<{ login?: string }>("/user");
+    return keep(await paginate<GhRepo>(me.data.login?.toLowerCase() === opts.owner.toLowerCase() ? ownerList : publicList));
+  }
+  // A token with no known prefix, for example an old token of 40 hexadecimal digits: the reads find the kind of the token
+  let listUrl = publicList;
+  try {
+    const me = await read<{ login?: string }>("/user");
+    if (me.data.login?.toLowerCase() === opts.owner.toLowerCase()) listUrl = ownerList;
+  } catch {
+    // A workflow token cannot read /user. The public list is correct for it.
   }
   let listed: GhRepo[] | null = null;
-  if (opts.token && !opts.publicOnly && listUrl.startsWith("/users/")) {
+  if (listUrl === publicList) {
     // The token of a GitHub App installation lists its repositories, also the private ones.
     try {
-      const all: GhRepo[] = [];
-      let url: string | null = "/installation/repositories?per_page=100";
-      while (url) {
-        const page: { data: { repositories: GhRepo[] }; next: string | null } = await read<{ repositories: GhRepo[] }>(url);
-        all.push(...page.data.repositories);
-        url = page.next;
-      }
-      listed = all;
+      listed = await installationList();
     } catch {
       // A token that is not of an installation cannot read this list. The public list is correct for it.
     }
   }
-  return (listed ?? (await paginate<GhRepo>(listUrl)))
-    .filter((r) => !r.archived && !r.fork)
-    .filter((r) => !(opts.publicOnly && r.private))
-    .filter((r) => !r.owner?.login || r.owner.login.toLowerCase() === opts.owner.toLowerCase())
-    .sort((a, b) => a.name.localeCompare(b.name));
+  return keep(listed ?? (await paginate<GhRepo>(listUrl)));
 }
 
 /** This function reads the repositories, the manifests, the lockfiles and the npm state of one owner. */
