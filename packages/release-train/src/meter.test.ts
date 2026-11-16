@@ -3,7 +3,19 @@ import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import type { FetchFn } from "./collect.ts";
 import { gitHub, readRateLimit } from "./github.ts";
-import { JUMP_MIN, outsideLine, outsideUse, requestMeter, routeLines, routeTemplate } from "./meter.ts";
+import {
+  DISAGREE_MIN,
+  JUMP_MIN,
+  outsideLine,
+  outsideUse,
+  readsOutside,
+  refusalKind,
+  refusalLine,
+  requestMeter,
+  routeLines,
+  routeTemplate,
+  SAMPLE_MAX,
+} from "./meter.ts";
 
 const API = "https://api.github.com";
 const SHA = "0123456789abcdef0123456789abcdef01234567";
@@ -246,6 +258,114 @@ describe("the outside use of the rate limit", () => {
         expect(out.requests).toBe(outside);
         expect(out.jumps).toEqual(outside >= JUMP_MIN ? [{ at: new Date(cut * 10).toISOString(), size: outside }] : []);
       }),
+    );
+  });
+});
+
+describe("the evidence of the rate limit: samples, refusals and the two reads", () => {
+  const RESET = 1_800_000_000;
+  const ISO = new Date(RESET * 1000).toISOString();
+  /** A clock that moves one second at each read, from 2026-11-16 04:52:00Z. */
+  const ticks = (): (() => number) => {
+    let t = Date.parse("2026-11-16T04:52:00Z");
+    return () => (t += 1000);
+  };
+  const answer = (status: number, headers: Record<string, string>, body = "{}"): Response => new Response(body, { status, headers });
+
+  it("keeps each answer of core with its status, its remaining count and its route, and no name", async () => {
+    const answers = [
+      answer(200, { "x-ratelimit-used": "10", "x-ratelimit-remaining": "90", "x-ratelimit-reset": String(RESET) }),
+      answer(404, { "x-ratelimit-used": "11", "x-ratelimit-remaining": "89", "x-ratelimit-reset": String(RESET) }),
+      answer(200, { "x-ratelimit-used": "3", "x-ratelimit-reset": String(RESET), "x-ratelimit-resource": "graphql" }),
+    ];
+    const meter = requestMeter(async () => answers.shift() as Response, API, ticks());
+    await meter.fetch(`${API}/repos/secret-owner/secret-repo/pulls/7`);
+    await meter.fetch(`${API}/repos/secret-owner/secret-repo/contents/a/b.json`);
+    await meter.fetch(`${API}/graphql`, { method: "POST" });
+    expect(meter.samples()).toEqual([
+      { at: Date.parse("2026-11-16T04:52:01Z"), used: 10, reset: RESET, remaining: 90, status: 200, route: "GET /repos/{owner}/{repo}/pulls/{number}" },
+      { at: Date.parse("2026-11-16T04:52:02Z"), used: 11, reset: RESET, remaining: 89, status: 404, route: "GET /repos/{owner}/{repo}/contents/{path}" },
+    ]);
+    expect(JSON.stringify(meter.samples())).not.toMatch(/secret/);
+  });
+
+  it("keeps at most SAMPLE_MAX samples", async () => {
+    let used = 0;
+    const meter = requestMeter(async () => answer(200, { "x-ratelimit-used": String(++used), "x-ratelimit-reset": String(RESET) }), API, ticks());
+    for (let i = 0; i < SAMPLE_MAX + 3; i++) await meter.fetch(`${API}/repos/o/r`);
+    expect(meter.samples()).toHaveLength(SAMPLE_MAX);
+    expect(meter.outside().answers).toBe(SAMPLE_MAX);
+  });
+
+  it("gives the cause of each refusal from the status, the headers and the message", () => {
+    const h = (x: Record<string, string>): Headers => new Headers(x);
+    expect(refusalKind(200, h({}), "")).toBeNull();
+    expect(refusalKind(404, h({}), "Not Found")).toBeNull();
+    expect(refusalKind(403, h({ "x-ratelimit-remaining": "0" }), "")).toBe("primary");
+    expect(refusalKind(429, h({ "x-ratelimit-remaining": " 0 " }), "")).toBe("primary");
+    expect(refusalKind(403, h({ "x-ratelimit-remaining": "12" }), "API rate limit exceeded for installation.")).toBe("primary");
+    expect(refusalKind(403, h({ "retry-after": "60", "x-ratelimit-remaining": "40" }), "")).toBe("secondary");
+    expect(refusalKind(403, h({ "x-ratelimit-remaining": "40" }), "You have exceeded a secondary rate limit.")).toBe("secondary");
+    expect(refusalKind(403, h({ "x-ratelimit-remaining": "40" }), "Resource not accessible by integration")).toBe("other");
+  });
+
+  it("counts the refusals by cause, names the time of the first one, and leaves the body to the caller", async () => {
+    const answers = [
+      answer(403, { "x-ratelimit-remaining": "5" }, '{"message":"Resource not accessible by integration"}'),
+      answer(403, { "x-ratelimit-remaining": "0" }, '{"message":"API rate limit exceeded"}'),
+      answer(403, { "x-ratelimit-remaining": "5" }, '{"message":"You have exceeded a secondary rate limit"}'),
+      answer(429, { "retry-after": "30" }, "{}"),
+    ];
+    const meter = requestMeter(async () => answers.shift() as Response, API, ticks());
+    const bodies: string[] = [];
+    for (let i = 0; i < 4; i++) bodies.push(await (await meter.fetch(`${API}/repos/o/r`)).text());
+    expect(bodies[0]).toContain("Resource not accessible");
+    expect(bodies[1]).toContain("API rate limit exceeded");
+    // The first answer is a permission error, so the first refusal for a rate limit is the second answer.
+    expect(meter.refusals()).toEqual({ primary: 1, secondary: 2, other: 1, first: "2026-11-16T04:52:02.000Z" });
+    expect(refusalLine(meter.refusals())).toBe(
+      "GitHub refused 4 requests with 403 or 429: 1 for a spent rate limit, 2 for a secondary rate limit, 1 with no sign of a rate limit. The first refusal for a rate limit came at 04:52:02Z.",
+    );
+    expect(refusalLine({ primary: 0, secondary: 0, other: 0, first: null })).toBeNull();
+  });
+
+  it("puts each sample in its window, also when the samples of two windows alternate", () => {
+    // Two windows, A from 100 and B from 5,000. Each rises by one at each of its answers, and B has 30 outside requests.
+    const samples = Array.from({ length: 10 }, (_, i) =>
+      i % 2 === 0 ? { at: i, used: 100 + i / 2, reset: RESET } : { at: i, used: 5000 + (i - 1) / 2 + (i >= 5 ? 30 : 0), reset: RESET + 900 },
+    );
+    const out = outsideUse(samples);
+    expect(out.requests).toBe(30);
+    expect(out.jumps).toEqual([{ at: new Date(5).toISOString(), size: 30 }]);
+  });
+
+  it("gives the outside use from the two reads: the rise minus the counted requests of the meter", () => {
+    const routes = [
+      { route: "GET /repos/{owner}/{repo}", count: 1941, notModified: 0, failed: 209 },
+      { route: "GET /repos/{owner}/{repo}/pulls", count: 10, notModified: 4, failed: 0 },
+    ];
+    // Train 43805901480: 288 used at the start and 10,200 at the end, in one window.
+    expect(readsOutside({ used: 288, reset: ISO }, { used: 10_200, reset: ISO }, routes)).toBe(10_200 - 288 - 1941 - 6);
+    expect(readsOutside({ used: 288, reset: ISO }, { used: 10_200, reset: new Date((RESET + 30) * 1000).toISOString() }, routes)).toBe(7965);
+    expect(readsOutside({ used: 288, reset: ISO }, { used: 50, reset: new Date((RESET + 3600) * 1000).toISOString() }, routes)).toBeNull();
+    expect(readsOutside(null, { used: 50, reset: ISO }, routes)).toBeNull();
+    expect(readsOutside({ used: 1, reset: ISO }, undefined, routes)).toBeNull();
+    expect(readsOutside({ used: 1, reset: "no time" }, { used: 2, reset: ISO }, routes)).toBeNull();
+  });
+
+  it("gives both measures, and tells when they disagree", () => {
+    const zero = { requests: 0, answers: 1940, jumps: [] };
+    expect(outsideLine(zero, 7965)).toBe(
+      "GitHub requests outside the meter: 0, from 1940 answers. The two reads of GET /rate_limit give 7965. The two measures disagree, so neither count is a read. The report has each sample (rateLimit.samples).",
+    );
+    expect(outsideLine({ requests: 7900, answers: 1940, jumps: [] }, 7965)).toBe(
+      "GitHub requests outside the meter: 7900, from 1940 answers. The two reads of GET /rate_limit give 7965.",
+    );
+    expect(outsideLine(zero, DISAGREE_MIN)).not.toMatch(/disagree/);
+    expect(outsideLine(zero, DISAGREE_MIN + 1)).toMatch(/disagree/);
+    expect(outsideLine(zero, -(DISAGREE_MIN + 1))).toMatch(/disagree/);
+    expect(outsideLine({ requests: 0, answers: 0, jumps: [] }, 12)).toBe(
+      "GitHub requests outside the meter: no read from the answers (no answer had the header x-ratelimit-used). The two reads of GET /rate_limit give 12.",
     );
   });
 });
