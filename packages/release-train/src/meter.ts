@@ -183,12 +183,81 @@ export function routeTemplate(method: string, url: string, apiBase: string = GIT
   return `${/^[A-Z]+$/.test(verb) ? verb : "OTHER"} /${out.join("/")}`;
 }
 
+/**
+ * The use of the rate limit that the meter did not send. Another holder of the same installation, or a path of the run
+ * with no meter, uses the same budget. On 2026-11-16 a run sent 2,239 requests, but its token used 9,968.
+ */
+export interface OutsideUse {
+  /**
+   * The requests that the token used and the meter did not send. In each window, the count is the rise of
+   * `x-ratelimit-used` from the first to the last answer. The requests of the meter in the window are not in it.
+   */
+  requests: number;
+  /** The answers with the header `x-ratelimit-used` of the resource `core`. */
+  answers: number;
+  /** The largest rises between two answers of the meter, minus the one request of the meter, the largest first. */
+  jumps: { at: string; size: number }[];
+}
+
+/** The smallest rise that the list of jumps shows. A smaller rise can come from requests of the meter that are in flight at the same time. */
+export const JUMP_MIN = 20;
+
+/** The largest count of jumps in the record. */
+export const JUMP_COUNT = 5;
+
+/** One read of the headers of an answer: the time in ms, the used count and the reset in s. */
+interface UsedSample {
+  at: number;
+  used: number;
+  reset: number;
+}
+
+/**
+ * This function gives the outside use from the samples of the answers. A window of the rate limit ends when the reset
+ * moves by more than one minute. The reset of one window can differ by some seconds from one answer to the next.
+ */
+export function outsideUse(samples: readonly UsedSample[]): OutsideUse {
+  const sorted = [...samples].sort((a, b) => a.at - b.at || a.used - b.used);
+  const windows: UsedSample[][] = [];
+  for (const sample of sorted) {
+    const open = windows[windows.length - 1];
+    if (open && Math.abs(sample.reset - (open[0]?.reset ?? sample.reset)) <= 60) open.push(sample);
+    else windows.push([sample]);
+  }
+  let requests = 0;
+  const jumps: { at: string; size: number }[] = [];
+  for (const w of windows) {
+    const used = w.map((x) => x.used);
+    requests += Math.max(0, Math.max(...used) - Math.min(...used) - (w.length - 1));
+    let top = w[0]?.used ?? 0;
+    for (const x of w.slice(1)) {
+      const size = x.used - top - 1;
+      if (size >= JUMP_MIN) jumps.push({ at: new Date(x.at).toISOString(), size });
+      top = Math.max(top, x.used);
+    }
+  }
+  jumps.sort((a, b) => b.size - a.size || (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  return { requests, answers: sorted.length, jumps: jumps.slice(0, JUMP_COUNT) };
+}
+
+/** This function gives the sample of an answer, or null when the answer has no header of the rate limit of `core`. */
+function sampleOf(res: Response, at: number): UsedSample | null {
+  const resource = res.headers.get("x-ratelimit-resource");
+  if (resource !== null && resource !== "core") return null;
+  const used = res.headers.get("x-ratelimit-used");
+  const reset = res.headers.get("x-ratelimit-reset");
+  if (used === null || reset === null || !/^\d+$/.test(used.trim()) || !/^\d+$/.test(reset.trim())) return null;
+  return { at, used: Number(used), reset: Number(reset) };
+}
+
 /** A meter of the GitHub requests of a run. */
 export interface Meter {
   /** This `fetch` counts each request to the API, and it gives each other request to the inner `fetch` with no count. */
   readonly fetch: FetchFn;
   /** This function gives the count of each route, with the largest count first. */
   routes(): RouteCount[];
+  /** This function gives the use of the rate limit that the meter did not send. */
+  outside(): OutsideUse;
 }
 
 /**
@@ -197,10 +266,12 @@ export interface Meter {
  *
  * @param inner - The `fetch` that sends the requests. The default is the global `fetch`.
  * @param apiBase - The base of the API. The meter counts only the requests to this base.
+ * @param now - The clock of the samples of the rate limit, in ms. The default is `Date.now`.
  */
-export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API): Meter {
+export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API, now: () => number = Date.now): Meter {
   const send: FetchFn = inner ?? ((u, i) => fetch(u, i));
   const counts = new Map<string, RouteCount>();
+  const samples: UsedSample[] = [];
   const add = (route: string, status: number | null): void => {
     const row = counts.get(route) ?? { route, count: 0, notModified: 0, failed: 0 };
     row.count += 1;
@@ -220,13 +291,23 @@ export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API): Met
         throw error;
       }
       add(route, res.status);
+      const sample = sampleOf(res, now());
+      if (sample) samples.push(sample);
       return res;
     },
+    outside: () => outsideUse(samples),
     routes: () =>
       [...counts.values()]
         .map((row) => ({ ...row }))
         .sort((a, b) => b.count - a.count || (a.route < b.route ? -1 : a.route > b.route ? 1 : 0)),
   };
+}
+
+/** This function gives the line of the summary for the outside use. */
+export function outsideLine(o: OutsideUse): string {
+  if (o.answers === 0) return "GitHub requests outside the meter: no read (no answer had the header x-ratelimit-used).";
+  const jumps = o.jumps.map((j) => `${j.size} at ${j.at.slice(11, 19)}Z`).join(", ");
+  return `GitHub requests outside the meter: ${o.requests}, from ${o.answers} answers.${jumps ? ` The largest jumps: ${jumps}.` : ""}`;
 }
 
 /** This function gives the lines of the summary for the routes: one line with the totals, and a table with the largest count first. */
