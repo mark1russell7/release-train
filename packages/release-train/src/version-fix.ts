@@ -204,10 +204,10 @@ export function trainKind(body: string | null): string | null {
 
 /**
  * This function decides from the author and the branch if the version fix can act on a pull request. It acts only on a
- * group of non-breaking updates of Renovate, and on each update of the train. The train writes the version bump of a
- * breaking adoption in a runtime section itself (the cascade release), so the release check does not name that package.
- * A breaking adoption in a development section has no cascade. When such a development dependency is bundled into the
- * shipped files, the release check names the package, and the version fix adds its PATCH: the public API stays.
+ * group of non-breaking updates of Renovate, and on each update of the train. For a breaking adoption in a runtime
+ * section, the train writes the version bump itself (the cascade release). So the release check does not name that
+ * package. A breaking adoption in a development section has no cascade. A bundle can put such a dependency into the
+ * shipped files. Then the release check names the package, and the version fix adds its PATCH: the public API stays.
  */
 export function pullScope(pr: PullInfo, trainLogin: string | null): FixDecision | { act: true; source: "renovate" | "train" } {
   if (!pr.sameRepo) return skip("the head branch is in a fork");
