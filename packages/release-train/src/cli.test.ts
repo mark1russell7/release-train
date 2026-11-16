@@ -207,4 +207,46 @@ describe("runApply and the rate budget", () => {
     expect(summary).toContain("GitHub requests by route: none.");
     expect(stdout.mock.calls.map((c) => String(c[0])).join("")).toContain("::notice::Rate budget: 40 requests are left");
   });
+
+  it("ends the run with the exit code 0 when the guard stops it after the gate, and writes the stop in the report and the summary", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rate-guard-"));
+    const report = join(dir, "apply.json");
+    const summaryFile = join(dir, "summary.md");
+    writeFileSync(summaryFile, "");
+    vi.stubEnv("GH_TOKEN", "ghs_example");
+    vi.stubEnv("RELEASE_TRAIN_HASH_KEY", "example-key");
+    vi.stubEnv("GITHUB_ACTIONS", "true");
+    vi.stubEnv("GITHUB_STEP_SUMMARY", summaryFile);
+    const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const now = Date.parse("2026-11-15T12:00:00Z");
+    let counted = 0;
+    const fetch: FetchFn = async (url) => {
+      // A stale read at the start: it shows a large budget, so the gate lets the run go on.
+      if (url.endsWith("/rate_limit")) {
+        return new Response(JSON.stringify({ resources: { core: { limit: 10_250, used: 276, remaining: 9974, reset: now / 1000 + 34 * 60 } } }), { status: 200 });
+      }
+      if (!url.startsWith("https://api.github.com/")) return new Response("{}", { status: 404 });
+      counted++;
+      return new Response(JSON.stringify({ message: "API rate limit exceeded" }), {
+        status: 403,
+        headers: { "x-ratelimit-used": "10250", "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(now / 1000 + 45 * 60) },
+      });
+    };
+    const sleeps: number[] = [];
+    const sleep = async (ms: number): Promise<void> => {
+      sleeps.push(ms);
+    };
+    const code = await runApply(parseArgs(["apply", "--owner", "example-owner", "--report", report]), { fetch, now: () => now, sleep });
+    expect(code).toBe(0);
+    expect(sleeps).toEqual([]);
+    // GitHub refuses the first request of the run. The reset is after the longest wait, so no other request goes to GitHub.
+    expect(counted).toBe(1);
+    const written = JSON.parse(readFileSync(report, "utf8")) as { rateLimit: { guard: { stop: string } } };
+    expect(written).toMatchObject({ results: [], inFlight: [], rateLimit: { gate: { outcome: "go" }, guard: { sent: 1, repeats: 0, waitedMs: 0 } } });
+    expect(written.rateLimit.guard.stop).toContain("The reset at 2026-11-15T12:45:00.000Z is 45.0 minutes away");
+    const summary = readFileSync(summaryFile, "utf8");
+    expect(summary).toContain("Rate guard: GitHub refused a request, because the rate limit is spent until 2026-11-15T12:45:00.000Z.");
+    expect(stdout.mock.calls.map((c) => String(c[0])).join("")).toContain("::notice::Rate guard: GitHub refused a request");
+  });
 });

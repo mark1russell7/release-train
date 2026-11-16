@@ -2,6 +2,7 @@
 // variable segment replaced. The template holds only the words of the API and the placeholders, so it holds no name of
 // a repository, a branch or a file, and the public report can show it.
 import type { FetchFn } from "./collect.ts";
+import type { RateLimitRead } from "./github.ts";
 
 /** The base of the REST API of GitHub. */
 export const GITHUB_API = "https://api.github.com";
@@ -127,6 +128,12 @@ const NAMED: ReadonlyMap<string, string> = new Map([
 
 /** The routes that GitHub does not count in the rate limit. The meter does not count them. */
 const FREE: ReadonlySet<string> = new Set(["GET /rate_limit"]);
+
+/** This function tells if the rate limit counts a request: a request to the API, but not a route of `FREE`. */
+export function countedRequest(url: string, init?: RequestInit, apiBase: string = GITHUB_API): boolean {
+  const route = routeTemplate(init?.method ?? "GET", url, apiBase);
+  return route !== null && !FREE.has(route);
+}
 
 /** This function gives the placeholder of a segment that is not a word of the API. */
 function placeholder(segment: string, after: string | undefined): string {
@@ -314,10 +321,103 @@ async function refusalMessage(res: Response): Promise<string> {
   }
 }
 
+/** One window of the rate limit in the live budget. */
+export interface RateWindow {
+  /** The reset of the window, in seconds after the epoch. It is the reset of the first read of the window. */
+  reset: number;
+  /** The limit of the window: the lowest sum of the used count and the remaining count of its reads. */
+  limit: number;
+  /** The highest used count of the reads of the window. */
+  used: number;
+}
+
+/** One read of the rate limit for the live budget. The reset is in seconds after the epoch. */
+export interface RateRead {
+  used: number;
+  /** The remaining count, or null when the answer does not have it. Then the read needs a window with a known limit. */
+  remaining: number | null;
+  reset: number;
+}
+
+/**
+ * The live budget of the rate limit of `core`. It takes the used count, the remaining count and the reset of each answer
+ * and of each read of `GET /rate_limit`.
+ *
+ * - A window holds the reads whose reset is in one minute of its reset, as `outsideUse` groups them. It keeps the highest
+ *   used count, so a stale read cannot raise the budget of its window again.
+ * - The live budget is the window with the fewest requests left, of the windows that have not reset.
+ *
+ * On 2026-11-16, the first read of a new token gave 276 used, with the reset 18:14:29Z. The first 8 answers gave 277 to
+ * 284 used, with the reset 18:14:28Z. From answer 9, the answers gave the true window: 9,246 to 10,250 used, with the reset
+ * 18:01:55Z (Train 43920794285). Thus a stale read can have a different reset. With the fewest requests left, a stale
+ * read cannot raise the budget while the true window is live.
+ */
+export interface RateTracker {
+  /** This function adds the read of an answer. */
+  observe(read: RateRead): void;
+  /** This function adds a read of `GET /rate_limit`. */
+  seed(read: RateLimitRead): void;
+  /** This function gives the live budget at a time in milliseconds after the epoch, or null when no window is live. */
+  live(now: number): RateLimitRead | null;
+  /** This function gives a copy of the windows, with the earliest reset first. */
+  windows(): RateWindow[];
+}
+
+/** This function makes an empty tracker of the live budget. */
+export function rateTracker(): RateTracker {
+  const windows: RateWindow[] = [];
+  const observe = (read: RateRead): void => {
+    const known = windows.find((w) => Math.abs(read.reset - w.reset) <= WINDOW_SLACK_S);
+    const limit = read.remaining === null ? (known?.limit ?? null) : read.used + read.remaining;
+    if (limit === null) return;
+    if (known === undefined) {
+      windows.push({ reset: read.reset, limit, used: read.used });
+      return;
+    }
+    known.used = Math.max(known.used, read.used);
+    known.limit = Math.min(known.limit, limit);
+  };
+  return {
+    observe,
+    seed: (read) => {
+      const reset = Date.parse(read.reset);
+      if (Number.isFinite(reset)) observe({ used: read.used, remaining: read.remaining, reset: Math.floor(reset / 1000) });
+    },
+    live: (now) => {
+      let low: RateWindow | null = null;
+      for (const w of windows) {
+        if (w.reset * 1000 <= now) continue;
+        const left = w.limit - w.used;
+        if (low === null || left < low.limit - low.used || (left === low.limit - low.used && w.reset < low.reset)) low = w;
+      }
+      if (low === null) return null;
+      return { limit: low.limit, used: low.used, remaining: Math.max(0, low.limit - low.used), reset: new Date(low.reset * 1000).toISOString() };
+    },
+    windows: () => windows.map((w) => ({ ...w })).sort((a, b) => a.reset - b.reset),
+  };
+}
+
+/**
+ * This error stops a run. The rate limit is spent, and its reset comes after the longest wait or after the one wait of
+ * the run. Its message names the reset time. The caller ends the run with the note and the exit code 0. The guard of
+ * the run throws it (budget.ts), and `collect` gives it no new try.
+ */
+export class RateStop extends Error {
+  /** The reset of the spent window, as an ISO text. */
+  readonly reset: string;
+  constructor(message: string, reset: string) {
+    super(message);
+    this.name = "RateStop";
+    this.reset = reset;
+  }
+}
+
 /** A meter of the GitHub requests of a run. */
 export interface Meter {
   /** This `fetch` counts each request to the API, and it gives each other request to the inner `fetch` with no count. */
   readonly fetch: FetchFn;
+  /** The live budget. The meter adds the read of each answer of `core` to it, also after `SAMPLE_MAX` samples. */
+  readonly rate: RateTracker;
   /** This function gives the count of each route, with the largest count first. */
   routes(): RouteCount[];
   /** This function gives the use of the rate limit that the meter did not send. */
@@ -341,6 +441,7 @@ export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API, now:
   const counts = new Map<string, RouteCount>();
   const samples: MeterSample[] = [];
   const refusals: Refusals = { primary: 0, secondary: 0, other: 0, first: null };
+  const rate = rateTracker();
   const add = (route: string, status: number | null): void => {
     const row = counts.get(route) ?? { route, count: 0, notModified: 0, failed: 0 };
     row.count += 1;
@@ -362,6 +463,7 @@ export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API, now:
       add(route, res.status);
       const at = now();
       const sample = sampleOf(res, at, route);
+      if (sample) rate.observe(sample);
       if (sample && samples.length < SAMPLE_MAX) samples.push(sample);
       if (res.status === 403 || res.status === 429) {
         const kind = refusalKind(res.status, res.headers, await refusalMessage(res));
@@ -370,6 +472,7 @@ export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API, now:
       }
       return res;
     },
+    rate,
     outside: () => outsideUse(samples),
     samples: () => samples.map((s) => ({ ...s })),
     refusals: () => ({ ...refusals }),

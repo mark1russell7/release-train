@@ -33,6 +33,7 @@ import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
 import { buildGraph } from "./graph.ts";
 import type { LagHold } from "./holds.ts";
+import { RateStop } from "./meter.ts";
 import { plan } from "./plan.ts";
 import type { Manifest, NpmInfo, RepoSnapshot, Resolved } from "./types.ts";
 import { API_REPORT_PACKAGE, CONVENTIONS, ageExcluded, apiReportUpdateArgs, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
@@ -2252,5 +2253,58 @@ describe("releaseCheckOf and releaseCheckLets", () => {
     }
     expect(releaseCheckLets("skipped", true)).toBe(true);
     expect(releaseCheckLets("skipped", false)).toBe(false);
+  });
+});
+
+describe("a stop of the guard in a run of apply", () => {
+  const next = `${base}/next-repo`;
+  const dispatchText = Buffer.from("on:\n  workflow_dispatch:\n").toString("base64");
+  // A push of lib-repo with a new pull request, the start of the release workflow of next-repo, and then the label search.
+  const routes = (search: Handler): Record<string, Handler> => ({
+    [`GET ${base}/lib-repo`]: meta,
+    [`POST ${base}/lib-repo/pulls`]: (b) => [201, { ...pull(9, "lib-repo"), ...b, labels: [] }],
+    [`POST ${base}/lib-repo/labels`]: () => [201, {}],
+    [`POST ${base}/lib-repo/issues/9/labels`]: () => [200, []],
+    [`GET ${next}/contents/.github/workflows/release.yml`]: () => [200, { content: dispatchText }],
+    [`GET ${next}`]: meta,
+    [`GET ${next}/pulls`]: () => [200, []],
+    [`GET ${next}/actions/workflows/release.yml/runs`]: () => [200, { workflow_runs: [{ status: "completed", conclusion: "success" }] }],
+    [`GET ${next}/commits/main`]: () => [200, { sha: "m1" }],
+    [`GET ${next}/commits/m1/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }],
+    [`GET ${next}/commits/m1/status`]: () => [200, { state: "pending", total_count: 0 }],
+    [`POST ${next}/actions/workflows/release.yml/dispatches`]: () => [204, null],
+    "GET /search/issues": search,
+  });
+  const run = (search: Handler) => {
+    const s = server(routes(search));
+    const up = updater();
+    const r = apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: false, only: ["lib-repo", "next-repo"], releaseDispatch: true });
+    return { r, up, calls: s.calls };
+  };
+
+  it("keeps the push and the started release in the report when the guard stops the run at the label search", async () => {
+    const reset = "2026-11-16T18:01:55.000Z";
+    // The guard of the run throws its stop in place of the request (budget.ts).
+    const stop = new RateStop(`Rate guard: GitHub refused a request, because the rate limit is spent until ${reset}.`, reset);
+    const { r, up, calls } = run(() => {
+      throw stop;
+    });
+    const report = await r;
+    expect(up.seen.map((u) => u.repo)).toEqual(["lib-repo"]);
+    expect(report.results.find((x) => x.repo === "lib-repo")).toMatchObject({ state: "opened", pr: { number: 9 } });
+    expect(report.results.find((x) => x.actionId === "release:next-repo")).toMatchObject({ state: "opened" });
+    expect(report.inFlight).toEqual([{ name: "@ex/next", version: "2.0.0" }]);
+    expect(calls.filter((c) => c.method === "POST" && c.path.endsWith("/dispatches"))).toHaveLength(1);
+    expect(calls.filter((c) => c.path.startsWith("/search/issues"))).toHaveLength(1);
+    // The stop ends the steps: no row of the label train-merge, and no row with the stop as an error.
+    expect(report.results.some((x) => x.kind === "train-merge")).toBe(false);
+    expect(report.results.some((x) => x.state === "error")).toBe(false);
+  });
+
+  it("gives each other error of a step to the caller, as before", async () => {
+    const { r } = run(() => {
+      throw new Error("example failure");
+    });
+    await expect(r).rejects.toThrow("example failure");
   });
 });
