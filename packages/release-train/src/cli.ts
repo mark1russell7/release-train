@@ -503,7 +503,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
           dryRun: o.dryRun,
           results: [],
           inFlight: [],
-          rateLimit: { start: gate.read, end: await readRateLimit(gh), routes: meter.routes(), gate: gateRecord },
+          rateLimit: { start: gate.read, end: await readRateLimit(gh), routes: meter.routes(), outside: meter.outside(), gate: gateRecord },
         });
       }
       gateRecord = goOnUrgent(gateRecord);
@@ -548,7 +548,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
       ...(starts ? { needSince: (u) => starts.since(u.repo, u.items) } : {}),
     });
-    report.rateLimit = { start: rateStart, end: await readRateLimit(gh), routes: meter.routes(), gate: gateRecord };
+    report.rateLimit = { start: rateStart, end: await readRateLimit(gh), routes: meter.routes(), outside: meter.outside(), gate: gateRecord };
     if (o.state !== undefined && starts) {
       writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen() })}\n`);
       const c = starts.counts();
