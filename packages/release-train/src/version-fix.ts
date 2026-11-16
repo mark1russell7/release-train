@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import semver from "semver";
 import { TRAIN_BRANCH, ciState, latestRuns } from "./apply.ts";
 import { pool } from "./collect.ts";
-import type { GitHub } from "./github.ts";
+import type { GhResponse, GitHub } from "./github.ts";
 import { SYNC_BRANCH } from "./sync.ts";
 
 /**
@@ -393,12 +393,23 @@ const FAILED = new Set(["failure", "timed_out", "cancelled", "action_required", 
 /**
  * This function finds the pull requests of the repositories that need a version fix, and gives each one to the writer. It
  * writes one log line for each pull request. A private repository shows only its hash, with no package name and no detail.
+ * A rate limit stops the run. Then one line gives the count of the repositories that the run did not read to the end.
  */
 export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
   const log = o.log ?? (() => {});
   const label = o.label ?? ((repo: string) => repo);
   const base = `/repos/${o.owner}`;
   const rows: FixRow[] = [];
+  // A rate limit stops the run: each next read fails too, and only spends the time of the job. The next run continues.
+  const stop: { by: GhResponse<unknown> | null; repos: number } = { by: null, repos: 0 };
+  const gh = {
+    async request<T>(method: string, path: string): Promise<GhResponse<T>> {
+      const res = await o.gh.request<T>(method, path);
+      if (stop.by === null && (res.refusal === "primary" || res.refusal === "secondary")) stop.by = res;
+      return res;
+    },
+    text: o.gh.text?.bind(o.gh),
+  };
   const row = (r: FixRow, detail?: string): void => {
     rows.push(r);
     const name = r.private ? label(r.repo, true) : `${r.repo}#${r.pr}`;
@@ -407,9 +418,9 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
   };
 
   const ciOf = async (repo: string, sha: string): Promise<CiFacts> => {
-    const runs = await o.gh.request<{ check_runs: CheckRunData[] }>("GET", `${base}/${repo}/commits/${sha}/check-runs?per_page=100`);
-    const status = await o.gh.request<{ state: string; total_count: number }>("GET", `${base}/${repo}/commits/${sha}/status`);
-    const workflows = await o.gh.request<{ workflow_runs: { workflow_id: number; check_suite_id: number; created_at: string }[] }>("GET", `${base}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
+    const runs = await gh.request<{ check_runs: CheckRunData[] }>("GET", `${base}/${repo}/commits/${sha}/check-runs?per_page=100`);
+    const status = await gh.request<{ state: string; total_count: number }>("GET", `${base}/${repo}/commits/${sha}/status`);
+    const workflows = await gh.request<{ workflow_runs: { workflow_id: number; check_suite_id: number; created_at: string }[] }>("GET", `${base}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
     const latest = latestRuns(runs.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []) as CheckRunData[];
     if (!runs.ok) return { state: "none", statusFailed: false, failed: [] };
     // A check that runs can still fail with another error, so the fix waits for each check.
@@ -418,13 +429,13 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
     if (state !== "failed") return { state, statusFailed, failed: [] };
     const failed: FailedCheck[] = [];
     for (const run of latest.filter((r) => r.status === "completed" && r.conclusion !== null && FAILED.has(r.conclusion))) {
-      const notes = await o.gh.request<{ annotation_level?: string; message?: string }[]>("GET", `${base}/${repo}/check-runs/${run.id}/annotations?per_page=100`);
+      const notes = await gh.request<{ annotation_level?: string; message?: string }[]>("GET", `${base}/${repo}/check-runs/${run.id}/annotations?per_page=100`);
       const annotations = (notes.data ?? []).filter((a) => a.annotation_level === "failure").map((a) => a.message ?? "");
       const check: FailedCheck = { name: run.name, annotations };
       const told = readCheck(check);
       // The annotations of a job can hold only the last line. Then the log of the job tells the message.
-      if (told.unshipped.length === 0 && told.missing.length === 0 && !told.aggregate && told.other.length === 0 && run.app?.slug === "github-actions" && o.gh.text) {
-        const text = await o.gh.text(`${base}/${repo}/actions/jobs/${run.id}/logs`);
+      if (told.unshipped.length === 0 && told.missing.length === 0 && !told.aggregate && told.other.length === 0 && run.app?.slug === "github-actions" && gh.text) {
+        const text = await gh.text(`${base}/${repo}/actions/jobs/${run.id}/logs`);
         check.log = text.ok ? text.data : null;
       }
       failed.push(check);
@@ -433,17 +444,26 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
   };
 
   const marksOf = async (repo: string, pr: number): Promise<FixMark[]> => {
-    const commits = await o.gh.request<{ commit?: { message?: string } }[]>("GET", `${base}/${repo}/pulls/${pr}/commits?per_page=100`);
+    const commits = await gh.request<{ commit?: { message?: string } }[]>("GET", `${base}/${repo}/pulls/${pr}/commits?per_page=100`);
     return parseFixMarks((commits.data ?? []).map((c) => c.commit?.message ?? ""));
   };
 
   await pool(o.repos, o.concurrency ?? 6, async (r) => {
-    const res = await o.gh.request<PullData[]>("GET", `${base}/${r.name}/pulls?state=open&per_page=100`);
+    if (stop.by !== null) {
+      stop.repos++;
+      return;
+    }
+    const res = await gh.request<PullData[]>("GET", `${base}/${r.name}/pulls?state=open&per_page=100`);
     if (!res.ok) {
-      log(`version fix ${label(r.name, r.private)}: the open pull requests are not readable (HTTP ${res.status}).`);
+      if (stop.by !== null) stop.repos++;
+      else log(`version fix ${label(r.name, r.private)}: the open pull requests are not readable (HTTP ${res.status}).`);
       return;
     }
     for (const p of res.data ?? []) {
+      if (stop.by !== null) {
+        stop.repos++;
+        break;
+      }
       const one = { repo: r.name, private: r.private, pr: p.number };
       try {
         const info: PullInfo = {
@@ -461,7 +481,13 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
         }
         const ci = await ciOf(r.name, p.head.sha);
         // Only a failed head needs the marks of the commits.
-        const d = decideFix(scope.source, ci, ci.state === "failed" ? await marksOf(r.name, p.number) : []);
+        const marks = ci.state === "failed" ? await marksOf(r.name, p.number) : [];
+        // A read that a rate limit refused gives no fact, so the run decides nothing on the facts of this pull request.
+        if (stop.by !== null) {
+          stop.repos++;
+          break;
+        }
+        const d = decideFix(scope.source, ci, marks);
         if (!d.act) {
           row({ ...one, action: "skipped", reason: d.reason, packages: [] }, d.detail);
           continue;
@@ -483,6 +509,11 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
       }
     }
   });
+  if (stop.by !== null) {
+    const cause = stop.by.refusal === "secondary" ? "a secondary rate limit" : "a spent rate limit";
+    const count = stop.repos === 1 ? "1 repository is" : `${stop.repos} repositories are`;
+    log(`version fix: GitHub refused a read (HTTP ${stop.by.status}) for ${cause}, so the run stops. ${count} not read to the end. The next run reads them.`);
+  }
   return rows.sort((a, b) => a.repo.localeCompare(b.repo) || a.pr - b.pr);
 }
 

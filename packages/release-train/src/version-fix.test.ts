@@ -508,3 +508,50 @@ describe("the update of the train keeps a version fix of its branch", () => {
     expect(JSON.parse((await fx.show(TRAIN_BRANCH, "package.json")) ?? "{}")).toMatchObject({ version: "1.3.0" });
   }, 90_000);
 });
+
+describe("versionFixRun at a rate limit", () => {
+  const refused = (headers: Record<string, string>, message: string): Response => new Response(JSON.stringify({ message }), { status: 403, headers });
+
+  it("stops at the first refusal for a spent rate limit, and logs one line in place of one line for each repository", async () => {
+    // Train 43898917642 logged one refusal for each of 32 repositories after the limit was spent.
+    const calls: string[] = [];
+    const f: FetchFn = async (url) => {
+      calls.push(new URL(url).pathname);
+      return refused({ "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1800000000" }, "API rate limit exceeded for installation ID 1.");
+    };
+    const lines: string[] = [];
+    const repos = ["a-repo", "b-repo", "c-repo"].map((name) => ({ name, private: false }));
+    const rows = await versionFixRun({ gh: gitHub({ token: "t", fetch: f }), owner: OWNER, repos, fixer: new FakeFixer(), trainLogin: TRAIN, log: (l) => lines.push(l), concurrency: 1 });
+    expect(rows).toEqual([]);
+    expect(calls).toEqual([`/repos/${OWNER}/a-repo/pulls`]);
+    expect(lines).toEqual(["version fix: GitHub refused a read (HTTP 403) for a spent rate limit, so the run stops. 3 repositories are not read to the end. The next run reads them."]);
+  });
+
+  it("decides nothing on the facts of a pull request when a rate limit refused one of its reads", async () => {
+    const routes = repoRoutes("lib-repo", { pulls: [openPull(1, "renovate/npm-patch", "renovate[bot]", "lib-repo")], release: [GENERIC, exUnshipped("@ex/lib", "1.2.0")] });
+    const f: FetchFn = async (url) => {
+      const path = new URL(url).pathname;
+      if (path.endsWith("/check-runs")) return refused({}, "You have exceeded a secondary rate limit.");
+      const data = routes[path];
+      return data === undefined ? new Response("{}", { status: 404 }) : new Response(JSON.stringify(data), { status: 200 });
+    };
+    const fixer = new FakeFixer();
+    const lines: string[] = [];
+    const rows = await versionFixRun({ gh: gitHub({ token: "t", fetch: f }), owner: OWNER, repos: [{ name: "lib-repo", private: false }], fixer, trainLogin: TRAIN, log: (l) => lines.push(l) });
+    expect(fixer.jobs).toEqual([]);
+    expect(rows).toEqual([]);
+    expect(lines).toEqual(["version fix: GitHub refused a read (HTTP 403) for a secondary rate limit, so the run stops. 1 repository is not read to the end. The next run reads them."]);
+  });
+
+  it("goes on after a refusal with no sign of a rate limit, as before", async () => {
+    const f: FetchFn = async (url) => {
+      const path = new URL(url).pathname;
+      if (path === `/repos/${OWNER}/a-repo/pulls`) return refused({}, "Resource not accessible by integration");
+      return new Response("[]", { status: 200 });
+    };
+    const lines: string[] = [];
+    const repos = ["a-repo", "b-repo"].map((name) => ({ name, private: false }));
+    await versionFixRun({ gh: gitHub({ token: "t", fetch: f }), owner: OWNER, repos, fixer: null, trainLogin: TRAIN, log: (l) => lines.push(l), concurrency: 1 });
+    expect(lines).toEqual(["version fix a-repo: the open pull requests are not readable (HTTP 403)."]);
+  });
+});

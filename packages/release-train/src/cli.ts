@@ -17,7 +17,7 @@ import { type GitHub, gitHub, pageRead, readRateLimit } from "./github.ts";
 import { moveCheck, moveSummary } from "./move.ts";
 import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
-import { awaitRelease } from "./release.ts";
+import { awaitRelease, dispatchReleased } from "./release.ts";
 import { takeReplaced } from "./urgent.ts";
 import { needStarts, readState } from "./state.ts";
 import { SYNC_RULES, apiFiles, renovateDays, syncFacts, syncRepo, syncSummary } from "./sync.ts";
@@ -684,9 +684,19 @@ export async function runMoveCheck(o: CliOptions, check: typeof moveCheck = move
   }
 }
 
+/** The most tries of the dispatch of the `released` event: the first try, and one try after the reset of the rate limit. */
+const DISPATCH_ATTEMPTS = 2;
+
+/**
+ * The most wait for a rate limit before the dispatch tries again. The job of the train stops after 60 minutes
+ * (`train.yml`), and the wait for npm before the dispatch can use 15 of them (`--minutes 15`).
+ */
+const DISPATCH_MAX_WAIT_MS = 15 * 60_000;
+
 /**
  * The await-release command: it reads the versions in flight from the apply report and waits until npm has one of them.
  * Then it sends the `released` event of `repository_dispatch` to the repository of the train, so the next wave starts.
+ * When a rate limit refuses the event, the command waits for the reset and tries again (`dispatchReleased`).
  */
 async function runAwait(o: CliOptions): Promise<number> {
   if (!o.report) {
@@ -716,15 +726,29 @@ async function runAwait(o: CliOptions): Promise<number> {
   }
   const tok = token();
   const repo = process.env["GITHUB_REPOSITORY"] ?? `${o.owner}/release-train`;
-  const res = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${tok ?? ""}`, accept: "application/vnd.github+json", "content-type": "application/json" },
-    body: JSON.stringify({ event_type: "released", client_payload: { name: first.name, version: first.version } }),
+  const sent = await dispatchReleased({
+    send: () =>
+      fetch(`https://api.github.com/repos/${repo}/dispatches`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${tok ?? ""}`, accept: "application/vnd.github+json", "content-type": "application/json" },
+        body: JSON.stringify({ event_type: "released", client_payload: { name: first.name, version: first.version } }),
+      }),
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    now: () => Date.now(),
+    attempts: DISPATCH_ATTEMPTS,
+    maxWaitMs: DISPATCH_MAX_WAIT_MS,
   });
-  if (!res.ok) {
-    process.stderr.write(`npm has ${first.name}@${first.version}, but the dispatch failed (HTTP ${res.status}).\n`);
-    return 1;
+  const version = `${first.name}@${first.version}`;
+  if (sent.ok) {
+    process.stdout.write(`npm has ${version}. The train starts the next wave${sent.tries > 1 ? ` (the dispatch passed at try ${sent.tries})` : ""}.\n`);
+    return 0;
   }
-  process.stdout.write(`npm has ${first.name}@${first.version}. The train starts the next wave.\n`);
-  return 0;
+  const tries = sent.tries > 1 ? ` after ${sent.tries} tries` : "";
+  if (sent.limit !== null) {
+    // The next scheduled run starts the wave. A red run here tells only that the rate limit of the App is spent.
+    process.stdout.write(`::warning::npm has ${version}, but GitHub refused the dispatch (HTTP ${sent.status}${tries}): ${sent.limit}. The next scheduled run starts the next wave.\n`);
+    return 0;
+  }
+  process.stderr.write(`npm has ${version}, but the dispatch failed (HTTP ${sent.status}${tries})${sent.message ? `: ${sent.message}` : ""}.\n`);
+  return 1;
 }
