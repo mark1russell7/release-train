@@ -931,6 +931,8 @@ export function releaseCheckLets(check: ReleaseCheck, isPrivate: boolean): boole
 
 /** A workflow run of a commit, as far as `latestRuns` reads it. */
 interface WorkflowRun {
+  /** The id of the run. GitHub gives a later run a higher id. */
+  id?: number;
   workflow_id: number;
   check_suite_id: number;
   created_at: string;
@@ -942,14 +944,14 @@ interface WorkflowRun {
  * This function keeps the check runs that decide the CI of a commit. Each workflow run is its own check suite, so the
  * `latest` filter of GitHub keeps the checks of an older run of the same workflow. An example is a run that a new push
  * cancelled, after a later run of the same commit passed. Thus the function keeps only the newest workflow run of each
- * workflow. A failed job of a workflow run that ended in success has `continue-on-error`, and the function also leaves
+ * workflow. Two runs can start in the same second, and then the higher id is the newer run (layout-contract#331). A failed job of a workflow run that ended in success has `continue-on-error`, and the function also leaves
  * it out. Check runs of other apps stay.
  */
 export function latestRuns<R extends CheckRun>(runs: readonly R[], workflowRuns: readonly WorkflowRun[]): R[] {
   const newest = new Map<number, WorkflowRun>();
   for (const w of workflowRuns) {
     const seen = newest.get(w.workflow_id);
-    if (!seen || w.created_at > seen.created_at) newest.set(w.workflow_id, w);
+    if (!seen || w.created_at > seen.created_at || (w.created_at === seen.created_at && (w.id ?? 0) > (seen.id ?? 0))) newest.set(w.workflow_id, w);
   }
   const keep = new Set([...newest.values()].map((w) => w.check_suite_id));
   const old = new Set(workflowRuns.map((w) => w.check_suite_id).filter((id) => !keep.has(id)));
