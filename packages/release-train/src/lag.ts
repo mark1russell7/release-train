@@ -442,9 +442,9 @@ const FAILED: ReadonlySet<string> = new Set(["failure", "timed_out", "startup_fa
  * This function gives the open pull requests of the train with a failed check on their head. A merge closes such a pull
  * request, so the first block of an open one starts its age. A new head of the train does not reset this age.
  *
- * The checks go through `latestRuns`, as in apply. Thus a failed job with `continue-on-error` in a workflow run that ended
- * in success does not count, and a check of an older run of the same workflow does not count. A failed read of the workflow
- * runs keeps each check, so a fault gives a row and not a silent pass.
+ * The checks go through `latestRuns`, as in apply. Thus a failed job with `continue-on-error` does not count when its
+ * workflow run ended in success. A check of an older run of the same workflow does not count either. A failed read of the
+ * workflow runs keeps each check, so a fault gives a row and not a silent pass.
  */
 async function redRows(i: LagInput, now: number, log: (line: string) => void): Promise<RedRow[]> {
   const out: RedRow[] = [];
