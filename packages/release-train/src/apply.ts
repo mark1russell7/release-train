@@ -762,7 +762,7 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
       "",
     );
   } else if (u.kind === "adopt-breaking") {
-    lines.push("A range of a new major version changes. No published package of this repository changes a runtime range, so no release is necessary.", "");
+    lines.push("A range of a new major version changes. No published package of this repository changes a runtime range, so the train writes no version bump. If the update changes the shipped files of a package (for example, a bundled development dependency), the release check names it, and the version fix of the train adds its PATCH.", "");
   }
   const versionFixes = r?.versionFixes ?? [];
   if (versionFixes.length > 0) {
