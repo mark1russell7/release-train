@@ -605,12 +605,13 @@ const renovateDayRule: SyncRule = {
 
 /** The text of the key `$comment` of a new `.github/site.json`. */
 export const SITE_CONFIG_COMMENT =
-  'The site config of this repository (CI.md of the template, "The site config"). The Pages workflow deploys this site from main, and the job site of ci.yml checks it on each pull request.';
+  'The site config of this repository (CI.md of the template, "The site config"). The Pages workflow deploys this site from main, and a job of ci.yml checks it on each pull request.';
 
 /**
  * Rule 7: a repository that deploys a site with `reusable-pages.yml` gets the form of the rule `site-check-in-ci` of
- * conventions. The site values go into `.github/site.json`, no pull request starts the deploy, and a job `site` of
- * `ci.yml` checks the site. The job `CI OK` needs it. A form that the rule cannot change safely is a need.
+ * conventions. The site values go into `.github/site.json`, no pull request starts the deploy, and a new job of
+ * `ci.yml` checks the site. The job `CI OK` needs it. The new job is `site`, or `site-check` when `site` is in use.
+ * A form that the rule cannot change safely is a need.
  */
 const siteConfigRule: SyncRule = {
   id: "site-config",

@@ -18,8 +18,22 @@ import { parse as parseYaml } from "yaml";
 /** The check workflow of the template, without the owner. */
 export const CHECK_WORKFLOW = "template/.github/workflows/reusable-pages-check.yml";
 
-/** The id of the new job of `ci.yml`. */
+/** The first choice of the id of the new job of `ci.yml`. The move takes the id that `checkJobId()` gives. */
 export const CHECK_JOB = "site";
+
+/**
+ * This function gives the id of the new job of the site check. It is `site` when no job of `ci.yml` has that id.
+ * Else it is the first free id of `site-check`, `site-check-2`, `site-check-3` and the next ones. A repository can have
+ * a job `site` of its own, for example the end-to-end tests of its site.
+ */
+export function checkJobId(taken: readonly string[]): string {
+  const used = new Set(taken);
+  if (!used.has(CHECK_JOB)) return CHECK_JOB;
+  for (let count = 1; ; count += 1) {
+    const id = count === 1 ? `${CHECK_JOB}-check` : `${CHECK_JOB}-check-${String(count)}`;
+    if (!used.has(id)) return id;
+  }
+}
 
 /** The name of the job that the ruleset of `main` names. */
 export const GATE_NAME = "CI OK";
@@ -308,19 +322,20 @@ function gateJob(pad: string, ids: readonly string[], skips: readonly string[], 
 }
 
 /** This function adds the job of the site check to `ci.yml` and to the needs of `CI OK`, or gives the problem. */
-function addCheckJob(text: string, input: SiteMoveInput, carry: Record<string, unknown>): { text: string; gate?: boolean; error?: string } {
+function addCheckJob(text: string, input: SiteMoveInput, carry: Record<string, unknown>): { text: string; jobId: string; gate?: boolean; error?: string } {
   const lines = text.split("\n");
   const jobs = topKey(lines, "jobs");
-  if (jobs < 0) return { text, error: "ci.yml has no jobs" };
+  if (jobs < 0) return { text, jobId: CHECK_JOB, error: "ci.yml has no jobs" };
   const ids = children(lines, jobs);
-  if (ids.some((line) => keyOf(lines[line] ?? "") === CHECK_JOB)) return { text, error: `ci.yml has a job ${CHECK_JOB} that does not use reusable-pages-check.yml` };
+  const names = ids.map((line) => keyOf(lines[line] ?? "") ?? "");
+  const jobId = checkJobId(names);
   const gate = ids.find((line) => children(lines, line).some((key) => keyOf(lines[key] ?? "") === "name" && (valueAfter(lines[key] ?? "") ?? "").replace(/^["']|["']$/g, "") === GATE_NAME));
   const pad = " ".repeat(indentOf(lines[gate ?? ids[0] ?? -1] ?? "  "));
   const withLines = Object.entries(carry).map(([key, given]) => `${pad}    ${key}: ${yamlScalar(given)}`);
   const job = [
     `${pad}# The site of ${SITE_CONFIG_PATH}: the build, the site check and the probe, with no deploy (CI.md of the`,
     `${pad}# template, "The site config"). The Pages workflow deploys the same site from main.`,
-    `${pad}${CHECK_JOB}:`,
+    `${pad}${jobId}:`,
     `${pad}  uses: ${input.owner}/${CHECK_WORKFLOW}@${input.templateSha} # main`,
     `${pad}  permissions:`,
     `${pad}    contents: read`,
@@ -328,29 +343,28 @@ function addCheckJob(text: string, input: SiteMoveInput, carry: Record<string, u
   ];
   if (gate === undefined) {
     // No summary job: a new job CI OK needs each job. The daily check of the rulesets asks the owner to require it.
-    if (ids.some((line) => keyOf(lines[line] ?? "") === GATE_JOB)) return { text, error: `ci.yml has a job ${GATE_JOB} with no name ${GATE_NAME}` };
-    const names = ids.map((line) => keyOf(lines[line] ?? "") ?? "");
+    if (ids.some((line) => keyOf(lines[line] ?? "") === GATE_JOB)) return { text, jobId, error: `ci.yml has a job ${GATE_JOB} with no name ${GATE_NAME}` };
     const skips = ids.filter((line) => children(lines, line).some((key) => keyOf(lines[key] ?? "") === "if")).map((line) => keyOf(lines[line] ?? "") ?? "");
     const end = blockEnd(lines, jobs);
-    return { text: [...lines.slice(0, end), "", ...job, "", ...gateJob(pad, [...names, CHECK_JOB], skips, input), ...lines.slice(end)].join("\n"), gate: true };
+    return { text: [...lines.slice(0, end), "", ...job, "", ...gateJob(pad, [...names, jobId], skips, input), ...lines.slice(end)].join("\n"), jobId, gate: true };
   }
   const needsLine = children(lines, gate).find((key) => keyOf(lines[key] ?? "") === "needs");
-  if (needsLine === undefined) return { text, error: `the job ${GATE_NAME} of ci.yml has no needs` };
+  if (needsLine === undefined) return { text, jobId, error: `the job ${GATE_NAME} of ci.yml has no needs` };
   const out = [...lines];
   const value = valueAfter(lines[needsLine] ?? "") ?? "";
   if (value.startsWith("[") && value.endsWith("]")) {
     const list = value.slice(1, -1).split(",").map((id) => id.trim()).filter(Boolean);
-    out[needsLine] = (lines[needsLine] ?? "").replace(value, `[${[...list, CHECK_JOB].join(", ")}]`);
+    out[needsLine] = (lines[needsLine] ?? "").replace(value, `[${[...list, jobId].join(", ")}]`);
   } else if (value !== "") {
-    out[needsLine] = (lines[needsLine] ?? "").replace(value, `[${value}, ${CHECK_JOB}]`);
+    out[needsLine] = (lines[needsLine] ?? "").replace(value, `[${value}, ${jobId}]`);
   } else {
     const items = children(lines, needsLine);
     const last = items[items.length - 1];
-    if (last === undefined) return { text, error: `the needs of the job ${GATE_NAME} of ci.yml are empty` };
-    out.splice(last + 1, 0, `${" ".repeat(indentOf(lines[last] ?? ""))}- ${CHECK_JOB}`);
+    if (last === undefined) return { text, jobId, error: `the needs of the job ${GATE_NAME} of ci.yml are empty` };
+    out.splice(last + 1, 0, `${" ".repeat(indentOf(lines[last] ?? ""))}- ${jobId}`);
   }
   out.splice(commentStart(lines, gate), 0, ...job, "");
-  return { text: out.join("\n") };
+  return { jobId, text: out.join("\n") };
 }
 
 /**
@@ -396,7 +410,7 @@ export function moveSiteConfig(input: SiteMoveInput): SiteMove | null {
     const ci = addCheckJob((writes[ciPath] ?? workflows.get(ciPath) ?? "").replace(/\r\n/g, "\n"), input, moved.carry);
     if (ci.error !== undefined) return fail(`\`${ciPath}\`: ${ci.error}`);
     writes[ciPath] = ciCrlf ? ci.text.replace(/\n/g, "\r\n") : ci.text;
-    changes.push(`\`${ciPath}\` gets the job \`${CHECK_JOB}\` (\`reusable-pages-check.yml\`, \`contents: read\`), and \`${GATE_NAME}\` needs it.`);
+    changes.push(`\`${ciPath}\` gets the job \`${ci.jobId}\` (\`reusable-pages-check.yml\`, \`contents: read\`), and \`${GATE_NAME}\` needs it.`);
     if (ci.gate === true) changes.push(`\`${ciPath}\` gets the summary job \`${GATE_NAME}\` (the action \`gate-summary\`), and it needs each job. The daily check of the rulesets lists it until the ruleset of \`main\` requires it.`);
   }
   if (changes.length === 0) return null;
