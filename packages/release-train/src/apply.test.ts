@@ -1311,6 +1311,32 @@ describe("helpers", () => {
     expect(ciState(latestRuns(runs, []), null)).toBe("failed");
   });
 
+  it("leaves out a failed job of a workflow run that ended in success, because the job has continue-on-error", () => {
+    // The CI of lag#160: the job "Safari on iOS" failed, and its workflow run ended in success
+    const runs = [
+      { name: "Browser tests (Safari on iOS, simulator)", status: "completed", conclusion: "failure", check_suite: { id: 1 } },
+      { name: "Unit tests", status: "completed", conclusion: "success", check_suite: { id: 1 } },
+      { name: "Audit", status: "completed", conclusion: "success", check_suite: { id: 2 } },
+    ];
+    const workflows = [
+      { workflow_id: 10, check_suite_id: 1, created_at: "2026-11-16T04:19:10Z", status: "completed", conclusion: "success" },
+      { workflow_id: 11, check_suite_id: 2, created_at: "2026-11-16T04:19:10Z", status: "completed", conclusion: "success" },
+    ];
+    expect(latestRuns(runs, workflows).map((r) => r.name)).toEqual(["Unit tests", "Audit"]);
+    expect(ciState(latestRuns(runs, workflows), null)).toBe("green");
+    // A workflow run that ended in failure keeps its failed job
+    const failed = workflows.map((w) => (w.check_suite_id === 1 ? { ...w, conclusion: "failure" } : w));
+    expect(ciState(latestRuns(runs, failed), null)).toBe("failed");
+    // A workflow run that is not done keeps its failed job, because its end is not known
+    const running = workflows.map((w) => (w.check_suite_id === 1 ? { ...w, status: "in_progress", conclusion: null } : w));
+    expect(ciState(latestRuns(runs, running), null)).toBe("failed");
+    // A workflow run with no conclusion in the answer keeps each check, as before
+    const unread = workflows.map(({ workflow_id, check_suite_id, created_at }) => ({ workflow_id, check_suite_id, created_at }));
+    expect(ciState(latestRuns(runs, unread), null)).toBe("failed");
+    // A check run of another app, with no check suite, still counts
+    expect(ciState(latestRuns([...runs, { name: "external", status: "completed", conclusion: "failure", check_suite: null }], workflows), null)).toBe("failed");
+  });
+
   it("writes the fingerprint and the lockfile changes into the body", () => {
     const u = selectUpdates(fixture(), ["lib-repo"]).ready[0] as RepoUpdate;
     const body = prBody(u, {

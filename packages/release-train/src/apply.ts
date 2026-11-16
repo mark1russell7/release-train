@@ -934,14 +934,18 @@ interface WorkflowRun {
   workflow_id: number;
   check_suite_id: number;
   created_at: string;
+  status?: string;
+  conclusion?: string | null;
 }
 
 /**
- * This function keeps the check runs of the newest workflow run of each workflow. Each workflow run is its own check
- * suite, so the `latest` filter of GitHub keeps the checks of an older run of the same workflow. An example is a run
- * that a new push cancelled, after a later run of the same commit passed. Check runs of other apps stay.
+ * This function keeps the check runs that decide the CI of a commit. Each workflow run is its own check suite, so the
+ * `latest` filter of GitHub keeps the checks of an older run of the same workflow. An example is a run that a new push
+ * cancelled, after a later run of the same commit passed. Thus the function keeps only the newest workflow run of each
+ * workflow. A failed job of a workflow run that ended in success has `continue-on-error`, and the function also leaves
+ * it out. Check runs of other apps stay.
  */
-export function latestRuns(runs: readonly CheckRun[], workflowRuns: readonly WorkflowRun[]): CheckRun[] {
+export function latestRuns<R extends CheckRun>(runs: readonly R[], workflowRuns: readonly WorkflowRun[]): R[] {
   const newest = new Map<number, WorkflowRun>();
   for (const w of workflowRuns) {
     const seen = newest.get(w.workflow_id);
@@ -949,7 +953,10 @@ export function latestRuns(runs: readonly CheckRun[], workflowRuns: readonly Wor
   }
   const keep = new Set([...newest.values()].map((w) => w.check_suite_id));
   const old = new Set(workflowRuns.map((w) => w.check_suite_id).filter((id) => !keep.has(id)));
-  return runs.filter((r) => !(r.check_suite && old.has(r.check_suite.id)));
+  // The workflow runs that ended in success: a failed job of such a run does not fail the run
+  const passed = new Set([...newest.values()].filter((w) => w.status === "completed" && w.conclusion === "success").map((w) => w.check_suite_id));
+  const allowed = (r: R): boolean => r.status === "completed" && r.conclusion !== "success" && r.conclusion !== "skipped" && passed.has(r.check_suite?.id ?? -1);
+  return runs.filter((r) => !(r.check_suite && old.has(r.check_suite.id)) && !allowed(r));
 }
 
 /** This function changes the check runs and the commit status of a commit into one CI state. */
