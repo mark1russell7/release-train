@@ -14,6 +14,8 @@ Stage 1 only reads. Stage 2 (`apply`) opens a pull request for each update of th
 
 A package is a `package.json` with a name and without `"private": true`. An edge is a dependency on a package of the account.
 
+The prefix of `GH_TOKEN` gives the list of the repositories. An installation token (`ghs_`) reads the list of its installation. The token of the owner reads each repository of the owner. Another token reads the public repositories. A failed read of the list stops the command, because a different list is not a correct answer.
+
 ## The actions of the plan
 
 | Action | When |
