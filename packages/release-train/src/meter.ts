@@ -195,12 +195,20 @@ export interface OutsideUse {
   requests: number;
   /** The answers with the header `x-ratelimit-used` of the resource `core`. */
   answers: number;
+  /**
+   * The count of the windows of the rate limit in the answers. On 2026-11-16 one token of a run gave answers in two
+   * windows with the same limit, at the same time (Train 43853352904). A report from before 0.3.15 does not have it.
+   */
+  windows?: number;
   /** The largest rises between two answers of the meter, minus the one request of the meter, the largest first. */
   jumps: { at: string; size: number }[];
 }
 
 /** The smallest rise that the list of jumps shows. A smaller rise can come from requests of the meter that are in flight at the same time. */
 export const JUMP_MIN = 20;
+
+/** The largest difference in seconds of the reset of two answers of one window of the rate limit. */
+const WINDOW_SLACK_S = 60;
 
 /** The largest count of jumps in the record. */
 export const JUMP_COUNT = 5;
@@ -265,7 +273,7 @@ export function outsideUse(samples: readonly UsedSample[]): OutsideUse {
   const sorted = [...samples].sort((a, b) => a.at - b.at || a.used - b.used);
   const windows: UsedSample[][] = [];
   for (const sample of sorted) {
-    const open = windows.find((w) => Math.abs(sample.reset - (w[0]?.reset ?? sample.reset)) <= 60);
+    const open = windows.find((w) => Math.abs(sample.reset - (w[0]?.reset ?? sample.reset)) <= WINDOW_SLACK_S);
     if (open) open.push(sample);
     else windows.push([sample]);
   }
@@ -282,7 +290,7 @@ export function outsideUse(samples: readonly UsedSample[]): OutsideUse {
     }
   }
   jumps.sort((a, b) => b.size - a.size || (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
-  return { requests, answers: sorted.length, jumps: jumps.slice(0, JUMP_COUNT) };
+  return { requests, answers: sorted.length, windows: windows.length, jumps: jumps.slice(0, JUMP_COUNT) };
 }
 
 /** This function gives the sample of an answer, or null when the answer has no header of the rate limit of `core`. */
@@ -383,13 +391,27 @@ interface UsedRead {
  * is the rise of the used count, minus each request of the meter that GitHub counts. GitHub counts each request but an
  * answer 304. The function gives null when a read failed or when the window of the rate limit changed between the two
  * reads. The value can be below 0.
+ *
+ * The two reads see only their own window. With the samples, the function does not take away the counted answers of
+ * another window. On 2026-11-16, 106 answers of one run were in a second window (Train 43853352904). The two reads gave
+ * -107, but no request was outside the meter. A request with no sample, for example a fetch that threw, counts in the
+ * window of the reads.
+ *
+ * @param samples - The samples of the answers of the meter. Without them, each counted request is in the window of the reads.
  */
-export function readsOutside(start: UsedRead | null | undefined, end: UsedRead | null | undefined, routes: readonly RouteCount[]): number | null {
+export function readsOutside(
+  start: UsedRead | null | undefined,
+  end: UsedRead | null | undefined,
+  routes: readonly RouteCount[],
+  samples: readonly Pick<MeterSample, "reset" | "status">[] = [],
+): number | null {
   if (!start || !end) return null;
   const a = Date.parse(start.reset);
   const b = Date.parse(end.reset);
-  if (!Number.isFinite(a) || !Number.isFinite(b) || Math.abs(a - b) > 60_000) return null;
-  return end.used - start.used - routes.reduce((n, r) => n + r.count - r.notModified, 0);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || Math.abs(a - b) > WINDOW_SLACK_S * 1000) return null;
+  const counted = routes.reduce((n, r) => n + r.count - r.notModified, 0);
+  const elsewhere = samples.filter((x) => x.status !== 304 && Math.abs(x.reset * 1000 - b) > WINDOW_SLACK_S * 1000).length;
+  return end.used - start.used - (counted - elsewhere);
 }
 
 /** The smallest difference of the two measures that the line calls a disagreement, also when 5 % of the larger is less. */
@@ -407,7 +429,8 @@ export function outsideLine(o: OutsideUse, reads: number | null = null): string 
     reads !== null && Math.abs(reads - o.requests) > Math.max(DISAGREE_MIN, 0.05 * Math.max(Math.abs(reads), o.requests))
       ? " The two measures disagree, so neither count is a read. The report has each sample (rateLimit.samples)."
       : "";
-  return `GitHub requests outside the meter: ${o.requests}, from ${o.answers} answers.${jumps ? ` The largest jumps: ${jumps}.` : ""}${fromReads}${disagree}`;
+  const windows = (o.windows ?? 1) > 1 ? ` in ${o.windows} windows of the rate limit` : "";
+  return `GitHub requests outside the meter: ${o.requests}, from ${o.answers} answers${windows}.${jumps ? ` The largest jumps: ${jumps}.` : ""}${fromReads}${disagree}`;
 }
 
 /** This function gives the line of the summary for the refusals, or null when GitHub refused no request. */

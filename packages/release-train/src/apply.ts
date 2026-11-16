@@ -1059,7 +1059,7 @@ export function applySummary(r: ApplyReport): string {
     if (r.rateLimit.gate) lines.push(r.rateLimit.gate.note);
     lines.push(rateLimitLine(r.rateLimit));
     if (r.rateLimit.routes) lines.push(...routeLines(r.rateLimit.routes));
-    if (r.rateLimit.outside) lines.push(outsideLine(r.rateLimit.outside, r.rateLimit.routes ? readsOutside(r.rateLimit.start, r.rateLimit.end, r.rateLimit.routes) : null));
+    if (r.rateLimit.outside) lines.push(outsideLine(r.rateLimit.outside, r.rateLimit.routes ? readsOutside(r.rateLimit.start, r.rateLimit.end, r.rateLimit.routes, r.rateLimit.samples) : null));
     const refused = r.rateLimit.refusals ? refusalLine(r.rateLimit.refusals) : null;
     if (refused) lines.push(refused);
   }
