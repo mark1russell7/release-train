@@ -3,7 +3,7 @@ import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import type { FetchFn } from "./collect.ts";
 import { gitHub, readRateLimit } from "./github.ts";
-import { requestMeter, routeLines, routeTemplate } from "./meter.ts";
+import { JUMP_MIN, outsideLine, outsideUse, requestMeter, routeLines, routeTemplate } from "./meter.ts";
 
 const API = "https://api.github.com";
 const SHA = "0123456789abcdef0123456789abcdef01234567";
@@ -182,5 +182,70 @@ describe("routeLines", () => {
       "| POST /graphql | 2 | 0 | 0 |",
       "",
     ]);
+  });
+});
+
+describe("the outside use of the rate limit", () => {
+  const RESET = 1_800_000_000;
+  /** A fetch that answers each request with the next used count of the list, and with the reset of the list. */
+  const usedAnswers = (used: readonly number[], opts: { reset?: readonly number[]; resource?: string } = {}): FetchFn => {
+    let i = 0;
+    return async () => {
+      const headers: Record<string, string> = { "x-ratelimit-used": String(used[i]), "x-ratelimit-reset": String(opts.reset?.[i] ?? RESET) };
+      if (opts.resource !== undefined) headers["x-ratelimit-resource"] = opts.resource;
+      i += 1;
+      return new Response("{}", { status: 200, headers });
+    };
+  };
+  /** A clock that moves one second at each read, from 2026-11-16 02:22:00Z. */
+  const ticks = (): (() => number) => {
+    let t = Date.parse("2026-11-16T02:22:00Z");
+    return () => (t += 1000);
+  };
+
+  it("counts the requests of another holder between two answers of the meter, and names the jump", async () => {
+    const meter = requestMeter(usedAnswers([10, 11, 50, 51]), API, ticks());
+    for (let i = 0; i < 4; i++) await meter.fetch(`${API}/repos/o/r/pulls/${i}`);
+    expect(meter.outside()).toEqual({ requests: 38, answers: 4, jumps: [{ at: "2026-11-16T02:22:03.000Z", size: 38 }] });
+    expect(outsideLine(meter.outside())).toBe("GitHub requests outside the meter: 38, from 4 answers. The largest jumps: 38 at 02:22:03Z.");
+  });
+
+  it("gives no read when no answer has the header, and counts no other resource", async () => {
+    const none = requestMeter(async () => new Response("{}", { status: 200 }), API, ticks());
+    await none.fetch(`${API}/repos/o/r`);
+    expect(none.outside()).toEqual({ requests: 0, answers: 0, jumps: [] });
+    expect(outsideLine(none.outside())).toMatch(/no read/);
+    const search = requestMeter(usedAnswers([1, 30], { resource: "search" }), API, ticks());
+    await search.fetch(`${API}/search/issues?q=x`);
+    await search.fetch(`${API}/search/issues?q=y`);
+    expect(search.outside().answers).toBe(0);
+  });
+
+  it("starts a new window at a reset: the drop of the used count is no use", async () => {
+    const meter = requestMeter(usedAnswers([100, 101, 1, 2], { reset: [RESET, RESET + 2, RESET + 3600, RESET + 3600] }), API, ticks());
+    for (let i = 0; i < 4; i++) await meter.fetch(`${API}/repos/o/r`);
+    expect(meter.outside()).toEqual({ requests: 0, answers: 4, jumps: [] });
+  });
+
+  it("gives no outside use for requests of the meter only, in each order of their answers", () => {
+    // Each request of the meter raises the count by one. Requests in flight answer in any order.
+    const orders = fc.integer({ min: 1, max: 40 }).chain((n) => fc.shuffledSubarray(Array.from({ length: n }, (_, i) => i), { minLength: n, maxLength: n }));
+    fc.assert(
+      fc.property(orders, fc.integer({ min: 0, max: 5000 }), (order, base) => {
+        expect(outsideUse(order.map((k, i) => ({ at: i * 10, used: base + k + 1, reset: RESET }))).requests).toBe(0);
+      }),
+    );
+  });
+
+  it("gives the exact count of a block of outside requests at each point of a run", () => {
+    fc.assert(
+      fc.property(fc.integer({ min: 2, max: 40 }), fc.integer({ min: 0, max: 9000 }), fc.nat(), (n, outside, at) => {
+        const cut = 1 + (at % (n - 1));
+        const samples = Array.from({ length: n }, (_, i) => ({ at: i * 10, used: i + 1 + (i >= cut ? outside : 0), reset: RESET }));
+        const out = outsideUse(samples);
+        expect(out.requests).toBe(outside);
+        expect(out.jumps).toEqual(outside >= JUMP_MIN ? [{ at: new Date(cut * 10).toISOString(), size: outside }] : []);
+      }),
+    );
   });
 });
