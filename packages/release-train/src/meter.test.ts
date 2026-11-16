@@ -218,14 +218,14 @@ describe("the outside use of the rate limit", () => {
   it("counts the requests of another holder between two answers of the meter, and names the jump", async () => {
     const meter = requestMeter(usedAnswers([10, 11, 50, 51]), API, ticks());
     for (let i = 0; i < 4; i++) await meter.fetch(`${API}/repos/o/r/pulls/${i}`);
-    expect(meter.outside()).toEqual({ requests: 38, answers: 4, jumps: [{ at: "2026-11-16T02:22:03.000Z", size: 38 }] });
+    expect(meter.outside()).toEqual({ requests: 38, answers: 4, windows: 1, jumps: [{ at: "2026-11-16T02:22:03.000Z", size: 38 }] });
     expect(outsideLine(meter.outside())).toBe("GitHub requests outside the meter: 38, from 4 answers. The largest jumps: 38 at 02:22:03Z.");
   });
 
   it("gives no read when no answer has the header, and counts no other resource", async () => {
     const none = requestMeter(async () => new Response("{}", { status: 200 }), API, ticks());
     await none.fetch(`${API}/repos/o/r`);
-    expect(none.outside()).toEqual({ requests: 0, answers: 0, jumps: [] });
+    expect(none.outside()).toEqual({ requests: 0, answers: 0, windows: 0, jumps: [] });
     expect(outsideLine(none.outside())).toMatch(/no read/);
     const search = requestMeter(usedAnswers([1, 30], { resource: "search" }), API, ticks());
     await search.fetch(`${API}/search/issues?q=x`);
@@ -236,7 +236,7 @@ describe("the outside use of the rate limit", () => {
   it("starts a new window at a reset: the drop of the used count is no use", async () => {
     const meter = requestMeter(usedAnswers([100, 101, 1, 2], { reset: [RESET, RESET + 2, RESET + 3600, RESET + 3600] }), API, ticks());
     for (let i = 0; i < 4; i++) await meter.fetch(`${API}/repos/o/r`);
-    expect(meter.outside()).toEqual({ requests: 0, answers: 4, jumps: [] });
+    expect(meter.outside()).toEqual({ requests: 0, answers: 4, windows: 2, jumps: [] });
   });
 
   it("gives no outside use for requests of the meter only, in each order of their answers", () => {
@@ -351,6 +351,43 @@ describe("the evidence of the rate limit: samples, refusals and the two reads", 
     expect(readsOutside(null, { used: 50, reset: ISO }, routes)).toBeNull();
     expect(readsOutside({ used: 1, reset: ISO }, undefined, routes)).toBeNull();
     expect(readsOutside({ used: 1, reset: "no time" }, { used: 2, reset: ISO }, routes)).toBeNull();
+  });
+
+  it("takes away only the counted answers of the window of the reads (Train 43853352904)", () => {
+    // One run: 2,953 counted answers, 106 of them in a second window with the same limit and a reset 225 s later.
+    // The two reads rose by 2,847, the count of the answers in their own window. No request was outside the meter.
+    const routes = [{ route: "GET /repos/{owner}/{repo}", count: 2953, notModified: 0, failed: 0 }];
+    const samples = [
+      ...Array.from({ length: 2847 }, () => ({ reset: RESET, status: 200 })),
+      ...Array.from({ length: 106 }, () => ({ reset: RESET + 225, status: 200 })),
+    ];
+    const start = { used: 1303, reset: ISO };
+    const end = { used: 1303 + 2847, reset: ISO };
+    expect(readsOutside(start, end, routes)).toBe(-106);
+    expect(readsOutside(start, end, routes, samples)).toBe(0);
+    // A reset some seconds away is the same window.
+    expect(readsOutside(start, end, routes, samples.map((x, i) => (i < 2847 ? { ...x, reset: RESET + (i % 7) } : x)))).toBe(0);
+    // An answer 304 of the other window is not counted, so it is not taken away.
+    const notModified = [{ route: "GET /repos/{owner}/{repo}", count: 2953, notModified: 6, failed: 0 }];
+    const with304 = samples.map((x, i) => (i >= 2947 ? { ...x, status: 304 } : x));
+    expect(readsOutside(start, end, notModified, with304)).toBe(0);
+    // A request with no sample counts in the window of the reads.
+    const more = [{ route: "GET /repos/{owner}/{repo}", count: 2963, notModified: 0, failed: 10 }];
+    expect(readsOutside(start, end, more, samples)).toBe(-10);
+  });
+
+  it("names the windows of the answers when there are more than one", () => {
+    const samples = [
+      { at: 1, used: 1303, reset: RESET },
+      { at: 2, used: 34, reset: RESET + 225 },
+      { at: 3, used: 1304, reset: RESET },
+      { at: 4, used: 35, reset: RESET + 225 },
+    ];
+    const out = outsideUse(samples);
+    expect(out).toEqual({ requests: 0, answers: 4, windows: 2, jumps: [] });
+    expect(outsideLine(out, 0)).toBe(
+      "GitHub requests outside the meter: 0, from 4 answers in 2 windows of the rate limit. The two reads of GET /rate_limit give 0.",
+    );
   });
 
   it("gives both measures, and tells when they disagree", () => {
