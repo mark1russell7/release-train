@@ -244,9 +244,9 @@ export interface Refusals {
 export type RefusalKind = "primary" | "secondary" | "other";
 
 /**
- * This function gives the cause of a refusal from the status, the headers and the message of the answer, or null for an
- * answer that is not a refusal. GitHub can send a secondary rate limit as a 403 with no `retry-after`. Only its message
- * tells it from a permission error.
+ * This function gives the cause of a refusal from the status, the headers and the message of the answer. For an answer
+ * that is not a refusal, it gives null. GitHub can send a secondary rate limit as a 403 with no `retry-after`. Only its
+ * message tells it from a permission error.
  */
 export function refusalKind(status: number, headers: Headers, message: string): RefusalKind | null {
   if (status !== 403 && status !== 429) return null;
@@ -379,9 +379,10 @@ interface UsedRead {
 }
 
 /**
- * This function gives the outside use from the two reads of `GET /rate_limit` at the start and at the end of a run: the
- * rise of the used count, minus each request of the meter that GitHub counts (each request but an answer 304). It gives
- * null when a read failed or when the window of the rate limit changed between the two reads. The value can be below 0.
+ * This function gives the outside use from the two reads of `GET /rate_limit`, at the start and at the end of a run. It
+ * is the rise of the used count, minus each request of the meter that GitHub counts. GitHub counts each request but an
+ * answer 304. The function gives null when a read failed or when the window of the rate limit changed between the two
+ * reads. The value can be below 0.
  */
 export function readsOutside(start: UsedRead | null | undefined, end: UsedRead | null | undefined, routes: readonly RouteCount[]): number | null {
   if (!start || !end) return null;
