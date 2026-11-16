@@ -199,6 +199,9 @@ importers:
       '@mark1russell7/service':
         specifier: ^0.9.0
         version: 0.9.0(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
+      '@mark1russell7/site-pages':
+        specifier: ^0.7.0
+        version: 0.7.0
       '@mark1russell7/text':
         specifier: ^0.0.10
         version: 0.0.10
@@ -522,12 +525,20 @@ packages:
     resolution: {integrity: sha512-C94Q4C31aZ8UXx1R0JSBV7DiQFl5tVpbFxHxHzHaSqr3dTgmCkEvLrvlUV8/0/GZqPhQYG9cbX6GOlqfRj/h4g==}
     engines: {node: '>=22'}
 
+  '@mark1russell7/rigor-generators@0.2.0':
+    resolution: {integrity: sha512-eTyJhK4Nowx1KQ3QrsQqLiAlhFoL+8m1OT6He+X0Lf0G/0f9OyQC8ponQLViQKRkP/ef10B6oACFjtjnKErobg==}
+    engines: {node: '>=22'}
+
   '@mark1russell7/rigor-statistics@0.1.27':
     resolution: {integrity: sha512-UnBEZVSVSytwFH5pJ5ezlOCEs/19Ur0/REQ+Tq5BYs8uYWSNoP/hZNGx2tdqLN2Rn0u+A41GwieBnuM6DuWS4g==}
     engines: {node: '>=22'}
 
   '@mark1russell7/rigor-statistics@0.2.1':
     resolution: {integrity: sha512-4m8yw4giLH/y1HcsroBQSHAWByC5fK/iJb4dNGCPT6Eelr26bxvBz7kMC7UMFSzGcR+W8GTrAwlAQmmFnQDMuA==}
+    engines: {node: '>=22'}
+
+  '@mark1russell7/rigor-statistics@0.2.9':
+    resolution: {integrity: sha512-9u9u2imcLpkiwSu1FGeB57Z+/Fr7byplVNMoR8G9OELjhSwOdzNbTiPieHqFM6phVVyMWrGlgoEQyBaxKqwvtQ==}
     engines: {node: '>=22'}
 
   '@mark1russell7/service@0.8.20':
@@ -589,6 +600,11 @@ packages:
         optional: true
       zod:
         optional: true
+
+  '@mark1russell7/site-pages@0.7.0':
+    resolution: {integrity: sha512-nFiaxs1D/IAxj54KUow0AkU35fxWj6iCHAcQ2GG2ISv0yD+YwnOoDHNmO1mV1g+roRV7G5czJNZlzv+3lcT2vg==}
+    engines: {node: '>=22'}
+    hasBin: true
 
   '@mark1russell7/ste-lint@https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905':
     resolution: {gitHosted: true, integrity: sha512-VWKTHvPQEnTV/nbBzNaFmm/yzfZxqiakZwlroonxX2S8kchU1xssZi5gTgO+Wm5o+Lnhyk7mwLdnq3Sh5gkp4w==, tarball: https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905}
@@ -1416,6 +1432,8 @@ snapshots:
 
   '@mark1russell7/rigor-generators@0.1.16': {}
 
+  '@mark1russell7/rigor-generators@0.2.0': {}
+
   '@mark1russell7/rigor-statistics@0.1.27':
     dependencies:
       '@mark1russell7/rigor-generators': 0.1.16
@@ -1423,6 +1441,10 @@ snapshots:
   '@mark1russell7/rigor-statistics@0.2.1':
     dependencies:
       '@mark1russell7/rigor-generators': 0.1.16
+
+  '@mark1russell7/rigor-statistics@0.2.9':
+    dependencies:
+      '@mark1russell7/rigor-generators': 0.2.0
 
   '@mark1russell7/service@0.8.20(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)':
     dependencies:
@@ -1449,6 +1471,10 @@ snapshots:
       '@opentelemetry/api': 1.10.0
       ws: 8.22.1
       zod: 4.6.7
+
+  '@mark1russell7/site-pages@0.7.0':
+    dependencies:
+      '@mark1russell7/rigor-statistics': 0.2.9
 
   '@mark1russell7/ste-lint@https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905':
     dependencies:
