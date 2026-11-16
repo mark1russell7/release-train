@@ -5,9 +5,12 @@ import { UNSETTLED } from "./run-command.ts";
 
 const guard = pathToFileURL(fileURLToPath(new URL("./run-command.ts", import.meta.url))).href;
 
+/** The folder of the package, so a script of `run` can import its dependencies. */
+const packageDir = fileURLToPath(new URL("..", import.meta.url));
+
 /** This function runs a module script in a new Node process and gives its exit code and its output. */
 function run(script: string): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 30_000 });
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 30_000, cwd: packageDir });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
@@ -70,5 +73,23 @@ describe("runCommand", () => {
     `);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("a plain text");
+  });
+
+  // The GitHub reads of collect.ts retry on the default clock of retry. Before @mark1russell7/service 0.9.0, its timers had
+  // unref, so Node ended the process in the wait of a rate limit with the code 0.
+  it("a retry on the default clock of @mark1russell7/service keeps the process alive in its wait", () => {
+    const result = run(`
+      const { retry } = await import("@mark1russell7/service");
+      const { runCommand } = await import(${JSON.stringify(guard)});
+      runCommand(async () => {
+        let tries = 0;
+        const value = await retry(async () => { tries += 1; if (tries === 1) throw new Error("busy"); return 7; }, { tries: 2, base: 200, factor: 1, cap: 200 });
+        console.log("after the retry", value, tries);
+        return 0;
+      });
+    `);
+    expect(result.stderr).not.toContain(UNSETTLED);
+    expect(result.stdout).toContain("after the retry 7 2");
+    expect(result.status).toBe(0);
   });
 });

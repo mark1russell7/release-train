@@ -197,8 +197,8 @@ importers:
         specifier: ^0.41.0
         version: 0.41.14
       '@mark1russell7/service':
-        specifier: ^0.8.6
-        version: 0.8.20(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
+        specifier: ^0.9.0
+        version: 0.9.0(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
       '@mark1russell7/text':
         specifier: ^0.0.6
         version: 0.0.6
@@ -474,6 +474,15 @@ packages:
       zod:
         optional: true
 
+  '@mark1russell7/algebra@0.9.0':
+    resolution: {integrity: sha512-lBqHZc3y41qI2YG2AAuqqqsry9GEvZiHyjmM6nWBaXi1sJxwMzNVlwUwIdY30axf1Ttun0wXzz/4SO6LZZ6giQ==}
+    engines: {node: '>=22.19'}
+    peerDependencies:
+      zod: ^4.1.0
+    peerDependenciesMeta:
+      zod:
+        optional: true
+
   '@mark1russell7/api-report@0.5.7':
     resolution: {integrity: sha512-Oe69KbJhZL6GIrbEwNVIFN+Yz5XLjgEt78CrQZFX7vdeGANWuRyDCoLQaebumVuyip52WpPt19ZQU7n3Oj5WmQ==}
     engines: {node: '>=22'}
@@ -554,6 +563,36 @@ packages:
 
   '@mark1russell7/service@0.8.20':
     resolution: {integrity: sha512-8yo1hu4MMXCdzRk43tSvB1xqb9MBgOqAmKisspOGszqsRCZVjdmSbZ1Hgli6RtE5jrF7I7eaGEQLHADnhxxHGQ==}
+    engines: {node: '>=22.19'}
+    peerDependencies:
+      '@grpc/grpc-js': ^1.14.6
+      '@opentelemetry/api': ^1.9.0
+      amqplib: ^2.2.0
+      ioredis: ^6.0.0
+      mongodb: ^7.7.0
+      pg: ^8.23.1
+      ws: ^8.22.0
+      zod: ^4.1.0
+    peerDependenciesMeta:
+      '@grpc/grpc-js':
+        optional: true
+      '@opentelemetry/api':
+        optional: true
+      amqplib:
+        optional: true
+      ioredis:
+        optional: true
+      mongodb:
+        optional: true
+      pg:
+        optional: true
+      ws:
+        optional: true
+      zod:
+        optional: true
+
+  '@mark1russell7/service@0.9.0':
+    resolution: {integrity: sha512-oKg0LwD5JWdrIm1iW+UvXJO3nf4MHVmgmNS/u2Ks7G76uK/6GZrE9yvpvyMraPfOhFypGCVC3Lo60KL8GjZzrw==}
     engines: {node: '>=22.19'}
     peerDependencies:
       '@grpc/grpc-js': ^1.14.6
@@ -1359,6 +1398,12 @@ snapshots:
     optionalDependencies:
       zod: 4.6.7
 
+  '@mark1russell7/algebra@0.9.0(zod@4.6.7)':
+    dependencies:
+      '@mark1russell7/quantity': 0.4.1(zod@4.6.7)
+    optionalDependencies:
+      zod: 4.6.7
+
   '@mark1russell7/api-report@0.5.7':
     dependencies:
       '@mark1russell7/conventions': 0.41.14
@@ -1429,6 +1474,19 @@ snapshots:
   '@mark1russell7/service@0.8.20(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)':
     dependencies:
       '@mark1russell7/algebra': 0.8.10(zod@4.6.7)
+      '@mark1russell7/collections': 0.11.0(zod@4.6.7)
+      '@mark1russell7/quantity': 0.4.1(zod@4.6.7)
+      '@mark1russell7/rational': 0.1.2
+      '@mark1russell7/rigor-generators': 0.1.16
+      '@mark1russell7/text': 0.0.6
+    optionalDependencies:
+      '@opentelemetry/api': 1.10.0
+      ws: 8.22.1
+      zod: 4.6.7
+
+  '@mark1russell7/service@0.9.0(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)':
+    dependencies:
+      '@mark1russell7/algebra': 0.9.0(zod@4.6.7)
       '@mark1russell7/collections': 0.11.0(zod@4.6.7)
       '@mark1russell7/quantity': 0.4.1(zod@4.6.7)
       '@mark1russell7/rational': 0.1.2
