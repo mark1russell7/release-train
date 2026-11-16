@@ -9,7 +9,7 @@ import { pool } from "./collect.ts";
 import { rateLimitLine } from "./github.ts";
 import type { GitHub, RateLimitReport } from "./github.ts";
 import { holdsUpdate } from "./holds.ts";
-import { outsideLine, readsOutside, refusalLine, routeLines } from "./meter.ts";
+import { outsideLine, RateStop, readsOutside, refusalLine, routeLines } from "./meter.ts";
 import type { LagHold } from "./holds.ts";
 import { adoptWhy, moveSets } from "./plan.ts";
 import type { Action, ActionItem, Plan } from "./plan.ts";
@@ -1100,6 +1100,30 @@ export function applySummary(r: ApplyReport): string {
  * It keeps no state between runs: each run reads the state from GitHub again.
  */
 export async function apply(o: ApplyOptions): Promise<ApplyReport> {
+  const sofar: ApplySoFar = { results: [], inFlight: [] };
+  try {
+    return await applySteps(o, sofar);
+  } catch (e) {
+    if (!(e instanceof RateStop)) throw e;
+    // A stop of the guard ends the run (budget.ts). The report keeps each result and each release in flight before the
+    // stop, so the summary tells each push and each start of a release workflow.
+    return { owner: o.owner, at: (o.now ?? new Date()).toISOString(), dryRun: o.dryRun, results: sofar.results, inFlight: sofar.inFlight };
+  }
+}
+
+/** The results of `apply` so far. A stop of the guard keeps each result and each release in flight before it. */
+interface ApplySoFar {
+  results: RepoResult[];
+  inFlight: { name: string; version: string }[];
+}
+
+/** This function throws a stop of the guard of the run again, so that `apply` ends with the report so far. Each other error stays with its step. */
+function stopOn(e: unknown): void {
+  if (e instanceof RateStop) throw e;
+}
+
+/** This function does the steps of `apply`. It adds each result and each release in flight to `sofar` at once. */
+async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyReport> {
   const log = o.log ?? (() => {});
   const label = o.label ?? ((repo: string, priv: boolean) => (priv ? hashName(repo) : repo));
   const gh = o.gh;
@@ -1118,14 +1142,15 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       const wf = await gh.request<{ content?: string }>("GET", `${base}/${repo}/contents/.github/workflows/release.yml`);
       const text = wf.data?.content ? Buffer.from(wf.data.content, "base64").toString("utf8") : "";
       if (text && !dispatchOnly(text) && (await lastReleaseFlies(repo))) flying.add(repo);
-    } catch {
+    } catch (e) {
+      stopOn(e);
       flying.add(repo);
     }
   }
   const sel = selectUpdates(o.plan, o.only ?? null, o.cascade ?? "all", flying, o.holds ?? []);
   const privateOf = new Map(o.plan.repos.map((r) => [r.name, r.private]));
   const scan = o.plan.repos.map((r) => r.name).filter((n) => !o.only || o.only.includes(n));
-  const results: RepoResult[] = [];
+  const results = sofar.results;
   const result = (x: Omit<RepoResult, "private"> & { private?: boolean }): RepoResult => {
     const full: RepoResult = { ...x, private: x.private ?? privateOf.get(x.repo) ?? true };
     results.push(full);
@@ -1496,6 +1521,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       return await decideWith(policy, facts, (need) => reader.read(need, t));
     } catch (e) {
       log(`${label(t.repo, t.private)}: the candidate rules did not decide${t.private ? "." : `: ${e instanceof Error ? e.message : String(e)}`}`);
+      stopOn(e);
       return null;
     }
   };
@@ -1767,6 +1793,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         result({ ...base0, state: s.state, pr: prRef(pr), ci: s.ci, detail, ...mergedOf(s) });
       } catch (e) {
         result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
+        stopOn(e);
       }
     }
   };
@@ -2005,6 +2032,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
     } catch (e) {
       record.cause = "error";
       result({ ...common, state: "error", pr: prRef(existing), autoMerge: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
+      stopOn(e);
     }
   }
 
@@ -2164,6 +2192,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
         });
       } catch (e) {
         fail(e instanceof Error ? e.message : String(e));
+        stopOn(e);
       }
     };
     const list = pacing ? rotate(scan, slot) : scan;
@@ -2180,7 +2209,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
   // A repository whose release workflow starts only by hand (for example with changesets) needs a dispatch after green CI on main.
   // Only a version that a release workflow publishes soon is in flight: a workflow that starts on a push, a workflow that runs,
   // or a workflow that this run started. A version of a workflow that waits for a start by hand is not in flight.
-  const inFlight: { name: string; version: string }[] = [];
+  const inFlight = sofar.inFlight;
   const infoOf = new Map(o.plan.repos.map((r) => [r.name, r]));
   const pendingOf = pendingVersions(o.plan, o.only ?? null);
   const releaseRepos = new Set(pendingOf.keys());
@@ -2241,6 +2270,7 @@ export async function apply(o: ApplyOptions): Promise<ApplyReport> {
       result({ ...base0, state: "opened", pr: null, ci, detail: `The train started the release workflow for ${what}.` });
     } catch (e) {
       result({ ...base0, state: "error", pr: null, ci: null, detail: e instanceof Error ? e.message : String(e) });
+      stopOn(e);
     }
   }
 

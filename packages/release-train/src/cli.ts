@@ -568,6 +568,8 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     const urgentList = urgent !== undefined ? urgent : await urgentNames(o, gh, log);
     const planned = guard.stopped();
     if (planned) return await stopEarly(planned);
+    // From here, apply keeps the report so far at a stop of the guard. Thus a stop that comes out of apply is an error.
+    guardStop = null;
     const report = await apply({
       owner: o.owner,
       plan: p,
