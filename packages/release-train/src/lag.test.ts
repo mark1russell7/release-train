@@ -393,4 +393,52 @@ describe("the red pull requests of the train", () => {
     });
     expect(green.red).toEqual([]);
   });
+
+  it("leaves out a failed job with continue-on-error in a run that passed, as apply does", async () => {
+    const routes = {
+      "/search/issues": search(7),
+      "/repos/o/r/pulls/7": { head: { sha: "h" } },
+      "/repos/o/r/commits/h/check-runs": {
+        check_runs: [
+          { name: "unit", status: "completed", conclusion: "success", completed_at: ago(40 * HOUR), check_suite: { id: 1 } },
+          { name: "Browser tests (Safari on iOS, simulator)", status: "completed", conclusion: "failure", completed_at: ago(40 * HOUR), check_suite: { id: 1 } },
+        ],
+      },
+    };
+    const passed = await run([], { ...routes, "/repos/o/r/actions/runs": { workflow_runs: [{ workflow_id: 10, check_suite_id: 1, created_at: ago(41 * HOUR), status: "completed", conclusion: "success" }] } });
+    expect(passed.red).toEqual([]);
+    expect(lagOver(passed)).toBe(false);
+    // The same failed job in a run that failed counts
+    const failed = await run([], { ...routes, "/repos/o/r/actions/runs": { workflow_runs: [{ workflow_id: 10, check_suite_id: 1, created_at: ago(41 * HOUR), status: "completed", conclusion: "failure" }] } });
+    expect(failed.red[0]).toMatchObject({ number: 7, checks: ["Browser tests (Safari on iOS, simulator)"], over: true });
+  });
+
+  it("leaves out a failed check of an older run of the same workflow", async () => {
+    const r = await run([], {
+      "/search/issues": search(7),
+      "/repos/o/r/pulls/7": { head: { sha: "h" } },
+      "/repos/o/r/commits/h/check-runs": {
+        check_runs: [
+          { name: "test", status: "completed", conclusion: "failure", completed_at: ago(30 * HOUR), check_suite: { id: 1 } },
+          { name: "test", status: "completed", conclusion: "success", completed_at: ago(2 * HOUR), check_suite: { id: 2 } },
+        ],
+      },
+      "/repos/o/r/actions/runs": {
+        workflow_runs: [
+          { workflow_id: 10, check_suite_id: 1, created_at: ago(31 * HOUR), status: "completed", conclusion: "failure" },
+          { workflow_id: 10, check_suite_id: 2, created_at: ago(3 * HOUR), status: "completed", conclusion: "success" },
+        ],
+      },
+    });
+    expect(r.red).toEqual([]);
+  });
+
+  it("keeps each failed check when the workflow runs are not read, so a fault gives a row", async () => {
+    const r = await run([], {
+      "/search/issues": search(7),
+      "/repos/o/r/pulls/7": { head: { sha: "h" } },
+      "/repos/o/r/commits/h/check-runs": { check_runs: [{ name: "test", status: "completed", conclusion: "failure", completed_at: ago(30 * HOUR), check_suite: { id: 1 } }] },
+    });
+    expect(r.red[0]).toMatchObject({ number: 7, checks: ["test"], over: true });
+  });
 });

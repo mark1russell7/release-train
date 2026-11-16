@@ -1,6 +1,6 @@
 import { pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
-import { BLOCKED_LABEL, TRAIN_BRANCH } from "./apply.ts";
+import { BLOCKED_LABEL, TRAIN_BRANCH, latestRuns } from "./apply.ts";
 import type { GitHub } from "./github.ts";
 import type { HoldReading, LagHold } from "./holds.ts";
 import { SYNC_BRANCH } from "./sync.ts";
@@ -429,7 +429,11 @@ interface EventAnswer {
 }
 
 interface CheckAnswer {
-  check_runs?: { name: string; conclusion: string | null; completed_at: string | null }[];
+  check_runs?: { name: string; status: string; conclusion: string | null; completed_at: string | null; check_suite?: { id: number } | null }[];
+}
+
+interface WorkflowAnswer {
+  workflow_runs?: { workflow_id: number; check_suite_id: number; created_at: string; status?: string; conclusion?: string | null }[];
 }
 
 const FAILED: ReadonlySet<string> = new Set(["failure", "timed_out", "startup_failure"]);
@@ -437,6 +441,10 @@ const FAILED: ReadonlySet<string> = new Set(["failure", "timed_out", "startup_fa
 /**
  * This function gives the open pull requests of the train with a failed check on their head. A merge closes such a pull
  * request, so the first block of an open one starts its age. A new head of the train does not reset this age.
+ *
+ * The checks go through `latestRuns`, as in apply. Thus a failed job with `continue-on-error` in a workflow run that ended
+ * in success does not count, and a check of an older run of the same workflow does not count. A failed read of the workflow
+ * runs keeps each check, so a fault gives a row and not a silent pass.
  */
 async function redRows(i: LagInput, now: number, log: (line: string) => void): Promise<RedRow[]> {
   const out: RedRow[] = [];
@@ -454,7 +462,9 @@ async function redRows(i: LagInput, now: number, log: (line: string) => void): P
       const sha = pull.data?.head?.sha;
       if (sha === undefined) return null;
       const checks = await i.gh.request<CheckAnswer>("GET", `/repos/${i.owner}/${repo}/commits/${sha}/check-runs?per_page=100`);
-      const failed = (checks.data?.check_runs ?? []).filter((c) => c.conclusion !== null && FAILED.has(c.conclusion));
+      const workflows = await i.gh.request<WorkflowAnswer>("GET", `/repos/${i.owner}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
+      const latest = latestRuns(checks.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []);
+      const failed = latest.filter((c) => c.conclusion !== null && FAILED.has(c.conclusion));
       if (failed.length === 0) return null;
       const events = await i.gh.request<EventAnswer[]>("GET", `/repos/${i.owner}/${repo}/issues/${item.number}/events?per_page=100`);
       const blocks = (events.data ?? []).filter((e) => e.event === "labeled" && e.label?.name === BLOCKED_LABEL).map((e) => e.created_at);
