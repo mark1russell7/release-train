@@ -213,15 +213,60 @@ interface UsedSample {
 }
 
 /**
- * This function gives the outside use from the samples of the answers. A window of the rate limit ends when the reset
- * moves by more than one minute. The reset of one window can differ by some seconds from one answer to the next.
+ * One answer of the resource `core`, as the report keeps it. On 2026-11-16 the samples gave no outside use, but the two
+ * reads of `GET /rate_limit` gave 7,971 (Train 43805901480). The samples let a reader find which measure is wrong.
+ */
+export interface MeterSample extends UsedSample {
+  /** The value of `x-ratelimit-remaining`, or null when the answer does not have it. */
+  remaining: number | null;
+  /** The status of the answer. */
+  status: number;
+  /** The route template of the request. It holds no name. */
+  route: string;
+}
+
+/** The largest count of samples that a meter keeps. A run that has more keeps the first ones and counts the others. */
+export const SAMPLE_MAX = 12_000;
+
+/** The answers that refused a request with the status 403 or 429, by cause. */
+export interface Refusals {
+  /** A spent primary rate limit: `x-ratelimit-remaining: 0`, or a message of a spent rate limit. */
+  primary: number;
+  /** A secondary rate limit: `retry-after`, or a message that names a secondary rate limit. */
+  secondary: number;
+  /** A refusal with no sign of a rate limit, for example a permission error. */
+  other: number;
+  /** The time of the first refusal for a rate limit, primary or secondary, or null. */
+  first: string | null;
+}
+
+/** The cause of a refusal. */
+export type RefusalKind = "primary" | "secondary" | "other";
+
+/**
+ * This function gives the cause of a refusal from the status, the headers and the message of the answer. For an answer
+ * that is not a refusal, it gives null. GitHub can send a secondary rate limit as a 403 with no `retry-after`. Only its
+ * message tells it from a permission error.
+ */
+export function refusalKind(status: number, headers: Headers, message: string): RefusalKind | null {
+  if (status !== 403 && status !== 429) return null;
+  if (headers.get("x-ratelimit-remaining")?.trim() === "0") return "primary";
+  if (headers.has("retry-after") || /secondary rate limit/i.test(message)) return "secondary";
+  if (/rate limit/i.test(message)) return "primary";
+  return "other";
+}
+
+/**
+ * This function gives the outside use from the samples of the answers. A window of the rate limit holds the samples
+ * whose reset is in one minute of the reset of the window. The reset of one window can differ by some seconds from one
+ * answer to the next. A sample goes to its window also when the samples of two windows alternate.
  */
 export function outsideUse(samples: readonly UsedSample[]): OutsideUse {
   const sorted = [...samples].sort((a, b) => a.at - b.at || a.used - b.used);
   const windows: UsedSample[][] = [];
   for (const sample of sorted) {
-    const open = windows[windows.length - 1];
-    if (open && Math.abs(sample.reset - (open[0]?.reset ?? sample.reset)) <= 60) open.push(sample);
+    const open = windows.find((w) => Math.abs(sample.reset - (w[0]?.reset ?? sample.reset)) <= 60);
+    if (open) open.push(sample);
     else windows.push([sample]);
   }
   let requests = 0;
@@ -241,13 +286,24 @@ export function outsideUse(samples: readonly UsedSample[]): OutsideUse {
 }
 
 /** This function gives the sample of an answer, or null when the answer has no header of the rate limit of `core`. */
-function sampleOf(res: Response, at: number): UsedSample | null {
+function sampleOf(res: Response, at: number, route: string): MeterSample | null {
   const resource = res.headers.get("x-ratelimit-resource");
   if (resource !== null && resource !== "core") return null;
   const used = res.headers.get("x-ratelimit-used");
   const reset = res.headers.get("x-ratelimit-reset");
   if (used === null || reset === null || !/^\d+$/.test(used.trim()) || !/^\d+$/.test(reset.trim())) return null;
-  return { at, used: Number(used), reset: Number(reset) };
+  const left = res.headers.get("x-ratelimit-remaining")?.trim() ?? "";
+  return { at, used: Number(used), reset: Number(reset), remaining: /^\d+$/.test(left) ? Number(left) : null, status: res.status, route };
+}
+
+/** This function gives the message of a refusal from a copy of the answer, so the caller can still read the body. */
+async function refusalMessage(res: Response): Promise<string> {
+  if (typeof res.clone !== "function") return "";
+  try {
+    return (await res.clone().text()).slice(0, 500);
+  } catch {
+    return "";
+  }
 }
 
 /** A meter of the GitHub requests of a run. */
@@ -258,6 +314,10 @@ export interface Meter {
   routes(): RouteCount[];
   /** This function gives the use of the rate limit that the meter did not send. */
   outside(): OutsideUse;
+  /** This function gives the samples of the answers of `core`, in the order of the answers, at most `SAMPLE_MAX`. */
+  samples(): MeterSample[];
+  /** This function gives the refusals by cause. */
+  refusals(): Refusals;
 }
 
 /**
@@ -271,7 +331,8 @@ export interface Meter {
 export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API, now: () => number = Date.now): Meter {
   const send: FetchFn = inner ?? ((u, i) => fetch(u, i));
   const counts = new Map<string, RouteCount>();
-  const samples: UsedSample[] = [];
+  const samples: MeterSample[] = [];
+  const refusals: Refusals = { primary: 0, secondary: 0, other: 0, first: null };
   const add = (route: string, status: number | null): void => {
     const row = counts.get(route) ?? { route, count: 0, notModified: 0, failed: 0 };
     row.count += 1;
@@ -291,11 +352,19 @@ export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API, now:
         throw error;
       }
       add(route, res.status);
-      const sample = sampleOf(res, now());
-      if (sample) samples.push(sample);
+      const at = now();
+      const sample = sampleOf(res, at, route);
+      if (sample && samples.length < SAMPLE_MAX) samples.push(sample);
+      if (res.status === 403 || res.status === 429) {
+        const kind = refusalKind(res.status, res.headers, await refusalMessage(res));
+        if (kind) refusals[kind] += 1;
+        if (kind !== "other" && refusals.first === null) refusals.first = new Date(at).toISOString();
+      }
       return res;
     },
     outside: () => outsideUse(samples),
+    samples: () => samples.map((s) => ({ ...s })),
+    refusals: () => ({ ...refusals }),
     routes: () =>
       [...counts.values()]
         .map((row) => ({ ...row }))
@@ -303,11 +372,50 @@ export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API, now:
   };
 }
 
-/** This function gives the line of the summary for the outside use. */
-export function outsideLine(o: OutsideUse): string {
-  if (o.answers === 0) return "GitHub requests outside the meter: no read (no answer had the header x-ratelimit-used).";
+/** One read of `GET /rate_limit`: the used count and the time of the reset as an ISO text. */
+interface UsedRead {
+  used: number;
+  reset: string;
+}
+
+/**
+ * This function gives the outside use from the two reads of `GET /rate_limit`, at the start and at the end of a run. It
+ * is the rise of the used count, minus each request of the meter that GitHub counts. GitHub counts each request but an
+ * answer 304. The function gives null when a read failed or when the window of the rate limit changed between the two
+ * reads. The value can be below 0.
+ */
+export function readsOutside(start: UsedRead | null | undefined, end: UsedRead | null | undefined, routes: readonly RouteCount[]): number | null {
+  if (!start || !end) return null;
+  const a = Date.parse(start.reset);
+  const b = Date.parse(end.reset);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || Math.abs(a - b) > 60_000) return null;
+  return end.used - start.used - routes.reduce((n, r) => n + r.count - r.notModified, 0);
+}
+
+/** The smallest difference of the two measures that the line calls a disagreement, also when 5 % of the larger is less. */
+export const DISAGREE_MIN = 50;
+
+/**
+ * This function gives the line of the summary for the outside use. With the measure of the two reads (`readsOutside`),
+ * the line gives both measures, and it tells when they disagree. Then the count of the samples is not a read.
+ */
+export function outsideLine(o: OutsideUse, reads: number | null = null): string {
+  const fromReads = reads === null ? "" : ` The two reads of GET /rate_limit give ${reads}.`;
+  if (o.answers === 0) return `GitHub requests outside the meter: no read from the answers (no answer had the header x-ratelimit-used).${fromReads}`;
   const jumps = o.jumps.map((j) => `${j.size} at ${j.at.slice(11, 19)}Z`).join(", ");
-  return `GitHub requests outside the meter: ${o.requests}, from ${o.answers} answers.${jumps ? ` The largest jumps: ${jumps}.` : ""}`;
+  const disagree =
+    reads !== null && Math.abs(reads - o.requests) > Math.max(DISAGREE_MIN, 0.05 * Math.max(Math.abs(reads), o.requests))
+      ? " The two measures disagree, so neither count is a read. The report has each sample (rateLimit.samples)."
+      : "";
+  return `GitHub requests outside the meter: ${o.requests}, from ${o.answers} answers.${jumps ? ` The largest jumps: ${jumps}.` : ""}${fromReads}${disagree}`;
+}
+
+/** This function gives the line of the summary for the refusals, or null when GitHub refused no request. */
+export function refusalLine(r: Refusals): string | null {
+  const all = r.primary + r.secondary + r.other;
+  if (all === 0) return null;
+  const first = r.first ? ` The first refusal for a rate limit came at ${r.first.slice(11, 19)}Z.` : "";
+  return `GitHub refused ${all} requests with 403 or 429: ${r.primary} for a spent rate limit, ${r.secondary} for a secondary rate limit, ${r.other} with no sign of a rate limit.${first}`;
 }
 
 /** This function gives the lines of the summary for the routes: one line with the totals, and a table with the largest count first. */
