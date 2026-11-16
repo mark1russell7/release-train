@@ -1,5 +1,7 @@
 import { gunzipSync } from "node:zlib";
 import semver from "semver";
+import { rateLimitText, rateLimitWait } from "./collect.ts";
+import { refusalKind } from "./meter.ts";
 
 /** The release type of a version bump. */
 export type ReleaseType = "patch" | "minor" | "major";
@@ -159,5 +161,58 @@ export async function awaitRelease(i: AwaitInput): Promise<{ name: string; versi
     for (const x of i.inFlight) if (await i.published(x.name, x.version)) return x;
     if (waited + i.intervalMs > i.maxMs) return null;
     await i.sleep(i.intervalMs);
+  }
+}
+
+/** The input of `dispatchReleased`. Each time is in milliseconds. */
+export interface DispatchInput {
+  /** This function sends the `released` event one time and gives the answer of GitHub. */
+  send: () => Promise<Pick<Response, "ok" | "status" | "headers" | "text">>;
+  /** This function waits the given time. */
+  sleep: (ms: number) => Promise<void>;
+  /** This function gives the time in epoch milliseconds. */
+  now: () => number;
+  /** The most tries, the first try included. */
+  attempts: number;
+  /** The most wait before one try. A rate limit that asks for a longer wait stops the tries. */
+  maxWaitMs: number;
+}
+
+/** The result of `dispatchReleased`. A failure has `limit` when a rate limit refused the last try, else `limit` is null. */
+export type DispatchResult =
+  | { ok: true; tries: number }
+  | { ok: false; status: number; tries: number; limit: string | null; message: string | null };
+
+/** The wait after a rate limit whose answer gives no time: GitHub asks for one minute at least. */
+export const LIMIT_WAIT_MS = 60_000;
+
+/** The time after `x-ratelimit-reset` before the next try, because the header gives whole seconds. */
+const RESET_MARGIN_MS = 1000;
+
+/**
+ * This function sends the `released` event of `repository_dispatch`. After a rate limit, it waits for the time that GitHub
+ * asks for (`retry-after`, else `x-ratelimit-reset`) and tries again. A rate limit refuses the event before GitHub makes it.
+ * Each different failure stops at once. A status 5xx can come after GitHub made the event, and a second event starts a
+ * second run of the train.
+ */
+export async function dispatchReleased(i: DispatchInput): Promise<DispatchResult> {
+  for (let tries = 1; ; tries++) {
+    const res = await i.send();
+    if (res.ok) return { ok: true, tries };
+    const text = await res.text().catch(() => "");
+    let message: string | null = null;
+    try {
+      const doc = JSON.parse(text) as { message?: unknown } | null;
+      if (typeof doc?.message === "string") message = doc.message;
+    } catch {
+      // A body that is not JSON has no message.
+    }
+    const kind = refusalKind(res.status, res.headers, message ?? "");
+    const limited = kind === "primary" || kind === "secondary";
+    const limit = limited ? (rateLimitText(res, i.now()) ?? (kind === "secondary" ? "a secondary rate limit of GitHub" : "a spent rate limit of GitHub")) : null;
+    const asked = limited ? rateLimitWait(res.headers, i.now()) : null;
+    const wait = limited ? (asked === null ? LIMIT_WAIT_MS : asked + RESET_MARGIN_MS) : null;
+    if (wait === null || tries >= i.attempts || wait > i.maxWaitMs) return { ok: false, status: res.status, tries, limit, message };
+    await i.sleep(wait);
   }
 }

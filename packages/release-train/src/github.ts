@@ -1,7 +1,8 @@
 import { nextLink } from "./collect.ts";
 import type { FetchFn, PageRead } from "./collect.ts";
 import type { GateRecord } from "./budget.ts";
-import type { MeterSample, OutsideUse, Refusals, RouteCount } from "./meter.ts";
+import { refusalKind } from "./meter.ts";
+import type { MeterSample, OutsideUse, RefusalKind, Refusals, RouteCount } from "./meter.ts";
 
 /** The result of one request to the GitHub API. */
 export interface GhResponse<T> {
@@ -12,6 +13,11 @@ export interface GhResponse<T> {
   message: string | null;
   /** The URL of the next page, from the `link` header. A client that does not read the header does not give it. */
   next?: string | null;
+  /**
+   * The cause of a refusal with the status 403 or 429, from `refusalKind`. A different status has no cause. A client that
+   * does not read the headers does not give it.
+   */
+  refusal?: RefusalKind;
 }
 
 /** A small client for the REST API and the GraphQL API of GitHub. */
@@ -49,7 +55,8 @@ export function gitHub(opts: { token: string | null; fetch?: FetchFn; apiBase?: 
         data = null;
       }
       const message = !res.ok && data && typeof data === "object" && "message" in data ? String((data as { message: unknown }).message) : null;
-      return { status: res.status, ok: res.ok, data: res.ok ? (data as T) : null, message, next: nextLink(res.headers.get("link")) };
+      const refusal = refusalKind(res.status, res.headers, message ?? "");
+      return { status: res.status, ok: res.ok, data: res.ok ? (data as T) : null, message, next: nextLink(res.headers.get("link")), ...(refusal === null ? {} : { refusal }) };
     },
     async text(path: string): Promise<GhResponse<string>> {
       // GitHub sends a job log as a redirect to a signed URL. The fetch follows it.

@@ -9,7 +9,7 @@ import { gitHub } from "./github.ts";
 import type { FetchFn } from "./collect.ts";
 import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
-import { addChangelogSection, awaitRelease, changesetText, decideBump, decisionBreaks, namesModule, setManifestVersion, typedFiles } from "./release.ts";
+import { addChangelogSection, awaitRelease, changesetText, dispatchReleased, decideBump, decisionBreaks, namesModule, setManifestVersion, typedFiles } from "./release.ts";
 import type { Manifest, NpmInfo, RepoSnapshot } from "./types.ts";
 import { changesetName, CREDENTIAL_NAME, gitUpdater, needsGitAuth, UPDATE_SCRIPT } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
@@ -482,5 +482,65 @@ describe("changesetName", () => {
     expect(changesetName(() => false, "0123456789ab")).toBe("release-train-01234567.md");
     const taken = new Set(["release-train-01234567.md", "release-train-01234567-2.md"]);
     expect(changesetName((n) => taken.has(n), "0123456789ab")).toBe("release-train-01234567-3.md");
+  });
+});
+
+describe("dispatchReleased", () => {
+  const NOW = Date.parse("2026-11-16T15:51:14Z");
+  const answer = (status: number, headers: Record<string, string> = {}, message?: string): Response =>
+    new Response(status === 204 ? null : JSON.stringify(message === undefined ? {} : { message }), { status, headers });
+  const spent = (resetInSeconds: number): Response =>
+    answer(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(NOW / 1000 + resetInSeconds) }, "API rate limit exceeded for installation ID 1.");
+  const run = async (answers: Response[], maxWaitMs = 15 * 60_000) => {
+    const waits: number[] = [];
+    let sent = 0;
+    const result = await dispatchReleased({
+      send: async () => answers[sent++] ?? answer(204),
+      sleep: async (ms) => void waits.push(ms),
+      now: () => NOW,
+      attempts: 2,
+      maxWaitMs,
+    });
+    return { result, waits, sent };
+  };
+
+  it("sends the event one time when GitHub takes it", async () => {
+    expect(await run([answer(204)])).toEqual({ result: { ok: true, tries: 1 }, waits: [], sent: 1 });
+  });
+
+  it("waits for the reset of a spent rate limit and tries again", async () => {
+    // Train 43898917642: GitHub refused the dispatch at 15:51:14Z, and the limit reset 72 s later.
+    expect(await run([spent(72), answer(204)])).toEqual({ result: { ok: true, tries: 2 }, waits: [73_000], sent: 2 });
+  });
+
+  it("stops at once when the reset is later than the most wait", async () => {
+    const { result, waits, sent } = await run([spent(20 * 60)]);
+    expect(result).toMatchObject({ ok: false, status: 403, tries: 1, message: "API rate limit exceeded for installation ID 1." });
+    expect(result.ok ? null : result.limit).toContain("spent until 16:12Z");
+    expect([waits, sent]).toEqual([[], 1]);
+  });
+
+  it("stops after the last try, and the result keeps the rate limit", async () => {
+    const { result, waits } = await run([spent(72), spent(72)]);
+    expect(result).toMatchObject({ ok: false, status: 403, tries: 2 });
+    expect(result.ok ? null : result.limit).not.toBeNull();
+    expect(waits).toEqual([73_000]);
+  });
+
+  it("waits the time of retry-after, and one minute for a secondary rate limit with no time", async () => {
+    expect((await run([answer(429, { "retry-after": "30" }), answer(204)])).waits).toEqual([31_000]);
+    expect((await run([answer(403, {}, "You have exceeded a secondary rate limit."), answer(204)])).waits).toEqual([60_000]);
+  });
+
+  it("stops at once on a refusal with no sign of a rate limit, and gives the message of GitHub", async () => {
+    const { result, sent } = await run([answer(403, {}, "Resource not accessible by integration")]);
+    expect(result).toEqual({ ok: false, status: 403, tries: 1, limit: null, message: "Resource not accessible by integration" });
+    expect(sent).toBe(1);
+  });
+
+  it("does not send the event again after a status 5xx, because GitHub can have made it", async () => {
+    const { result, sent } = await run([answer(502)]);
+    expect(result).toEqual({ ok: false, status: 502, tries: 1, limit: null, message: null });
+    expect(sent).toBe(1);
   });
 });

@@ -48,3 +48,14 @@ describe("rateLimitLine", () => {
     expect(rateLimitLine({ start: null, end: null })).toBe("GitHub rate limit: no read.");
   });
 });
+
+describe("the refusal of an answer", () => {
+  it("gives the cause of a 403 or 429, and no cause for a different status", async () => {
+    const spent: FetchFn = async () => new Response(JSON.stringify({ message: "API rate limit exceeded" }), { status: 403, headers: { "x-ratelimit-remaining": "0" } });
+    const a = await client(spent).request("GET", "/x");
+    const b = await client(answer(429, { message: "You have exceeded a secondary rate limit." })).request("GET", "/x");
+    const c = await client(answer(403, { message: "Resource not accessible by integration" })).request("GET", "/x");
+    const d = await client(answer(404, { message: "Not Found" })).request("GET", "/x");
+    expect([a.refusal, b.refusal, c.refusal, "refusal" in d]).toEqual(["primary", "secondary", "other", false]);
+  });
+});
