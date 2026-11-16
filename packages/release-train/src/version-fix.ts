@@ -204,8 +204,10 @@ export function trainKind(body: string | null): string | null {
 
 /**
  * This function decides from the author and the branch if the version fix can act on a pull request. It acts only on a
- * group of non-breaking updates of Renovate, and on an update of the train that is not a breaking adoption. The train
- * writes the version bump of a breaking adoption itself.
+ * group of non-breaking updates of Renovate, and on each update of the train. The train writes the version bump of a
+ * breaking adoption in a runtime section itself (the cascade release), so the release check does not name that package.
+ * A breaking adoption in a development section has no cascade. When such a development dependency is bundled into the
+ * shipped files, the release check names the package, and the version fix adds its PATCH: the public API stays.
  */
 export function pullScope(pr: PullInfo, trainLogin: string | null): FixDecision | { act: true; source: "renovate" | "train" } {
   if (!pr.sameRepo) return skip("the head branch is in a fork");
@@ -220,7 +222,6 @@ export function pullScope(pr: PullInfo, trainLogin: string | null): FixDecision 
     if (pr.headRef !== TRAIN_BRANCH) return skip("the branch is not the update branch of the train");
     const kind = trainKind(pr.body);
     if (kind === null) return skip("the body of the train pull request names no kind");
-    if (kind === "adopt-breaking") return skip("a breaking adoption: the train writes its version bump itself");
     return { act: true, source: "train" };
   }
   if (pr.author.endsWith("[bot]")) return skip("a pull request of another bot");

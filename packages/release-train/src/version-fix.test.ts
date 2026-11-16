@@ -148,11 +148,13 @@ describe("pullScope", () => {
     expect(pullScope(pr({ author: "dependabot[bot]" }), TRAIN)).toMatchObject({ act: false, reason: "a pull request of another bot" });
   });
 
-  it("acts on an update of the train that is not a breaking adoption", () => {
+  it("acts on each update of the train", () => {
     const train = (headRef: string, body: string | null) => pullScope(pr({ author: TRAIN, headRef, body }), TRAIN);
     expect(train(TRAIN_BRANCH, trainBody("adopt-in-range"))).toEqual({ act: true, source: "train" });
     expect(train(TRAIN_BRANCH, trainBody("settings"))).toEqual({ act: true, source: "train" });
-    expect(train(TRAIN_BRANCH, trainBody("adopt-breaking"))).toMatchObject({ act: false, reason: "a breaking adoption: the train writes its version bump itself" });
+    // A breaking adoption in devDependencies has no cascade release. A bundled development dependency changes the shipped
+    // files, so the release check names the package, and the version fix adds its PATCH.
+    expect(train(TRAIN_BRANCH, trainBody("adopt-breaking"))).toEqual({ act: true, source: "train" });
     expect(train(TRAIN_BRANCH, null)).toMatchObject({ act: false, reason: "the body of the train pull request names no kind" });
     expect(train("release-train/template", trainBody("adopt-in-range"))).toMatchObject({ act: false, reason: "the template sync is not a dependency update" });
     expect(train("release-train/other", trainBody("adopt-in-range"))).toMatchObject({ act: false, reason: "the branch is not the update branch of the train" });
