@@ -391,9 +391,10 @@ The template sync keeps the files from the repository `template` current in each
 - `site-config`: a repository that deploys a site with `reusable-pages.yml` gets the form of the rule `site-check-in-ci` of conventions.
   - The site values of the call go into `.github/site.json`, and the call gives none.
   - The deploy workflow does not start on `pull_request` or `pull_request_target`.
-  - A job `site` of `ci.yml` uses `reusable-pages-check.yml` with `contents: read`, and `CI OK` needs it. A `ci.yml` with no `CI OK` gets one, with the action `gate-summary`.
+  - A new job of `ci.yml` uses `reusable-pages-check.yml` with `contents: read`, and `CI OK` needs it. A `ci.yml` with no `CI OK` gets one, with the action `gate-summary`.
+  - The new job is `site`. When `ci.yml` has a job `site` of its own, the new job is `site-check`, and the old job stays.
   - The rule compares the config of the file with the config of the old inputs (`resolveSiteConfig`). When they differ, the rule changes nothing.
-  - A form that the rule cannot change safely goes under "Needs a hand". Examples are an expression of the workflow in a site value, a job `site` of another form, and two deploys.
+  - A form that the rule cannot change safely goes under "Needs a hand". Examples are an expression of the workflow in a site value, a `ci.yml` with no `CI OK` and a job `ci-ok`, and two deploys.
 
 A rule writes a JSON file in the layout of Prettier, so the check `prettier --check` of the repository passes on it (`formatJson`). It keeps the indent and the line ends of the file. `package.json`, `package-lock.json` and `composer.json` get the layout of `JSON.stringify`, as with the parser `json-stringify` of Prettier. In another JSON file, an array goes on one line when it has no object and fits in the `printWidth`. The `printWidth` comes from the Prettier config of the repository, and it is 80 when no config sets it.
 

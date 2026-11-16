@@ -5,7 +5,7 @@ import { siteCheckInCi } from "@mark1russell7/conventions";
 import { resolveSiteConfig, SITE_CONFIG_PATH } from "@mark1russell7/site-pages/config";
 import { afterAll, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
-import { moveSiteConfig, type SiteMove, type WorkflowText } from "./site-config.ts";
+import { checkJobId, moveSiteConfig, type SiteMove, type WorkflowText } from "./site-config.ts";
 import { SITE_CONFIG_COMMENT, syncRepo, type RepoFiles, type SyncFacts } from "./sync.ts";
 
 const OWNER = "mark1russell7";
@@ -225,6 +225,23 @@ describe("moveSiteConfig", () => {
     expect(result?.changes[0]).toContain("gets the defaults");
   });
 
+  it("gives the check job a free id when ci.yml has a job site of its own, and keeps that job", () => {
+    const workflows = { [PAGES]: pages(STANDARD), [CI]: ci().replace("  ci-ok:", "  site:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo site\n\n  ci-ok:") };
+    const result = move(workflows);
+    expectGates(workflows, result);
+    const text = result?.writes[CI] ?? "";
+    expect(text).toContain("  site:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo site\n");
+    expect(text).toContain(`  site-check:\n    uses: ${OWNER}/template/.github/workflows/reusable-pages-check.yml@${SHA} # main\n`);
+    expect(text).toContain("    needs: [ci, site-check]\n");
+    expect(result?.changes.some((change) => change.includes("the job `site-check`"))).toBe(true);
+  });
+
+  it("takes site, then the first free id of site-check and its numbers", () => {
+    expect(checkJobId(["ci", "ci-ok"])).toBe("site");
+    expect(checkJobId(["ci", "site"])).toBe("site-check");
+    expect(checkJobId(["site", "site-check", "site-check-2"])).toBe("site-check-3");
+  });
+
   it("gives null for a repository with no deploy, and for a repository in the form of the rule", () => {
     expect(move({ [CI]: ci() })).toBeNull();
     expect(move({ [PAGES]: pages(["deploy: false", ...STANDARD.filter((line) => !line.startsWith("deploy"))]), [CI]: ci() })).toBeNull();
@@ -232,7 +249,6 @@ describe("moveSiteConfig", () => {
 
   it.each([
     ["an expression that the file cannot hold", { [PAGES]: pages(["build: pnpm build ${{ secrets.TOKEN }}", "out: dist"]), [CI]: ci() }, null, "cannot hold"],
-    ["a job site of another form", { [PAGES]: pages(STANDARD), [CI]: ci().replace("  ci-ok:", "  site:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo site\n\n  ci-ok:") }, null, "job site"],
     ["a site config and inputs", { [PAGES]: pages(STANDARD), [CI]: ci() }, "{}\n", "also gives"],
     ["an on of one line", { [PAGES]: pages(STANDARD, []).replace("on:\n", "on: [push, pull_request]\n"), [CI]: ci() }, null, "one line"],
     ["no ci.yml", { [PAGES]: pages(STANDARD) }, null, "no `.github/workflows/ci.yml`"],
