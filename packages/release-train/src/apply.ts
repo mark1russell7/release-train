@@ -4,6 +4,7 @@ import { candidateReader } from "./candidate-facts.ts";
 import type { CandidateTarget } from "./candidate-facts.ts";
 import { CANDIDATE_POLICY, bodyAttempt, bodyItems, candidateItems, decide, decideWith, markLines, modeFor, nextAttempt } from "./candidate-policy.ts";
 import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateKind, CandidateMode, CandidatePolicy, CandidateRule, DecideResult } from "./candidate-policy.ts";
+import { guardLine } from "./budget.ts";
 import { pool } from "./collect.ts";
 import { rateLimitLine } from "./github.ts";
 import type { GitHub, RateLimitReport } from "./github.ts";
@@ -1057,6 +1058,8 @@ export function applySummary(r: ApplyReport): string {
   }
   if (r.rateLimit) {
     if (r.rateLimit.gate) lines.push(r.rateLimit.gate.note);
+    const guarded = r.rateLimit.guard ? guardLine(r.rateLimit.guard) : null;
+    if (guarded) lines.push(guarded);
     lines.push(rateLimitLine(r.rateLimit));
     if (r.rateLimit.routes) lines.push(...routeLines(r.rateLimit.routes));
     if (r.rateLimit.outside) lines.push(outsideLine(r.rateLimit.outside, r.rateLimit.routes ? readsOutside(r.rateLimit.start, r.rateLimit.end, r.rateLimit.routes, r.rateLimit.samples) : null));

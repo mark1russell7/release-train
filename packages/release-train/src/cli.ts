@@ -6,7 +6,7 @@ import { applyHolds, lagOver, lagReport, lagSummary } from "./lag.ts";
 import type { LagReport } from "./lag.ts";
 import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, pendingVersions, publicReport } from "./apply.ts";
 import type { ApplyReport } from "./apply.ts";
-import { budgetGate, DEFAULT_NEED, DEFAULT_WAIT_MINUTES, goOnUrgent } from "./budget.ts";
+import { budgetGate, DEFAULT_NEED, DEFAULT_WAIT_MINUTES, goOnUrgent, rateGuard } from "./budget.ts";
 import { collect, listRepos, pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { writeDb } from "./db.ts";
@@ -25,7 +25,7 @@ import type { SyncPlanItem, WorkflowsMode } from "./sync.ts";
 import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tagsSummary, validDate } from "./tags.ts";
 import { versionFixRun, versionFixSummary } from "./version-fix.ts";
 import { gitUpdater } from "./workspace.ts";
-import { requestMeter } from "./meter.ts";
+import { RateStop, requestMeter } from "./meter.ts";
 
 /** The options of the command line. */
 export interface CliOptions {
@@ -441,6 +441,8 @@ export interface ApplyDeps {
  * - Before the first read of a repository, the gate of the rate budget waits for the reset or stops the run (budget.ts).
  * - A stop gives the exit code 0. The run still writes the report, so the next steps of `train.yml` can read it.
  * - The meter counts each GitHub request of the run by its route (meter.ts). The report and the summary give the counts.
+ * - After the gate, the guard does the step of the gate before each request, on the headers of each answer (budget.ts).
+ *   A stop of the guard ends the run as a stop of the gate.
  */
 export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<number> {
   const tok = token();
@@ -474,18 +476,23 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     process.stdout.write(`${text}\n`);
     return 0;
   };
+  // The end of a run that the guard stopped. The `try` block sets it after the gate.
+  let guardStop: ((stop: RateStop) => Promise<number>) | null = null;
   try {
     const read = o.state === undefined ? null : readState(o.state);
     if (read?.note) log(read.note);
     // The meter counts each GitHub request of the run by its route. Each part of the run that takes a fetch gets its fetch.
     const meter = requestMeter(deps.fetch);
-    const gh = gitHub({ token: tok, fetch: meter.fetch });
+    // This client has no guard. The gate, the urgent names at a stop of the gate and the reads of the rate limit use it.
+    const gh0 = gitHub({ token: tok, fetch: meter.fetch });
     // The gate reads the rate limit (GitHub does not count GET /rate_limit). With too few requests left, it waits for the
     // reset on a timer that keeps Node alive, or it gives a stop. Its last read is the read at the start of the run.
+    // The read is only the first value of the live budget: the meter adds the headers of each answer to the tracker.
     const gate = await budgetGate({
       need: o.rateNeed,
       maxWaitMs: o.rateWait * 60_000,
-      read: () => readRateLimit(gh),
+      read: () => readRateLimit(gh0),
+      tracker: meter.rate,
       ...(deps.now ? { now: deps.now } : {}),
       ...(deps.sleep ? { sleep: deps.sleep } : {}),
     });
@@ -493,7 +500,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     log(gateRecord.note);
     let urgent: string[] | null | undefined;
     if (gateRecord.outcome === "stop") {
-      urgent = await urgentNames(o, gh, log);
+      urgent = await urgentNames(o, gh0, log);
       if (urgent === null || urgent.length === 0) {
         if (inActions) process.stdout.write(`::notice::${gateRecord.note}\n`);
         // The state file stays as the cache gave it. The step "Wait for a release" reads the report: it has no version in flight.
@@ -503,41 +510,71 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
           dryRun: o.dryRun,
           results: [],
           inFlight: [],
-          rateLimit: { start: gate.read, end: await readRateLimit(gh), routes: meter.routes(), outside: meter.outside(), samples: meter.samples(), refusals: meter.refusals(), gate: gateRecord },
+          rateLimit: { start: gate.read, end: await readRateLimit(gh0), routes: meter.routes(), outside: meter.outside(), samples: meter.samples(), refusals: meter.refusals(), gate: gateRecord },
         });
       }
       gateRecord = goOnUrgent(gateRecord);
       log(gateRecord.note);
     }
+    // The guard checks each request after the gate on the live budget. An urgent run needs no budget, only a window
+    // that is not spent. A run that waited at the gate does not wait again (budget.ts).
+    const guard = rateGuard(meter.fetch, {
+      tracker: meter.rate,
+      need: gateRecord.outcome === "urgent" ? 0 : o.rateNeed,
+      maxWaitMs: o.rateWait * 60_000,
+      waited: gateRecord.outcome === "waited",
+      log,
+      ...(deps.now ? { now: deps.now } : {}),
+      ...(deps.sleep ? { sleep: deps.sleep } : {}),
+    });
+    const gh = gitHub({ token: tok, fetch: guard.fetch });
     // The reads of the rate limit at the start and at the end give the GitHub requests of the run. A failed read is no read.
     const rateStart = gate.read;
+    const rateReport = async (): Promise<NonNullable<ApplyReport["rateLimit"]>> => ({
+      start: rateStart,
+      end: await readRateLimit(gh0),
+      routes: meter.routes(),
+      outside: meter.outside(),
+      samples: meter.samples(),
+      refusals: meter.refusals(),
+      gate: gateRecord,
+      guard: guard.record(),
+    });
+    // A stop of the guard before the plan: the data is not complete, so the run makes no write. As at a stop of the gate,
+    // the state file stays as the cache gave it, and the report has no version in flight.
+    const stopEarly = async (stop: RateStop): Promise<number> => {
+      if (inActions) process.stdout.write(`::notice::${stop.message}\n`);
+      return finish({ owner: o.owner, at: new Date(now()).toISOString(), dryRun: o.dryRun, results: [], inFlight: [], rateLimit: await rateReport() });
+    };
+    guardStop = stopEarly;
     const data = await collect({
       owner: o.owner,
       token: tok,
-      fetch: meter.fetch,
+      fetch: guard.fetch,
       log,
       onRepos: (repos) => hide(repos.filter((r) => r.private).map((r) => r.name)),
       ...(read ? { npmTimes: read.state.npm } : {}),
     });
+    // The collection turns a failed read of a repository into a warning, so a stop of the guard can end it without a throw.
+    const collected = guard.stopped();
+    if (collected) return await stopEarly(collected);
     const graph = buildGraph({ owner: o.owner, repos: data.repos, npm: data.npm, warnings: data.warnings });
     hide(graph.importers.filter((i) => i.repoPrivate).map((i) => i.name ?? ""));
     const p = plan(graph);
     // Without a state file the train keeps no first sight of a need, so the run gives no start for a need with no publish time.
     const starts = read ? needStarts(data.npm, read.state.seen, (o.now ?? new Date()).toISOString(), (k) => hashName(k, key)) : null;
-    const updater = gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author), fetch: meter.fetch });
+    const updater = gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author), fetch: guard.fetch });
+    const facts = o.sync ? await syncFacts({ gh, owner: o.owner, fetch: guard.fetch }) : null;
+    const urgentList = urgent !== undefined ? urgent : await urgentNames(o, gh, log);
+    const planned = guard.stopped();
+    if (planned) return await stopEarly(planned);
     const report = await apply({
       owner: o.owner,
       plan: p,
       gh,
       updater,
-      sync: o.sync
-        ? {
-            updater,
-            facts: await syncFacts({ gh, owner: o.owner, fetch: meter.fetch }),
-            workflows: o.workflows,
-          }
-        : null,
-      ...paceOptions({ ...o, urgent: urgent !== undefined ? urgent : await urgentNames(o, gh, log) }),
+      sync: o.sync ? { updater, facts, workflows: o.workflows } : null,
+      ...paceOptions({ ...o, urgent: urgentList }),
       runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
       dryRun: o.dryRun,
       only: o.only,
@@ -548,7 +585,10 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
       ...(starts ? { needSince: (u) => starts.since(u.repo, u.items) } : {}),
     });
-    report.rateLimit = { start: rateStart, end: await readRateLimit(gh), routes: meter.routes(), outside: meter.outside(), samples: meter.samples(), refusals: meter.refusals(), gate: gateRecord };
+    report.rateLimit = await rateReport();
+    // A stop of the guard during the writes keeps the report: each write before the stop is in it.
+    const applied = guard.stopped();
+    if (applied && inActions) process.stdout.write(`::notice::${applied.message}\n`);
     if (o.state !== undefined && starts) {
       writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen() })}\n`);
       const c = starts.counts();
@@ -556,6 +596,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     }
     return finish(report);
   } catch (e) {
+    if (e instanceof RateStop && guardStop !== null) return await guardStop(e);
     process.stderr.write(`${redact(e instanceof Error ? e.message : String(e))}\n`);
     return 1;
   }

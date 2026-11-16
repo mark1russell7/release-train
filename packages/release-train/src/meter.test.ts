@@ -3,11 +3,14 @@ import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import type { FetchFn } from "./collect.ts";
 import { gitHub, readRateLimit } from "./github.ts";
+import type { RateLimitRead } from "./github.ts";
 import {
+  countedRequest,
   DISAGREE_MIN,
   JUMP_MIN,
   outsideLine,
   outsideUse,
+  rateTracker,
   readsOutside,
   refusalKind,
   refusalLine,
@@ -404,5 +407,118 @@ describe("the evidence of the rate limit: samples, refusals and the two reads", 
     expect(outsideLine({ requests: 0, answers: 0, jumps: [] }, 12)).toBe(
       "GitHub requests outside the meter: no read from the answers (no answer had the header x-ratelimit-used). The two reads of GET /rate_limit give 12.",
     );
+  });
+});
+
+describe("countedRequest", () => {
+  it("counts each request of the API except GET /rate_limit, and no request to another host", () => {
+    expect(countedRequest(`${API}/repos/o/r/pulls/1`)).toBe(true);
+    expect(countedRequest(`${API}/graphql`, { method: "POST" })).toBe(true);
+    expect(countedRequest(`${API}/rate_limit`)).toBe(false);
+    expect(countedRequest("https://registry.npmjs.org/@ex%2fcore")).toBe(false);
+  });
+});
+
+describe("rateTracker", () => {
+  const RESET = 1_800_000_000;
+  const BEFORE = (RESET - 600) * 1000;
+
+  it("keeps the highest used count of a window, so an answer with a lower count does not raise the budget", () => {
+    const rate = rateTracker();
+    rate.observe({ used: 500, remaining: 9750, reset: RESET });
+    rate.observe({ used: 480, remaining: 9770, reset: RESET });
+    // An answer with no remaining count takes the limit of its window. Its reset is 30 s later, inside the same window.
+    rate.observe({ used: 490, remaining: null, reset: RESET + 30 });
+    expect(rate.windows()).toEqual([{ reset: RESET, limit: 10_250, used: 500 }]);
+    expect(rate.live(BEFORE)).toEqual({ limit: 10_250, used: 500, remaining: 9750, reset: new Date(RESET * 1000).toISOString() });
+  });
+
+  it("keeps the lowest limit of a window, and skips an answer with no remaining count and no known window", () => {
+    const rate = rateTracker();
+    rate.observe({ used: 7, remaining: null, reset: RESET });
+    expect(rate.windows()).toEqual([]);
+    expect(rate.live(BEFORE)).toBeNull();
+    rate.observe({ used: 10, remaining: 4990, reset: RESET });
+    rate.observe({ used: 11, remaining: 10_239, reset: RESET });
+    expect(rate.live(BEFORE)).toMatchObject({ limit: 5000, used: 11, remaining: 4989 });
+  });
+
+  it("skips a seed with a reset that is not a time", () => {
+    const rate = rateTracker();
+    rate.seed({ limit: 10_250, used: 1, remaining: 10_249, reset: "no time" });
+    expect(rate.windows()).toEqual([]);
+  });
+
+  it("gives the highest used count of a window as its budget, for each order of the answers", () => {
+    fc.assert(
+      fc.property(fc.array(fc.integer({ min: 0, max: 10_250 }), { minLength: 1, maxLength: 40 }), (used) => {
+        const rate = rateTracker();
+        for (const u of used) rate.observe({ used: u, remaining: 10_250 - u, reset: RESET });
+        expect(rate.live(BEFORE)?.remaining).toBe(10_250 - Math.max(...used));
+      }),
+    );
+  });
+
+  it("gives no live budget after each reset", () => {
+    const rate = rateTracker();
+    rate.observe({ used: 9000, remaining: 1250, reset: RESET });
+    expect(rate.live(RESET * 1000)).toBeNull();
+  });
+});
+
+// The numbers of the answers of Train 43920794285 (2026-11-16 17:40Z). The read of /rate_limit at the start and the
+// first 8 answers of the new token gave a stale window. The true window starts at answer 9 (17:40:38.514Z).
+describe("the live budget of the answers of Train 43920794285", () => {
+  const LIMIT = 10_250;
+  const seconds = (iso: string): number => Math.floor(Date.parse(iso) / 1000);
+  const START: RateLimitRead = { limit: LIMIT, used: 276, remaining: LIMIT - 276, reset: "2026-11-16T18:14:29.000Z" };
+  const STALE = seconds("2026-11-16T18:14:28Z");
+  const TRUE = seconds("2026-11-16T18:01:55Z");
+  const NEXT = seconds("2026-11-16T19:01:55Z");
+  const ANSWER_9 = Date.parse("2026-11-16T17:40:38.514Z");
+  const answer = (used: number, reset: number): Response =>
+    new Response("{}", { status: 200, headers: { "x-ratelimit-used": String(used), "x-ratelimit-remaining": String(Math.max(0, LIMIT - used)), "x-ratelimit-reset": String(reset) } });
+  /** The answers of the run in turn: 8 stale answers (277 to 284 used), then the true answer 9 (9246 used). */
+  const trainAnswers = (rest: Response[] = []): FetchFn => {
+    const list = [...Array.from({ length: 8 }, (_, i) => answer(277 + i, STALE)), answer(9246, TRUE), ...rest];
+    return async () => list.shift() ?? new Response("{}", { status: 500 });
+  };
+  /** A meter with the start read as its first value and the first `n` answers of the run. */
+  const after = async (n: number, rest: Response[] = []): Promise<ReturnType<typeof requestMeter>> => {
+    const meter = requestMeter(trainAnswers(rest), API, () => ANSWER_9);
+    meter.rate.seed(START);
+    for (let i = 0; i < n; i++) await meter.fetch(`${API}/repos/o/r${i}`);
+    return meter;
+  };
+  const STALE_LIVE = { limit: LIMIT, used: 284, remaining: LIMIT - 284, reset: "2026-11-16T18:14:29.000Z" };
+  const TRUE_LIVE = { limit: LIMIT, used: 9246, remaining: 1004, reset: "2026-11-16T18:01:55.000Z" };
+
+  it("(1) takes the start read and 8 stale answers as one window, and the true window from answer 9", async () => {
+    const stale = await after(8);
+    // The resets of the start read and the stale answers differ by 1 s, so they are one window.
+    expect(stale.rate.windows()).toEqual([{ reset: STALE + 1, limit: LIMIT, used: 284 }]);
+    expect(stale.rate.live(ANSWER_9)).toEqual(STALE_LIVE);
+    const live = await after(9);
+    expect(live.rate.windows()).toEqual([
+      { reset: TRUE, limit: LIMIT, used: 9246 },
+      { reset: STALE + 1, limit: LIMIT, used: 284 },
+    ]);
+    // The true window has the fewest requests left, so it is the live budget.
+    expect(live.rate.live(ANSWER_9)).toEqual(TRUE_LIVE);
+  });
+
+  it("(2) drops the true window after its reset, and the next true answer sets the new window", async () => {
+    const meter = await after(9, [answer(400, NEXT)]);
+    // After the reset of 18:01:55, only the stale window is left.
+    expect(meter.rate.live(Date.parse("2026-11-16T18:01:56Z"))).toEqual(STALE_LIVE);
+    await meter.fetch(`${API}/repos/o/next`);
+    expect(meter.rate.live(Date.parse("2026-11-16T18:05:00Z"))).toEqual({ limit: LIMIT, used: 400, remaining: LIMIT - 400, reset: "2026-11-16T19:01:55.000Z" });
+  });
+
+  it("(3) holds the budget low after a stale answer with a higher used count and a later reset", async () => {
+    const meter = await after(9, [answer(10_100, STALE)]);
+    await meter.fetch(`${API}/repos/o/stale`);
+    // The stale window keeps its highest used count. It has fewer requests left than the true window, so it is the live budget.
+    expect(meter.rate.live(ANSWER_9)).toEqual({ limit: LIMIT, used: 10_100, remaining: 150, reset: "2026-11-16T18:14:29.000Z" });
   });
 });

@@ -1,6 +1,6 @@
 import { nextLink } from "./collect.ts";
 import type { FetchFn, PageRead } from "./collect.ts";
-import type { GateRecord } from "./budget.ts";
+import type { GateRecord, GuardRecord } from "./budget.ts";
 import { refusalKind } from "./meter.ts";
 import type { MeterSample, OutsideUse, RefusalKind, Refusals, RouteCount } from "./meter.ts";
 
@@ -111,6 +111,8 @@ export interface RateLimitReport {
   refusals?: Refusals;
   /** The decision of the rate budget at the start of the run (budget.ts). */
   gate?: GateRecord;
+  /** The guard of the rate budget during the run: its requests, its wait and its stop (budget.ts). A report from before it does not have it. */
+  guard?: GuardRecord;
 }
 
 /**
