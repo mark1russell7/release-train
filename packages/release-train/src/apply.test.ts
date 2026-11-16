@@ -1311,6 +1311,27 @@ describe("helpers", () => {
     expect(ciState(latestRuns(runs, []), null)).toBe("failed");
   });
 
+  it("takes the higher id as the newer run when two runs of a workflow start in the same second", () => {
+    // layout-contract#331: two runs of "Carry sources" started at 03:12:11Z. The older one was cancelled and the newer one passed.
+    // GitHub listed the cancelled run first.
+    const runs = [
+      { status: "completed", conclusion: "cancelled", check_suite: { id: 1 } },
+      { status: "completed", conclusion: "success", check_suite: { id: 2 } },
+    ];
+    const at = "2026-11-16T03:12:11Z";
+    const workflows = [
+      { id: 43796727398, workflow_id: 10, check_suite_id: 1, created_at: at, status: "completed", conclusion: "cancelled" },
+      { id: 43796728538, workflow_id: 10, check_suite_id: 2, created_at: at, status: "completed", conclusion: "success" },
+    ];
+    expect(latestRuns(runs, workflows).map((r) => r.check_suite?.id)).toEqual([2]);
+    expect(ciState(latestRuns(runs, workflows), null)).toBe("green");
+    // The order of the list does not change the result
+    expect(ciState(latestRuns(runs, [...workflows].reverse()), null)).toBe("green");
+    // When the newer run failed, the commit fails
+    const newerFailed = workflows.map((w) => ({ ...w, id: w.check_suite_id === 1 ? 43796728538 : 43796727398 }));
+    expect(ciState(latestRuns(runs, newerFailed), null)).toBe("failed");
+  });
+
   it("leaves out a failed job of a workflow run that ended in success, because the job has continue-on-error", () => {
     // The CI of lag#160: the job "Safari on iOS" failed, and its workflow run ended in success
     const runs = [
