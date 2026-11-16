@@ -3,6 +3,8 @@ import type { FetchFn } from "./collect.ts";
 import type { GitHub } from "./github.ts";
 import { matchWorkspaces, parsePnpmWorkspace } from "./parse.ts";
 import { escapeRegExp as escapeRe } from "@mark1russell7/text";
+import { SITE_CONFIG_PATH } from "@mark1russell7/site-pages/config";
+import { moveSiteConfig, type WorkflowText } from "./site-config.ts";
 import { assignDays, configDay, pullRequestJobs, PRESET_DAY, renovateSchedule, usesSharedPreset, withSchedule, type DayInput, type RenovateConfig, type RenovateDay } from "./renovate.ts";
 
 /** The branch of each template sync pull request of the release train. */
@@ -601,8 +603,37 @@ const renovateDayRule: SyncRule = {
   },
 };
 
+/** The text of the key `$comment` of a new `.github/site.json`. */
+export const SITE_CONFIG_COMMENT =
+  'The site config of this repository (CI.md of the template, "The site config"). The Pages workflow deploys this site from main, and the job site of ci.yml checks it on each pull request.';
+
+/**
+ * Rule 7: a repository that deploys a site with `reusable-pages.yml` gets the form of the rule `site-check-in-ci` of
+ * conventions. The site values go into `.github/site.json`, no pull request starts the deploy, and a job `site` of
+ * `ci.yml` checks the site. The job `CI OK` needs it. A form that the rule cannot change safely is a need.
+ */
+const siteConfigRule: SyncRule = {
+  id: "site-config",
+  why: "The deploy and the check of each pull request build the same site from one file, and a failed check of the site stops a merge.",
+  except: [TEMPLATE_REPO],
+  async check(files, f) {
+    const workflows: WorkflowText[] = [];
+    for (const path of files.paths.filter((p) => WORKFLOW_FILE.test(p))) {
+      const text = await files.read(path);
+      if (text !== null) workflows.push({ path, text });
+    }
+    const config = files.paths.includes(SITE_CONFIG_PATH) ? await files.read(SITE_CONFIG_PATH) : null;
+    const move = moveSiteConfig({ owner: f.owner, repo: f.repo, templateSha: f.templateSha, workflows, config });
+    if (move === null) return null;
+    if (move.needs.length > 0) return { changes: [], needs: move.needs };
+    const write = { ...move.writes };
+    if (move.config !== null) write[SITE_CONFIG_PATH] = formatJson("{\n}\n", { $comment: SITE_CONFIG_COMMENT, ...move.config }, await jsonWidthOf(files, SITE_CONFIG_PATH));
+    return { changes: move.changes, edit: { write } };
+  },
+};
+
 /** The sync rules, in the sequence of their application. A later rule reads the files after the changes of the earlier rules. */
-export const SYNC_RULES: readonly SyncRule[] = [pinsRule, releaseScriptsRule, templateCliRule, coverageRule, callersRule, renovateDayRule];
+export const SYNC_RULES: readonly SyncRule[] = [pinsRule, releaseScriptsRule, templateCliRule, coverageRule, callersRule, renovateDayRule, siteConfigRule];
 
 /** This function gives the file of a `uses:` value for the job count. The file is a local workflow or a shared workflow of the template. */
 function usesReader(files: RepoFiles, f: RunFacts): (uses: string) => Promise<string | null> {

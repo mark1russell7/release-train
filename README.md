@@ -388,6 +388,12 @@ The template sync keeps the files from the repository `template` current in each
 - `coverage`: this rule is for a pnpm repository. A workspace package (or the root) can have a test script that starts Vitest. When that package and the root have no `@vitest/coverage-v8`, the rule adds it to the root dev dependencies. It uses the range of `vitest`. The action `coverage` of the template finds it there. The package manager updates the lockfile. When the packages name different ranges of `vitest`, the rule changes nothing and asks for a hand. It does the same when the range is not a version range (for example `catalog:`).
 - `renovate-day`: a repository with the shared Renovate preset gets its own weekday in the `schedule` of `renovate.json`. Thus the weekly Renovate pull requests of all repositories do not wait for the same runners.
 - `callers`: a `release.yml` that does not use `reusable-release-build.yml`, or a `ci.yml` that does not use `reusable-ci.yml`, goes under "Needs a hand". This rule changes nothing.
+- `site-config`: a repository that deploys a site with `reusable-pages.yml` gets the form of the rule `site-check-in-ci` of conventions.
+  - The site values of the call go into `.github/site.json`, and the call gives none.
+  - The deploy workflow does not start on `pull_request` or `pull_request_target`.
+  - A job `site` of `ci.yml` uses `reusable-pages-check.yml` with `contents: read`, and `CI OK` needs it. A `ci.yml` with no `CI OK` gets one, with the action `gate-summary`.
+  - The rule compares the config of the file with the config of the old inputs (`resolveSiteConfig`). When they differ, the rule changes nothing.
+  - A form that the rule cannot change safely goes under "Needs a hand". Examples are an expression of the workflow in a site value, a job `site` of another form, and two deploys.
 
 A rule writes a JSON file in the layout of Prettier, so the check `prettier --check` of the repository passes on it (`formatJson`). It keeps the indent and the line ends of the file. `package.json`, `package-lock.json` and `composer.json` get the layout of `JSON.stringify`, as with the parser `json-stringify` of Prettier. In another JSON file, an array goes on one line when it has no object and fits in the `printWidth`. The `printWidth` comes from the Prettier config of the repository, and it is 80 when no config sets it.
 
