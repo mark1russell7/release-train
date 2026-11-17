@@ -394,6 +394,7 @@ The template sync keeps the files from the repository `template` current in each
   - A new job of `ci.yml` uses `reusable-pages-check.yml` with `contents: read`, and `CI OK` needs it. A `ci.yml` with no `CI OK` gets one, with the action `gate-summary`.
   - The new job is `site`. When `ci.yml` has a job `site` of its own, the new job is `site-check`, and the old job stays.
   - The rule compares the config of the file with the config of the old inputs (`resolveSiteConfig`). When they differ, the rule changes nothing.
+  - The move waits while the root `package.json` gives `@mark1russell7/conventions` before 0.42.0. The rule `roadmap-parses` of those versions reads the roadmap only in the Pages workflow, so after the move it fails each pull request. The update of the conventions check ends the wait.
   - A form that the rule cannot change safely goes under "Needs a hand". Examples are an expression of the workflow in a site value, a `ci.yml` with no `CI OK` and a job `ci-ok`, and two deploys.
 
 A rule writes a JSON file in the layout of Prettier, so the check `prettier --check` of the repository passes on it (`formatJson`). It keeps the indent and the line ends of the file. `package.json`, `package-lock.json` and `composer.json` get the layout of `JSON.stringify`, as with the parser `json-stringify` of Prettier. In another JSON file, an array goes on one line when it has no object and fits in the `printWidth`. The `printWidth` comes from the Prettier config of the repository, and it is 80 when no config sets it.
