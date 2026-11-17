@@ -203,8 +203,8 @@ importers:
         specifier: ^0.7.0
         version: 0.7.0
       '@mark1russell7/text':
-        specifier: ^0.0.10
-        version: 0.0.10
+        specifier: ^0.0.13
+        version: 0.0.13
       '@procedures/shell':
         specifier: ^0.60.0
         version: 0.60.0
@@ -617,8 +617,8 @@ packages:
     engines: {node: '>=22.12'}
     hasBin: true
 
-  '@mark1russell7/text@0.0.10':
-    resolution: {integrity: sha512-ugLHCAcllSOlNZ0oz5Q8Wf3OkqfnSvwxgx8FL2gQ3EX7K1IS9oW9k2Jq77Obwa2ZtpzhNV47lJL2bGgvFVB14A==}
+  '@mark1russell7/text@0.0.13':
+    resolution: {integrity: sha512-8Tu7DTTpfmpXIy0F2JCyOW1RD91X7tm38c5xiqz3cLdmEkUQViH/06kTBLj+hrzuQPMBGVyxd7snqVG6EpNLdQ==}
     engines: {node: '>=22.12'}
 
   '@mark1russell7/text@0.0.6':
@@ -1484,7 +1484,7 @@ snapshots:
     dependencies:
       '@clack/prompts': 1.8.1
 
-  '@mark1russell7/text@0.0.10': {}
+  '@mark1russell7/text@0.0.13': {}
 
   '@mark1russell7/text@0.0.6': {}
 
