@@ -16,6 +16,11 @@ concurrency:
   group: lag
   cancel-in-progress: false
 
+# The other GitHub account with public repositories of the train, as ALSO_OWNER of train.yml. A public read needs no
+# token of that account, so the workflow token reads it.
+env:
+  ALSO_OWNER: metrograph-labs
+
 jobs:
   lag:
     runs-on: ubuntu-latest
@@ -39,7 +44,7 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           set +e
-          node packages/release-train/src/bin.ts lag --owner "$OWNER" --public-only --holds lag-holds.json --gate --out lag.json > lag.md
+          node packages/release-train/src/bin.ts lag --owner "$OWNER" --also-owner "$ALSO_OWNER" --public-only --holds lag-holds.json --gate --out lag.json > lag.md
           code=$?
           cat lag.md >> "$GITHUB_STEP_SUMMARY"
           exit "$code"

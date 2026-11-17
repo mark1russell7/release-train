@@ -52,6 +52,8 @@ export interface PullVersion {
 /** The data of one repository that the graph builder reads. */
 export interface RepoSnapshot {
   name: string;
+  /** The GitHub account of the repository. Absent: the account is the owner of the graph. */
+  account?: string;
   private: boolean;
   defaultBranch: string;
   manifests: ManifestFile[];
@@ -137,6 +139,8 @@ export interface Edge {
 /** A summary of one repository. */
 export interface RepoInfo {
   name: string;
+  /** The GitHub account of the repository. Absent: the account is the owner of the graph. */
+  account?: string;
   private: boolean;
   lockKind: LockKind;
   packages: string[];
@@ -152,6 +156,7 @@ export interface RepoInfo {
 
 /** The dependency graph of the packages of one owner. */
 export interface Graph {
+  /** The home account: it owns the template and the npm scope. A repository can be in a different account (`RepoInfo.account`). */
   owner: string;
   generatedAt: string;
   repos: RepoInfo[];

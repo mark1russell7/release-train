@@ -54,6 +54,9 @@ env:
   # The run opens the template sync pull requests (branch release-train/template) when SYNC is "true".
   # The changes to workflow files wait until the GitHub App has the permission Workflows: write.
   SYNC: "true"
+  # The other GitHub account with repositories of the train. The home account is the owner of this repository: it has the
+  # template, the npm scope and the App. The train reads the other account with a token of the App for that account.
+  ALSO_OWNER: metrograph-labs
 
 jobs:
   train:
@@ -76,6 +79,16 @@ jobs:
           app-id: ${{ secrets.RELEASE_TRAIN_APP_ID }}
           private-key: ${{ secrets.RELEASE_TRAIN_APP_KEY }}
           owner: ${{ github.repository_owner }}
+      # The token of the other account. When the App has no installation there, this step fails, and the run goes on with
+      # no read of that account: the report and the summary show "No read" for it, never a pass.
+      - name: Make the token of the GitHub App for the other account
+        id: app_also
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RELEASE_TRAIN_APP_ID }}
+          private-key: ${{ secrets.RELEASE_TRAIN_APP_KEY }}
+          owner: ${{ env.ALSO_OWNER }}
       # This step fails when the App does not have the permission Workflows: write. The token of this step is not used.
       - name: Check the Workflows permission of the App
         id: wf
@@ -107,6 +120,8 @@ jobs:
         id: apply
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          # A JSON object with the token of each other account. An empty token is no token.
+          GH_TOKENS: ${{ format('{{"{0}":"{1}"}}', env.ALSO_OWNER, steps.app_also.outputs.token) }}
           RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_HASH_KEY }}
           EVENT: ${{ github.event_name }}
           INPUT_DRY: ${{ inputs.dry-run }}
@@ -118,7 +133,7 @@ jobs:
           WORKFLOWS: ${{ steps.wf.outcome == 'success' && 'yes' || 'no' }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ]; then dry=false; else dry=true; fi
-          args=(apply --owner "$OWNER" --report apply.json --author "$AUTHOR" --holds lag-holds.json --state train-state.json)
+          args=(apply --owner "$OWNER" --also-owner "$ALSO_OWNER" --report apply.json --author "$AUTHOR" --holds lag-holds.json --state train-state.json)
           if [ "$dry" != "false" ]; then args+=(--dry-run); else args+=(--take-replaced); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
           if [ -n "$URGENT" ]; then args+=(--urgent "$URGENT"); fi
@@ -141,6 +156,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKENS: ${{ format('{{"{0}":"{1}"}}', env.ALSO_OWNER, steps.app_also.outputs.token) }}
           RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_HASH_KEY }}
           EVENT: ${{ github.event_name }}
           INPUT_DRY: ${{ inputs.dry-run }}
@@ -149,11 +165,12 @@ jobs:
           AUTHOR: ${{ steps.bot.outputs.author }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ] && [ "$VERSION_FIX_LIVE" = "true" ]; then dry=false; else dry=true; fi
-          args=(version-fix --owner "$OWNER" --author "$AUTHOR")
+          args=(version-fix --owner "$OWNER" --also-owner "$ALSO_OWNER" --author "$AUTHOR")
           if [ "$dry" != "false" ]; then args+=(--dry-run); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
           node packages/release-train/src/bin.ts "${args[@]}"
-      # When npm has a version in flight, the next wave starts at once with the released event.
+      # When npm has a version in flight, the next wave starts at once with the released event. This step reads only npm
+      # and starts this workflow, so it gets only the token of the home account.
       - name: Wait for a release
         if: steps.apply.outcome == 'success'
         env:

@@ -7,6 +7,7 @@ import { addChangelogSection, changesetText, decideBump, decisionBreaks, setMani
 import { ageExcludeAdd, ageRuleEdit, globMatch, ownScopes } from "./settings.ts";
 import type { LockChange, ReleaseDone, RepoUpdate, UpdateResult, Updater, YoungItem } from "./apply.ts";
 import type { FetchFn } from "./collect.ts";
+import type { AccountOf, Accounts } from "./accounts.ts";
 import { TRAIN_BRANCH } from "./apply.ts";
 
 /**
@@ -158,8 +159,14 @@ export function ageExcluded(patterns: readonly string[], name: string, version: 
 
 /** The options of the updater that uses git and the package manager of the repository. */
 export interface GitUpdaterOptions {
+  /** The home account. It owns the npm scope. */
   owner: string;
+  /** The token of the home account. */
   token: string;
+  /** This function gives the account of each repository. The default is the home account for each repository. */
+  accountOf?: AccountOf;
+  /** The accounts of the run. A repository takes the token of its account. The default is `token` for each repository. */
+  accounts?: Accounts;
   author: { name: string; email: string };
   run?: RunFn;
   tmpRoot?: string;
@@ -362,7 +369,8 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
       return null;
     }
   };
-  const basic = Buffer.from(`x-access-token:${o.token}`).toString("base64");
+  const accountOf = o.accountOf ?? ((): string => o.owner);
+  const slug = (repo: string): string => `${accountOf(repo)}/${repo}`;
   // Each child command gets the environment of the train with no token, secret or key. The package managers and the
   // scripts start code of the repository (a pnpmfile, a version script, a build), so they never get the token.
   const env: NodeJS.ProcessEnv = {};
@@ -371,28 +379,35 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
     env[k] = v;
   }
   Object.assign(env, { CI: "true", GIT_TERMINAL_PROMPT: "0" });
-  /** Only `git clone`, `git fetch` and `git push` get the token, in the git config of their own environment. */
-  const gitAuthEnv: NodeJS.ProcessEnv = {
-    ...env,
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
-    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
+  /**
+   * Only `git clone`, `git fetch` and `git push` get a token, in the git config of their own environment. Each repository
+   * gets only the token of its account.
+   */
+  const gitAuthEnv = (repo: string): NodeJS.ProcessEnv => {
+    const token = o.accounts?.token(accountOf(repo)) ?? o.token;
+    const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+    return {
+      ...env,
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+      GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
+    };
   };
-  const envFor = (cmd: string, args: readonly string[]): NodeJS.ProcessEnv => (needsGitAuth(cmd, args) ? gitAuthEnv : env);
+  const envFor = (cmd: string, args: readonly string[], repo: string): NodeJS.ProcessEnv => (needsGitAuth(cmd, args) ? gitAuthEnv(repo) : env);
 
   type Sh = (cmd: string, args: string[], what: string) => Promise<RunResult>;
-  /** This function gives the command helper of one clone folder. It throws on an exit code that is not 0. */
-  const shell = (dir: string): Sh => async (cmd, args, what) => {
-    const r = await run(cmd, args, { cwd: dir, env: envFor(cmd, args) });
+  /** This function gives the command helper of the clone folder of a repository. It throws on an exit code that is not 0. */
+  const shell = (dir: string, repo: string): Sh => async (cmd, args, what) => {
+    const r = await run(cmd, args, { cwd: dir, env: envFor(cmd, args, repo) });
     if (r.code !== 0) throw new Error(`${what} failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}`);
     return r;
   };
   /** This function clones the default branch and fetches a branch of the train. It gives the remote ref and if the branch exists. */
   const checkout = async (dir: string, sh: Sh, repo: string, branch: string, defaultBranch: string): Promise<{ remoteRef: string; hasRemote: boolean }> => {
-    await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", defaultBranch, `https://github.com/${o.owner}/${repo}.git`, "."], "git clone");
+    await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", defaultBranch, `https://github.com/${slug(repo)}.git`, "."], "git clone");
     const remoteRef = `refs/remotes/origin/${branch}`;
     const fetchArgs = ["fetch", "--quiet", "--depth", "2", "origin", `+refs/heads/${branch}:${remoteRef}`];
-    const fetched = await run("git", fetchArgs, { cwd: dir, env: envFor("git", fetchArgs) });
+    const fetched = await run("git", fetchArgs, { cwd: dir, env: envFor("git", fetchArgs, repo) });
     return { remoteRef, hasRemote: fetched.code === 0 };
   };
   /** This function pushes the commit to a branch. When the branch already has the same content in the changed files, it does not push. */
@@ -563,7 +578,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
   /** The environment of a script of the repository has no token. It names the repository, the commit, the branch and the folder of the clone (`cloneEnv`). */
   const scriptEnv = async (dir: string, repo: string, branch: string): Promise<NodeJS.ProcessEnv> => {
     const head = await run("git", ["rev-parse", "HEAD"], { cwd: dir, env });
-    return cloneEnv(env, { repository: `${o.owner}/${repo}`, workspace: dir, branch, sha: head.code === 0 ? head.stdout.trim() : undefined });
+    return cloneEnv(env, { repository: slug(repo), workspace: dir, branch, sha: head.code === 0 ? head.stdout.trim() : undefined });
   };
 
   /** This function gives the install of one clone: the packages with no install scripts, at most one time. */
@@ -735,7 +750,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
     async update(u0: RepoUpdate, ctx: { defaultBranch: string; rebuild: boolean }): Promise<UpdateResult> {
       const dir = mkdtempSync(join(o.tmpRoot ?? tmpdir(), "rt-"));
       const fail = (error: string): UpdateResult => ({ status: "failed", sha: null, changes: [], unresolved: [], young: [], tool: null, error });
-      const sh = shell(dir);
+      const sh = shell(dir, u0.repo);
       try {
         const remote = await checkout(dir, sh, u0.repo, TRAIN_BRANCH, ctx.defaultBranch);
 
@@ -974,7 +989,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
      */
     async sync(job: SyncJob, ctx: { defaultBranch: string; rebuild: boolean }): Promise<SyncPush> {
       const dir = mkdtempSync(join(o.tmpRoot ?? tmpdir(), "rt-"));
-      const sh = shell(dir);
+      const sh = shell(dir, job.repo);
       let result: SyncResult | null = null;
       let tool: string | null = null;
       try {
@@ -1017,10 +1032,10 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
      */
     async versionFix(job: FixJob): Promise<FixResult> {
       const dir = mkdtempSync(join(o.tmpRoot ?? tmpdir(), "rt-"));
-      const sh = shell(dir);
+      const sh = shell(dir, job.repo);
       const left: { name: string; reason: string }[] = [];
       try {
-        await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", job.branch, `https://github.com/${o.owner}/${job.repo}.git`, "."], "git clone");
+        await sh("git", ["clone", "--quiet", "--depth", "1", "--no-tags", "--branch", job.branch, `https://github.com/${slug(job.repo)}.git`, "."], "git clone");
         const head = (await sh("git", ["rev-parse", "HEAD"], "git rev-parse")).stdout.trim();
         if (head !== job.sha) return { status: "moved", sha: head, done: [], left, error: null };
         const folders = await packageFolders(sh, dir);
@@ -1079,7 +1094,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
         await sh("git", ["-c", `user.name=${o.author.name}`, "-c", `user.email=${o.author.email}`, "commit", "--quiet", "--no-verify", "-m", fixCommitMessage(marks)], "git commit");
         const sha = (await sh("git", ["rev-parse", "HEAD"], "git rev-parse")).stdout.trim();
         const pushArgs = ["push", "--quiet", "--no-verify", "origin", `HEAD:refs/heads/${job.branch}`];
-        const pushed = await run("git", pushArgs, { cwd: dir, env: envFor("git", pushArgs) });
+        const pushed = await run("git", pushArgs, { cwd: dir, env: envFor("git", pushArgs, job.repo) });
         if (pushed.code !== 0) {
           // A push with no force fails when the branch has a new head. Then the next run reads the CI of that head.
           if (/\[rejected\]|non-fast-forward|fetch first/.test(`${pushed.stderr}\n${pushed.stdout}`)) return { status: "moved", sha: null, done: [], left, error: null };

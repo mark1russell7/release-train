@@ -68,7 +68,10 @@ export interface WorkflowText {
 
 /** The input of {@link moveSiteConfig}. */
 export interface SiteMoveInput {
+  /** The home account of the template. The new job pins the workflows of the template of this account. */
   readonly owner: string;
+  /** The account of the repository. Absent: the account is `owner`. */
+  readonly account?: string | undefined;
   readonly repo: string;
   /** The commit of the template on `main`. The new job pins its check workflow to it. */
   readonly templateSha: string;
@@ -252,10 +255,10 @@ function moveCall(lines: readonly string[], call: number, input: SiteMoveInput):
     const result = fileValue(entry.key as SiteConfigKey, entry.value);
     if ("error" in result) return { lines: [...lines], config: null, carry, moved: [], error: result.error };
     config[entry.key] = result.value;
-    inputs[entry.key] = inputValue(entry.value, input.owner, input.repo);
+    inputs[entry.key] = inputValue(entry.value, input.account ?? input.owner, input.repo);
   }
   // A gate: the file gives the same site as the old inputs, or nothing changes
-  const repository = `${input.owner}/${input.repo}`;
+  const repository = `${input.account ?? input.owner}/${input.repo}`;
   const before = resolveSiteConfig({ file: undefined, path: SITE_CONFIG_PATH, inputs, repository });
   const after = resolveSiteConfig({ file: JSON.stringify(config), path: SITE_CONFIG_PATH, inputs: undefined, repository });
   if ("error" in before || "error" in after) return { lines: [...lines], config: null, carry, moved: [], error: "error" in before ? before.error : (after as { error: string }).error };

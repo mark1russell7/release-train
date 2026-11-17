@@ -27,6 +27,7 @@ export function buildGraph(input: GraphInput): Graph {
   for (const repo of input.repos) {
     const info: RepoInfo = {
       name: repo.name,
+      ...(repo.account !== undefined ? { account: repo.account } : {}),
       private: repo.private,
       lockKind: repo.lockKind,
       packages: [],

@@ -1,3 +1,4 @@
+import { accountOfPath, accountOfRepos, type Accounts } from "./accounts.ts";
 import type { FetchFn } from "./collect.ts";
 import { pool } from "./collect.ts";
 import { BLOCKED_LABEL, latestRuns, TRAIN_BRANCH } from "./apply.ts";
@@ -57,35 +58,41 @@ export function matchPull(a: Action, pulls: readonly Pull[]): Pull | null {
   return null;
 }
 
-/** This function reads the open pull requests and the release workflows of the repositories of the actions. */
+/**
+ * This function reads the open pull requests and the release workflows of the repositories of the actions. Each
+ * repository is in its account of the plan, and each read takes the token of that account from `accounts`. A read of an
+ * account with no token takes `token`.
+ */
 export async function addProgress(
   plan: Plan,
-  opts: { owner: string; token: string | null; fetch?: FetchFn; apiBase?: string; concurrency?: number },
+  opts: { owner: string; token: string | null; accounts?: Accounts; fetch?: FetchFn; apiBase?: string; concurrency?: number },
 ): Promise<Record<string, Progress>> {
   const f: FetchFn = opts.fetch ?? ((u, i) => fetch(u, i));
   const api = opts.apiBase ?? "https://api.github.com";
-  const headers: Record<string, string> = { accept: "application/vnd.github+json", "user-agent": "release-train" };
-  if (opts.token) headers["authorization"] = `Bearer ${opts.token}`;
+  const accountOf = accountOfRepos(opts.owner, plan.repos);
   const get = async <T>(path: string): Promise<T | null> => {
+    const headers: Record<string, string> = { accept: "application/vnd.github+json", "user-agent": "release-train" };
+    const token = opts.accounts?.token(accountOfPath(path) ?? opts.owner) ?? opts.token;
+    if (token) headers["authorization"] = `Bearer ${token}`;
     const res = await f(`${api}${path}`, { headers });
     return res.ok ? ((await res.json()) as T) : null;
   };
   const repos = [...new Set(plan.actions.map((a) => a.repo))].sort();
   const out: Record<string, Progress> = {};
   await pool(repos, opts.concurrency ?? 4, async (repo) => {
-    const pulls = (await get<Pull[]>(`/repos/${opts.owner}/${repo}/pulls?state=open&per_page=50`)) ?? [];
+    const pulls = (await get<Pull[]>(`/repos/${accountOf(repo)}/${repo}/pulls?state=open&per_page=50`)) ?? [];
     for (const a of plan.actions.filter((x) => x.repo === repo)) {
       const pr = matchPull(a, pulls);
       if (pr) {
-        const checks = await get<CheckRuns>(`/repos/${opts.owner}/${repo}/commits/${pr.head.sha}/check-runs?per_page=100`);
+        const checks = await get<CheckRuns>(`/repos/${accountOf(repo)}/${repo}/commits/${pr.head.sha}/check-runs?per_page=100`);
         const blocked = (pr.labels ?? []).some((l) => l.name === BLOCKED_LABEL);
-        const workflows = await get<{ workflow_runs: { workflow_id: number; check_suite_id: number; created_at: string }[] }>(`/repos/${opts.owner}/${repo}/actions/runs?head_sha=${pr.head.sha}&per_page=100`);
+        const workflows = await get<{ workflow_runs: { workflow_id: number; check_suite_id: number; created_at: string }[] }>(`/repos/${accountOf(repo)}/${repo}/actions/runs?head_sha=${pr.head.sha}&per_page=100`);
         const state = blocked ? "ci-failed" : checkState(latestRuns(checks?.check_runs ?? [], workflows?.workflow_runs ?? []));
         out[a.id] = { state, detail: `PR #${pr.number}: ${pr.title}${blocked ? " (blocked: CI failed)" : ""}`, url: pr.html_url };
         continue;
       }
       if (a.kind === "release") {
-        const runs = await get<Runs>(`/repos/${opts.owner}/${repo}/actions/workflows/release.yml/runs?branch=main&per_page=1`);
+        const runs = await get<Runs>(`/repos/${accountOf(repo)}/${repo}/actions/workflows/release.yml/runs?branch=main&per_page=1`);
         const run = runs?.workflow_runs[0];
         if (run && run.status !== "completed") {
           out[a.id] = { state: "ci-running", detail: "The release workflow runs now.", url: run.html_url };

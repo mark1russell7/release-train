@@ -283,13 +283,17 @@ export function plan(g: Graph): Plan {
 
   // The train moves a repository only to a version that the release workflow of its own repository built. A version from
   // another build can come from a stolen token, and pnpm does not check our scopes (trustPolicyExclude, minimumReleaseAgeExclude).
+  // The repository is in its own account. A repository that moved from the home account keeps the provenance of its old
+  // place until its next release, and the home account is also of the owner, so that place is valid too.
   const untrusted = (p: PackageNode, t: string): string | null => {
     if (t !== valid(p.npm.latest) || p.npm.provenance === undefined) return null;
-    const want = `https://github.com/${g.owner}/${p.repo}`;
+    const account = repoInfo.get(p.repo)?.account ?? g.owner;
+    const want = `https://github.com/${account}/${p.repo}`;
+    const places = [want, `https://github.com/${g.owner}/${p.repo}`].map((u) => u.toLowerCase());
     const prov = p.npm.provenance;
     const check = "A person checks the publish on npm, then releases a new version from release.yml.";
     if (prov === null) return `${p.name}@${t} has no provenance on npm, so the release train does not move a repository to it. ${check}`;
-    if (prov.repository.toLowerCase() !== want.toLowerCase() || prov.workflow !== RELEASE_WORKFLOW) {
+    if (!places.includes(prov.repository.toLowerCase()) || prov.workflow !== RELEASE_WORKFLOW) {
       return `${p.name}@${t} was built by ${prov.workflow} of ${prov.repository}, not by ${RELEASE_WORKFLOW} of ${want}. ${check}`;
     }
     return null;

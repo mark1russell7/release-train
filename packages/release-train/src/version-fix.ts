@@ -1,3 +1,4 @@
+import { accountOfRepos } from "./accounts.ts";
 import { createHash } from "node:crypto";
 import semver from "semver";
 import { TRAIN_BRANCH, ciState, latestRuns } from "./apply.ts";
@@ -360,8 +361,10 @@ export interface FixRow {
 /** The options of a run of the version fix. */
 export interface FixRunOptions {
   gh: GitHub;
+  /** The home account. */
   owner: string;
-  repos: readonly { name: string; private: boolean }[];
+  /** The repositories of the run. A repository with no account is in the home account. */
+  repos: readonly { name: string; private: boolean; account?: string }[];
   /** The writer. A dry run gives null. */
   fixer: VersionFixer | null;
   /** The login of the GitHub App of the train, for example `name[bot]`. */
@@ -399,7 +402,8 @@ const FAILED = new Set(["failure", "timed_out", "cancelled", "action_required", 
 export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
   const log = o.log ?? (() => {});
   const label = o.label ?? ((repo: string) => repo);
-  const base = `/repos/${o.owner}`;
+  const accountOf = accountOfRepos(o.owner, o.repos);
+  const at = (repo: string): string => `/repos/${accountOf(repo)}/${repo}`;
   const rows: FixRow[] = [];
   // A rate limit stops the run: each next read fails too, and only spends the time of the job. The next run continues.
   const stop: { by: GhResponse<unknown> | null; repos: number } = { by: null, repos: 0 };
@@ -419,9 +423,9 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
   };
 
   const ciOf = async (repo: string, sha: string): Promise<CiFacts> => {
-    const runs = await gh.request<{ check_runs: CheckRunData[] }>("GET", `${base}/${repo}/commits/${sha}/check-runs?per_page=100`);
-    const status = await gh.request<{ state: string; total_count: number }>("GET", `${base}/${repo}/commits/${sha}/status`);
-    const workflows = await gh.request<{ workflow_runs: { workflow_id: number; check_suite_id: number; created_at: string }[] }>("GET", `${base}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
+    const runs = await gh.request<{ check_runs: CheckRunData[] }>("GET", `${at(repo)}/commits/${sha}/check-runs?per_page=100`);
+    const status = await gh.request<{ state: string; total_count: number }>("GET", `${at(repo)}/commits/${sha}/status`);
+    const workflows = await gh.request<{ workflow_runs: { workflow_id: number; check_suite_id: number; created_at: string }[] }>("GET", `${at(repo)}/actions/runs?head_sha=${sha}&per_page=100`);
     const latest = latestRuns(runs.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []) as CheckRunData[];
     if (!runs.ok) return { state: "none", statusFailed: false, failed: [] };
     // A check that runs can still fail with another error, so the fix waits for each check.
@@ -430,13 +434,13 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
     if (state !== "failed") return { state, statusFailed, failed: [] };
     const failed: FailedCheck[] = [];
     for (const run of latest.filter((r) => r.status === "completed" && r.conclusion !== null && FAILED.has(r.conclusion))) {
-      const notes = await gh.request<{ annotation_level?: string; message?: string }[]>("GET", `${base}/${repo}/check-runs/${run.id}/annotations?per_page=100`);
+      const notes = await gh.request<{ annotation_level?: string; message?: string }[]>("GET", `${at(repo)}/check-runs/${run.id}/annotations?per_page=100`);
       const annotations = (notes.data ?? []).filter((a) => a.annotation_level === "failure").map((a) => a.message ?? "");
       const check: FailedCheck = { name: run.name, annotations };
       const told = readCheck(check);
       // The annotations of a job can hold only the last line. Then the log of the job tells the message.
       if (told.unshipped.length === 0 && told.missing.length === 0 && !told.aggregate && told.other.length === 0 && run.app?.slug === "github-actions" && gh.text) {
-        const text = await gh.text(`${base}/${repo}/actions/jobs/${run.id}/logs`);
+        const text = await gh.text(`${at(repo)}/actions/jobs/${run.id}/logs`);
         check.log = text.ok ? text.data : null;
       }
       failed.push(check);
@@ -445,7 +449,7 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
   };
 
   const marksOf = async (repo: string, pr: number): Promise<FixMark[]> => {
-    const commits = await gh.request<{ commit?: { message?: string } }[]>("GET", `${base}/${repo}/pulls/${pr}/commits?per_page=100`);
+    const commits = await gh.request<{ commit?: { message?: string } }[]>("GET", `${at(repo)}/pulls/${pr}/commits?per_page=100`);
     return parseFixMarks((commits.data ?? []).map((c) => c.commit?.message ?? ""));
   };
 
@@ -454,7 +458,7 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
       stop.repos++;
       return;
     }
-    const res = await gh.request<PullData[]>("GET", `${base}/${r.name}/pulls?state=open&per_page=100`);
+    const res = await gh.request<PullData[]>("GET", `${at(r.name)}/pulls?state=open&per_page=100`);
     if (!res.ok) {
       if (stop.by !== null) stop.repos++;
       else log(`version fix ${label(r.name, r.private)}: the open pull requests are not readable (HTTP ${res.status}).`);

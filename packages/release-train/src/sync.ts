@@ -63,6 +63,8 @@ export interface RunFacts {
 /** The facts that the rules read for one repository. */
 export interface SyncFacts extends RunFacts {
   repo: string;
+  /** The account of the repository. Absent: the account is `owner`, the home account of the template. */
+  account?: string | undefined;
   /** This value is true when a version of the repository is in flight. Then `release.yml` keeps its pins. */
   releaseInFlight: boolean;
 }
@@ -648,7 +650,7 @@ const siteConfigRule: SyncRule = {
       if (text !== null) workflows.push({ path, text });
     }
     const config = files.paths.includes(SITE_CONFIG_PATH) ? await files.read(SITE_CONFIG_PATH) : null;
-    const move = moveSiteConfig({ owner: f.owner, repo: f.repo, templateSha: f.templateSha, workflows, config });
+    const move = moveSiteConfig({ owner: f.owner, account: f.account, repo: f.repo, templateSha: f.templateSha, workflows, config });
     if (move === null) return null;
     if (move.needs.length > 0) return { changes: [], needs: move.needs };
     if (move.config !== null) {

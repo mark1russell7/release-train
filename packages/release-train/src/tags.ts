@@ -68,6 +68,8 @@ export function provenanceCommit(doc: Attestations, repositoryId: string): strin
 /** One repository of the backfill. */
 export interface TagRepo {
   name: string;
+  /** The account of the repository. Absent: the account is the owner of the run. */
+  account?: string;
   private: boolean;
   defaultBranch: string;
   /** The count of published packages on the default branch, by the rule of the template for a tag. */
@@ -84,6 +86,7 @@ export function tagRepos(repos: readonly RepoSnapshot[], packages: readonly Pack
     .filter((r) => only === null || only.includes(r.name))
     .map((r) => ({
       name: r.name,
+      ...(r.account !== undefined ? { account: r.account } : {}),
       private: r.private,
       defaultBranch: r.defaultBranch,
       publishedCount: r.manifests.filter(({ manifest: m }) => Boolean(m.name) && m.private !== true).length,
@@ -191,7 +194,7 @@ export async function backfillTags(i: TagsInput): Promise<TagsReport> {
   };
 
   const backfillRepo = async (repo: TagRepo): Promise<{ versions: number; tagged: number; rows: TagRow[] }> => {
-    const slug = `${i.owner}/${repo.name}`;
+    const slug = `${repo.account ?? i.owner}/${repo.name}`;
     const rows: TagRow[] = [];
     let versions = 0;
     let tagged = 0;
