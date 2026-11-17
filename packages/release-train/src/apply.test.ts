@@ -1604,7 +1604,7 @@ describe("gitUpdater and the first API report", () => {
   const REPORT = "packages/a/test/api/public-api.txt";
 
   /** The clone has the script `start`. The fix adds `check:api` and writes LICENSE. The step `broken` fails. */
-  const start = async (options: { had?: boolean; script?: string; broken?: string; config?: string; noBuild?: boolean; noReport?: string; tool?: boolean } = {}) => {
+  const start = async (options: { had?: boolean; script?: string; broken?: string; config?: string; noBuild?: boolean; noReport?: string; tool?: boolean; committed?: boolean } = {}) => {
     const dep = options.tool === true ? API_REPORT_PACKAGE : CONVENTIONS;
     const cmds: string[] = [];
     const trees: { manifest: string; lock: string }[] = [];
@@ -1619,6 +1619,10 @@ describe("gitUpdater and the first API report", () => {
         const apiReport = options.config === undefined ? {} : { apiReport: { report: options.config } };
         const scripts = { ...(options.noBuild === true ? {} : { build: "tsc" }), ...(options.had === true ? { "check:api": options.script ?? "api-report check" } : {}) };
         writeFileSync(file, `${JSON.stringify({ name: "x", scripts, ...apiReport, devDependencies: { [dep]: "^0.8.0" } }, null, 2)}\n`);
+        if (options.committed === true) {
+          mkdirSync(join(opts.cwd, "packages/a/test/api"), { recursive: true });
+          writeFileSync(join(opts.cwd, REPORT), "old report\n");
+        }
       }
       if (cmd === "git" && args[0] === "write-tree") {
         trees.push({ manifest: readFileSync(file, "utf8"), lock: readFileSync(join(opts.cwd, "pnpm-lock.yaml"), "utf8") });
@@ -1709,6 +1713,16 @@ describe("gitUpdater and the first API report", () => {
     expect(message).toContain("- api-report update: 1 report");
     expect(cmds.slice(0, cmds.findIndex((c) => c.includes(" commit ")))).toContain(`git add -A -- ${REPORT}`);
     expect(prBody(update(API_REPORT_PACKAGE), result)).toContain("## API reports\n");
+  });
+
+  it("builds only the packages with a report and their dependencies when the root has no script build", async () => {
+    // highways 2026-11-15: the build of packages/site read the history of git, and the clone has one commit
+    const { cmds, result } = await start({ had: true, tool: true, noBuild: true, committed: true });
+    const built = cmds.indexOf("pnpm -r --if-present --filter {packages/a}... run build");
+    expect(built).toBeGreaterThan(-1);
+    expect(cmds).not.toContain("pnpm -r --if-present run build");
+    expect(built).toBeLessThan(cmds.lastIndexOf("pnpm exec api-report update"));
+    expect(result).toMatchObject({ status: "pushed", apiReports: [REPORT] });
   });
 
   it("writes the reports of the folders that the script check:api names", async () => {
