@@ -11,7 +11,7 @@ import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import { addChangelogSection, awaitRelease, changesetText, dispatchReleased, decideBump, decisionBreaks, namesModule, setManifestVersion, typedFiles } from "./release.ts";
 import type { Manifest, NpmInfo, RepoSnapshot } from "./types.ts";
-import { changesetName, CREDENTIAL_NAME, gitUpdater, needsGitAuth, UPDATE_SCRIPT } from "./workspace.ts";
+import { changesetName, cloneEnv, CREDENTIAL_NAME, gitUpdater, needsGitAuth, TRAIN_ONLY_VARIABLES, UPDATE_SCRIPT } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 /** This function makes a gzip tar file with the given files. */
@@ -119,6 +119,59 @@ describe("needsGitAuth", () => {
   it("names tokens, secrets, keys and the settings of the train", () => {
     for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "ACTIONS_RUNTIME_TOKEN", "NPM_SECRET", "RELEASE_TRAIN_APP_KEY", "RELEASE_TRAIN_HASH_KEY", "SSH_KEY"]) expect(CREDENTIAL_NAME.test(name), name).toBe(true);
     for (const name of ["PATH", "HOME", "CI", "GITHUB_REPOSITORY", "KEYBOARD", "NODE_OPTIONS"]) expect(CREDENTIAL_NAME.test(name), name).toBe(false);
+  });
+});
+
+describe("cloneEnv", () => {
+  // The environment of a scheduled run of the train, in the repository of the train
+  const train: NodeJS.ProcessEnv = {
+    PATH: "/bin",
+    CI: "true",
+    GITHUB_ACTIONS: "true",
+    GITHUB_REPOSITORY: "ex/release-train",
+    GITHUB_REPOSITORY_ID: "1",
+    GITHUB_SHA: "d52e7745112a4b4264e913e2c1fa36c2e834f0be",
+    GITHUB_REF: "refs/heads/trunk",
+    GITHUB_REF_NAME: "trunk",
+    GITHUB_REF_TYPE: "branch",
+    GITHUB_REF_PROTECTED: "true",
+    GITHUB_HEAD_REF: "",
+    GITHUB_BASE_REF: "",
+    GITHUB_WORKSPACE: "/work/release-train",
+    GITHUB_WORKFLOW_REF: "ex/release-train/.github/workflows/train.yml@refs/heads/trunk",
+    GITHUB_WORKFLOW_SHA: "d52e7745112a4b4264e913e2c1fa36c2e834f0be",
+    GITHUB_ENV: "/run/env",
+    GITHUB_PATH: "/run/path",
+    GITHUB_OUTPUT: "/run/output",
+    GITHUB_STATE: "/run/state",
+    GITHUB_STEP_SUMMARY: "/run/summary",
+    GITHUB_RUN_ID: "42",
+    GITHUB_EVENT_NAME: "schedule",
+  };
+  const clone = { repository: "ex/lib-repo", workspace: "/tmp/rt-1", branch: "main", sha: "0123456789abcdef0123456789abcdef01234567" };
+
+  it("gives the repository, the commit, the branch and the folder of the clone", () => {
+    expect(cloneEnv(train, clone)).toMatchObject({
+      GITHUB_REPOSITORY: "ex/lib-repo",
+      GITHUB_SHA: clone.sha,
+      GITHUB_REF: "refs/heads/main",
+      GITHUB_REF_NAME: "main",
+      GITHUB_REF_TYPE: "branch",
+      GITHUB_WORKSPACE: "/tmp/rt-1",
+    });
+  });
+
+  it("removes each variable that names the train or a file of its job, and keeps the others", () => {
+    const e = cloneEnv(train, clone);
+    for (const name of TRAIN_ONLY_VARIABLES) expect(e, name).not.toHaveProperty(name);
+    expect(e).toMatchObject({ PATH: "/bin", CI: "true", GITHUB_ACTIONS: "true", GITHUB_RUN_ID: "42", GITHUB_EVENT_NAME: "schedule" });
+    // The input does not change
+    expect(train["GITHUB_SHA"]).toBe("d52e7745112a4b4264e913e2c1fa36c2e834f0be");
+    expect(train["GITHUB_ENV"]).toBe("/run/env");
+  });
+
+  it("gives no GITHUB_SHA when the commit of the clone is not known, so a tool reads HEAD", () => {
+    for (const sha of [undefined, ""]) expect(cloneEnv(train, { ...clone, sha }), String(sha)).not.toHaveProperty("GITHUB_SHA");
   });
 });
 

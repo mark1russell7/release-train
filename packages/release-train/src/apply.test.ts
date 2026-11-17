@@ -1542,6 +1542,10 @@ describe("gitUpdater and conventions fix", () => {
     expect(cmds.slice(0, fix).filter((c) => c.startsWith("pnpm")).at(-1)).toBe("pnpm install --frozen-lockfile --ignore-scripts");
     expect(fixEnv[0]?.["GITHUB_REPOSITORY"]).toBe(`${OWNER}/lib-repo`);
     expect(fixEnv[0]).not.toHaveProperty("GITHUB_STEP_SUMMARY");
+    expect(fixEnv[0]?.["GITHUB_REF_NAME"]).toBe("main");
+    // The fake git gives no commit, so the fix gets no GITHUB_SHA, and never the commit of the train
+    expect(fixEnv[0]).not.toHaveProperty("GITHUB_SHA");
+    for (const name of ["GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT"]) expect(fixEnv[0], name).not.toHaveProperty(name);
     expect(Object.keys(fixEnv[0] ?? {}).filter((key) => key.startsWith("GIT_CONFIG_"))).toEqual([]);
     expect(result).toMatchObject({ status: "pushed", fixed: [".github/workflows/ci.yml", "vitest.config.ts"] });
     expect(message).toContain("- conventions fix: .github/workflows/ci.yml, vitest.config.ts");
