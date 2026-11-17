@@ -182,6 +182,7 @@ describe("decideFix", () => {
   it("skips a head that runs, has no CI, is green, or has a failed commit status", () => {
     expect(decideFix("renovate", { state: "running", statusFailed: false, failed: [] }, [])).toEqual({ act: false, reason: "CI runs" });
     expect(decideFix("renovate", { state: "none", statusFailed: false, failed: [] }, [])).toEqual({ act: false, reason: "the head has no CI result" });
+    expect(decideFix("renovate", { state: "unread", statusFailed: false, failed: [] }, [])).toEqual({ act: false, reason: "no read of the CI state" });
     expect(decideFix("renovate", { state: "green", statusFailed: false, failed: [] }, [])).toEqual({ act: false, reason: "CI is green" });
     expect(decideFix("renovate", { ...failed({ name: "x", annotations: [LAG_HUD] }), statusFailed: true }, [])).toEqual({ act: false, reason: "a commit status failed" });
   });

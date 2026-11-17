@@ -57,6 +57,11 @@ describe("stuckCi", () => {
   it("does not change a state that is not running", () => {
     expect(stuckCi([check(1, "completed", "failure")], null, [run(1, 7, "completed")], NOW, 6)).toEqual({ state: "failed", stuck: false });
   });
+
+  it("gives no read when a read of the CI failed, and never stuck", () => {
+    expect(stuckCi([check(2, "completed", "success")], null, [run(2, 1, "completed")], NOW, 6, true)).toEqual({ state: "unread", stuck: false });
+    expect(stuckCi([check(1), check(2, "completed", "success")], null, [run(1, 7), run(2, 1, "completed")], NOW, 6, true)).toEqual({ state: "unread", stuck: false });
+  });
 });
 
 describe("candidateReader", () => {

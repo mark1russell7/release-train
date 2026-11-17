@@ -363,8 +363,11 @@ export type RepoState =
   | "skipped"
   | "error";
 
-/** The CI state of a pull request. */
-export type CiState = "none" | "running" | "failed" | "green";
+/**
+ * The CI state of a pull request. `unread`: a read of the check runs or of the commit status failed, and the reads that
+ * worked show no failure. The train cannot decide, so it waits: a check that cannot read gives no pass.
+ */
+export type CiState = "none" | "running" | "failed" | "green" | "unread";
 
 /** The result of one repository. */
 export interface RepoResult {
@@ -990,12 +993,19 @@ export function latestRuns<R extends CheckRun>(runs: readonly R[], workflowRuns:
   return runs.filter((r) => !(r.check_suite && old.has(r.check_suite.id)) && !allowed(r));
 }
 
-/** This function changes the check runs and the commit status of a commit into one CI state. */
-export function ciState(runs: readonly CheckRun[], status: { state: string; total_count: number } | null): CiState {
+/**
+ * This function changes the check runs and the commit status of a commit into one CI state.
+ *
+ * @param unread - True when a read of the check runs or of the commit status failed. A failure that the other read shows
+ * still gives `failed`. Else the state is `unread`, never `green` or `none`: for example, an App with no permission for
+ * commit statuses cannot read them in a private repository (the answer 403).
+ */
+export function ciState(runs: readonly CheckRun[], status: { state: string; total_count: number } | null, unread = false): CiState {
   const failed = new Set(["failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"]);
   const legacy = status && status.total_count > 0 ? status.state : null;
   if (runs.some((r) => r.status === "completed" && r.conclusion !== null && failed.has(r.conclusion))) return "failed";
   if (legacy === "failure" || legacy === "error") return "failed";
+  if (unread) return "unread";
   if (runs.length === 0 && legacy === null) return "none";
   if (runs.some((r) => r.status !== "completed") || legacy === "pending") return "running";
   return "green";
@@ -1203,14 +1213,25 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   };
   const open = await openOf(TRAIN_BRANCH);
 
+  /**
+   * This function makes the labels of the train that a repository does not have. It reads the labels of the repository
+   * one time in a run, and makes only the missing ones. Before, it made each label in each run, and GitHub refused each
+   * label that existed (10 of 10 requests failed in a run of 11-17). When the read fails, it makes each label, as before.
+   */
+  const labelsDone = new Set<string>();
   const ensureLabels = async (repo: string): Promise<void> => {
+    if (labelsDone.has(repo)) return;
+    labelsDone.add(repo);
     const labels: (readonly [string, string, string])[] = [
       [TRAIN_LABEL, "1d76db", "A pull request of the release train."],
       [BLOCKED_LABEL, "b60205", "CI failed on a pull request of the release train."],
     ];
     // Only the mode one-candidate reads the retry label, so only that mode makes it.
     if (modeOf(repo, privateOf.get(repo) ?? true) === "one-candidate") labels.push([policy.retryLabel, "fbca04", "Add this label for one new build of a red pull request of the release train."]);
+    const read = await gh.request<{ name: string }[]>("GET", `${at(repo)}/labels?per_page=100`);
+    const have = new Set(read.ok && Array.isArray(read.data) ? read.data.map((l) => l.name.toLowerCase()) : []);
     for (const [name, color, description] of labels) {
+      if (have.has(name.toLowerCase())) continue;
       await gh.request("POST", `${at(repo)}/labels`, { name, color, description });
     }
   };
@@ -1257,7 +1278,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     const status = await gh.request<{ state: string; total_count: number }>("GET", `${at(repo)}/commits/${sha}/status`);
     const workflows = await gh.request<{ workflow_runs: WorkflowRun[] }>("GET", `${at(repo)}/actions/runs?head_sha=${sha}&per_page=100`);
     const latest = latestRuns(runs.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []);
-    return { ci: ciState(latest, status.data), release: releaseCheckOf(latest) };
+    return { ci: ciState(latest, status.data, !runs.ok || !status.ok), release: releaseCheckOf(latest) };
   };
   const ciOf = async (repo: string, sha: string): Promise<CiState> => (await checksOf(repo, sha)).ci;
 
@@ -1390,7 +1411,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       }
       return { state: "unchanged", ci, detail: `CI is green, but the merge failed (HTTP ${m.status}${m.message ? `: ${m.message}` : ""}).` };
     }
-    const why = ci === "none" ? "No CI check started yet." : "CI runs.";
+    const why = ci === "none" ? "No CI check started yet." : ci === "unread" ? "No read: a read of the check runs or of the commit status failed, so the train waits." : "CI runs.";
     return { state: "unchanged", ci, detail: why };
   };
 
