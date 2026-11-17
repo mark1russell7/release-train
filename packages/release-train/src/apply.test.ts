@@ -307,6 +307,9 @@ describe("apply", () => {
       [`POST ${base}/lib-repo/pulls`]: (b) => [201, { ...pull(9, "lib-repo"), ...b, labels: [] }],
       [`POST ${base}/lib-repo/labels`]: () => [201, {}],
       [`GET ${base}/secret-repo/labels`]: () => [200, [{ name: "release-train" }, { name: "Release-Train:Blocked" }]],
+      // The pull request has no CI yet: the reads succeed and show no check.
+      [`GET ${base}/secret-repo/commits/sha7/check-runs`]: () => [200, { check_runs: [] }],
+      [`GET ${base}/secret-repo/commits/sha7/status`]: () => [200, { state: "pending", total_count: 0 }],
       [`POST ${base}/secret-repo/labels`]: () => [422, { message: "exists" }],
       [`POST ${base}/lib-repo/issues/9/labels`]: () => [200, []],
       [`PATCH ${base}/stale-repo/pulls/3`]: () => [200, {}],
@@ -358,7 +361,7 @@ describe("apply", () => {
     const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: up, dryRun: false, only: ["secret-repo"], maxPushes: 0, now: slot(0) });
     expect(up.seen).toEqual([]);
     expect(r.results[0]).toMatchObject({ state: "unchanged", ci: "unread" });
-    expect(r.results[0]?.detail).toContain("No read");
+    expect(r.results[0]?.detail).toContain("no read of the CI state");
     expect(calls.some((c) => c.method === "PUT")).toBe(false);
   });
 

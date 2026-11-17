@@ -997,7 +997,7 @@ export function latestRuns<R extends CheckRun>(runs: readonly R[], workflowRuns:
  * This function changes the check runs and the commit status of a commit into one CI state.
  *
  * @param unread - True when a read of the check runs or of the commit status failed. A failure that the other read shows
- * still gives `failed`. Else the state is `unread`, never `green` or `none`: for example, an App with no permission for
+ * still gives `failed`. Else the state is `unread`, not `green` or `none`. For example, an App with no permission for
  * commit statuses cannot read them in a private repository (the answer 403).
  */
 export function ciState(runs: readonly CheckRun[], status: { state: string; total_count: number } | null, unread = false): CiState {
