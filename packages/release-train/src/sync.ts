@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import semver from "semver";
 import type { FetchFn } from "./collect.ts";
 import type { GitHub } from "./github.ts";
 import { matchWorkspaces, parsePnpmWorkspace } from "./parse.ts";
@@ -607,11 +608,34 @@ const renovateDayRule: SyncRule = {
 export const SITE_CONFIG_COMMENT =
   'The site config of this repository (CI.md of the template, "The site config"). The Pages workflow deploys this site from main, and a job of ci.yml checks it on each pull request.';
 
+/** The package of the conventions check. */
+const CONVENTIONS = "@mark1russell7/conventions";
+
+/** The first version of the conventions check whose rule `roadmap-parses` reads the roadmap in `.github/site.json`. */
+export const SITE_CONFIG_CONVENTIONS = "0.42.0";
+
+/**
+ * This function gives the range of the conventions check in the root `package.json` when the range has a version before
+ * `SITE_CONFIG_CONVENTIONS`. It gives null for no range, a newer range, or a value that is not a SemVer range (for
+ * example `workspace:*`).
+ */
+async function conventionsBeforeSiteConfig(files: RepoFiles): Promise<string | null> {
+  const root = (await readJson(files, "package.json"))?.value;
+  const range = root?.devDependencies?.[CONVENTIONS] ?? root?.dependencies?.[CONVENTIONS];
+  if (range === undefined || semver.validRange(range) === null) return null;
+  const lowest = semver.minVersion(range);
+  return lowest !== null && semver.lt(lowest, SITE_CONFIG_CONVENTIONS) ? range : null;
+}
+
 /**
  * Rule 7: a repository that deploys a site with `reusable-pages.yml` gets the form of the rule `site-check-in-ci` of
  * conventions. The site values go into `.github/site.json`, no pull request starts the deploy, and a new job of
  * `ci.yml` checks the site. The job `CI OK` needs it. The new job is `site`, or `site-check` when `site` is in use.
  * A form that the rule cannot change safely is a need.
+ *
+ * The move waits while the root `package.json` gives a conventions
+ * check before `SITE_CONFIG_CONVENTIONS`. That check reads the roadmap only in the Pages workflow, so after the move it
+ * fails each pull request. The update of the conventions check ends the wait.
  */
 const siteConfigRule: SyncRule = {
   id: "site-config",
@@ -627,6 +651,13 @@ const siteConfigRule: SyncRule = {
     const move = moveSiteConfig({ owner: f.owner, repo: f.repo, templateSha: f.templateSha, workflows, config });
     if (move === null) return null;
     if (move.needs.length > 0) return { changes: [], needs: move.needs };
+    if (move.config !== null) {
+      const range = await conventionsBeforeSiteConfig(files);
+      if (range !== null) {
+        const wait = `The site values move into \`${SITE_CONFIG_PATH}\` after the update of \`${CONVENTIONS}\` to ${SITE_CONFIG_CONVENTIONS} or later. The root \`package.json\` gives \`${range}\`, and the rule \`roadmap-parses\` of that version reads the roadmap only in the Pages workflow.`;
+        return { changes: [], waits: [wait] };
+      }
+    }
     const write = { ...move.writes };
     if (move.config !== null) write[SITE_CONFIG_PATH] = formatJson("{\n}\n", { $comment: SITE_CONFIG_COMMENT, ...move.config }, await jsonWidthOf(files, SITE_CONFIG_PATH));
     return { changes: move.changes, edit: { write } };

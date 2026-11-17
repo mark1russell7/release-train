@@ -6,7 +6,7 @@ import { resolveSiteConfig, SITE_CONFIG_PATH } from "@mark1russell7/site-pages/c
 import { afterAll, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import { checkJobId, moveSiteConfig, type SiteMove, type WorkflowText } from "./site-config.ts";
-import { SITE_CONFIG_COMMENT, syncRepo, type RepoFiles, type SyncFacts } from "./sync.ts";
+import { SITE_CONFIG_COMMENT, SITE_CONFIG_CONVENTIONS, syncRepo, type RepoFiles, type SyncFacts } from "./sync.ts";
 
 const OWNER = "mark1russell7";
 const REPO = "demo-site";
@@ -281,6 +281,26 @@ describe("the sync rule site-config", () => {
     const held = await syncRepo(mem(files), facts(), rules, false);
     expect(held.outcomes).toMatchObject([{ rule: "site-config", state: "held" }]);
     expect(held.writes).toEqual({});
+  });
+
+  it("waits while the root package.json gives a conventions check before 0.42.0, and moves with a newer one", async () => {
+    const rules = (await import("./sync.ts")).SYNC_RULES.filter((rule) => rule.id === "site-config");
+    const withRoot = (root: object): Record<string, string> => ({ [PAGES]: pages(STANDARD), [CI]: ci(), "package.json": JSON.stringify(root) });
+    for (const [field, range] of [["devDependencies", "^0.41.9"], ["dependencies", ">=0.40.0"]] as const) {
+      const r = await syncRepo(mem(withRoot({ [field]: { "@mark1russell7/conventions": range } })), facts(), rules);
+      expect(r.outcomes).toMatchObject([{ rule: "site-config", state: "report", changes: [] }]);
+      expect(r.outcomes[0]?.waits).toHaveLength(1);
+      expect(r.outcomes[0]?.waits[0]).toContain(`to ${SITE_CONFIG_CONVENTIONS} or later`);
+      expect(r.outcomes[0]?.waits[0]).toContain(`\`${range}\``);
+      expect(r.writes).toEqual({});
+    }
+    // A newer range, a value that is not a SemVer range, and a root with no conventions check: the values move.
+    for (const range of ["^0.42.0", "^0.45.0", "workspace:*", null]) {
+      const root = range === null ? { devDependencies: { vitest: "^4.0.0" } } : { devDependencies: { "@mark1russell7/conventions": range } };
+      const r = await syncRepo(mem(withRoot(root)), facts(), rules);
+      expect(r.outcomes).toMatchObject([{ rule: "site-config", state: "applied", waits: [] }]);
+      expect(Object.keys(r.writes)).toContain(SITE_CONFIG_PATH);
+    }
   });
 
   it("skips the template", async () => {
