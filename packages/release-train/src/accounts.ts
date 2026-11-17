@@ -82,19 +82,25 @@ export function accountFn(owner: string | AccountOf): AccountOf {
  * - `/repositories/{id}/...` gives the account of the id in `ids`. GitHub gives this form in the links of the next pages.
  * - `/search/...` gives the account of the first `user:` or `org:` qualifier of the query.
  *
- * @param url - The path, or the full URL.
+ * @param url - The path, or a full URL of the API. A full URL of a different host, or with a path out of the base, gives null.
  * @param ids - The account of each repository id.
  * @param apiBase - The base of the API. The function removes it from a full URL.
  */
 export function accountOfPath(url: string, ids: ReadonlyMap<number, string> = new Map(), apiBase = "https://api.github.com"): string | null {
-  let rest = url.startsWith(apiBase) ? url.slice(apiBase.length) : url;
-  if (/^https?:\/\//.test(rest)) {
+  let rest = url;
+  if (/^https?:\/\//.test(url)) {
+    let u: URL;
+    let base: URL;
     try {
-      const u = new URL(rest);
-      rest = `${u.pathname}${u.search}`;
+      u = new URL(url);
+      base = new URL(apiBase);
     } catch {
       return null;
     }
+    // The origins must be equal: a host whose name starts with the text of the API host is a different host.
+    const prefix = base.pathname.replace(/\/+$/, "");
+    if (u.origin !== base.origin || (u.pathname !== prefix && !u.pathname.startsWith(`${prefix}/`))) return null;
+    rest = `${u.pathname.slice(prefix.length)}${u.search}`;
   }
   const q = rest.indexOf("?");
   const path = q < 0 ? rest : rest.slice(0, q);

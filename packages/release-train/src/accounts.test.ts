@@ -57,6 +57,14 @@ describe("accountOfPath", () => {
     expect(accountOfPath(`https://example.test/api/repos/${OTHER}/demo`, new Map(), "https://example.test/api")).toBe(OTHER);
   });
 
+  it("gives null for a full URL of a different host or with a path out of the base of the API", () => {
+    expect(accountOfPath(`${API}.example.test/repos/${OTHER}/demo`)).toBeNull();
+    expect(accountOfPath(`https://example.test/repos/${OTHER}/demo`)).toBeNull();
+    expect(accountOfPath(`https://example.test/other/repos/${OTHER}/demo`, new Map(), "https://example.test/api")).toBeNull();
+    expect(accountOfPath(`https://example.test/apix/repos/${OTHER}/demo`, new Map(), "https://example.test/api")).toBeNull();
+    expect(accountOfPath("https://[bad/repos/x/y")).toBeNull();
+  });
+
   it("gives the account of a repository id from the known ids, and null for an id that it does not know", () => {
     const ids = new Map([[42, OTHER]]);
     expect(accountOfPath("/repositories/42/pulls?page=2", ids)).toBe(OTHER);
