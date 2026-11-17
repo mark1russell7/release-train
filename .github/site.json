@@ -1,0 +1,14 @@
+{
+  "$comment": "The site config of this repository (CI.md of the template, \"The site config\"). The Pages workflow deploys this site from main, and a job of ci.yml checks it on each pull request.",
+  "build": "pnpm --filter @release-train/site run build",
+  "out": "packages/site/dist",
+  "env": {
+    "SITE_BASE": "/{repo}"
+  },
+  "site-pages": true,
+  "site-name": "release-train",
+  "roadmap": "docs/ROADMAP.md",
+  "site-check": true,
+  "site-check-pages": "/,/releases/,/status/",
+  "site-check-probe": "packages/site/src/check-probe.ts"
+}

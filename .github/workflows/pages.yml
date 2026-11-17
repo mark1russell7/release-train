@@ -13,7 +13,6 @@ on:
   schedule:
     - cron: "35 6 * * *"
   workflow_dispatch:
-  pull_request:
 
 permissions: {}
 
@@ -25,7 +24,7 @@ concurrency:
 
 jobs:
   pages:
-    uses: mark1russell7/template/.github/workflows/reusable-pages.yml@a236ffe6767f5d4c5d4c3cc0e5915ecd5b4a7e83 # main
+    uses: mark1russell7/template/.github/workflows/reusable-pages.yml@2030c7dec9485afebb504772f79f41f23bdb2df7 # main
     # The build job of the shared workflow gets only the read permissions. Only its deploy job,
     # which runs no code of the repository, writes to Pages.
     permissions:
@@ -37,24 +36,6 @@ jobs:
       statuses: read
       pages: write
       id-token: write
-    with:
-      # The site bundles graph.ts and plan.ts of @release-train/release-train from the workspace,
-      # so the page plans with the same code as the CLI.
-      build: pnpm --filter @release-train/site run build
-      out: packages/site/dist
-      env: '{"SITE_BASE": "/${{ github.event.repository.name }}"}'
-      deploy: ${{ github.event_name != 'pull_request' }}
-      # The site-pages action adds releases/, status/, data/releases.json and data/status.json to the built site.
-      site-pages: true
-      site-name: release-train
-      # The Status page reads the items of this table.
-      roadmap: docs/ROADMAP.md
-      # The check opens each page in a browser at 360, 400 and 1280 pixels, in light and dark.
-      # The probe drives the explorer: it bumps a package, then reads the waves, the new versions and the blocks.
-      # The check reads the TypeScript source and removes its types.
-      site-check: true
-      site-check-pages: /,/releases/,/status/
-      site-check-probe: packages/site/src/check-probe.ts
 
   # This job examines the deployed site: the home page and the pages of site-pages.
   # It starts no code of the repository and reads only the public site.
