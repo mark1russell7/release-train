@@ -186,6 +186,56 @@ export const UPDATE_SCRIPT = "release-train:update";
 /** The names of the environment variables that no child command gets: tokens, secrets, keys and the settings of the train. */
 export const CREDENTIAL_NAME: RegExp = /TOKEN|SECRET|_KEY$|^RELEASE_TRAIN_/i;
 
+/** The commit, the branch and the folder of a clone, for the environment of the scripts of the clone. */
+export interface CloneIdentity {
+  /** The full name of the repository, `owner/name`. */
+  readonly repository: string;
+  /** The folder of the clone. */
+  readonly workspace: string;
+  /** The branch of the clone. */
+  readonly branch: string;
+  /** The commit of the clone. When it is undefined or empty, the environment has no `GITHUB_SHA`, so a tool reads `HEAD`. */
+  readonly sha?: string | undefined;
+}
+
+/**
+ * The variables of GitHub Actions that no script of a clone gets. Each one names a part of the run of the train that the
+ * clone does not have. These parts are the id or a ref of the repository of the train, its workflow file and the files of its job. A script that
+ * writes `GITHUB_ENV`, `GITHUB_PATH` or `GITHUB_OUTPUT` changes the next steps of the job of the train, so these go too.
+ */
+export const TRAIN_ONLY_VARIABLES: readonly string[] = [
+  "GITHUB_REPOSITORY_ID",
+  "GITHUB_REF_PROTECTED",
+  "GITHUB_HEAD_REF",
+  "GITHUB_BASE_REF",
+  "GITHUB_WORKFLOW_REF",
+  "GITHUB_WORKFLOW_SHA",
+  "GITHUB_ENV",
+  "GITHUB_PATH",
+  "GITHUB_OUTPUT",
+  "GITHUB_STATE",
+  "GITHUB_STEP_SUMMARY",
+];
+
+/**
+ * This function gives the environment of a script of a clone. The repository, the commit, the ref and the folder are those of
+ * the clone, as in CI of its branch. The variables of `TRAIN_ONLY_VARIABLES` go. Before 0.3.19, a build read the commit of the
+ * train in `GITHUB_SHA`, and the plugin of site-pages stopped: "git cannot read the commit".
+ */
+export function cloneEnv(env: Readonly<NodeJS.ProcessEnv>, clone: CloneIdentity): NodeJS.ProcessEnv {
+  const e: NodeJS.ProcessEnv = { ...env };
+  for (const name of [...TRAIN_ONLY_VARIABLES, "GITHUB_SHA"]) delete e[name];
+  Object.assign(e, {
+    GITHUB_REPOSITORY: clone.repository,
+    GITHUB_WORKSPACE: clone.workspace,
+    GITHUB_REF: `refs/heads/${clone.branch}`,
+    GITHUB_REF_NAME: clone.branch,
+    GITHUB_REF_TYPE: "branch",
+  });
+  if (clone.sha !== undefined && clone.sha !== "") e["GITHUB_SHA"] = clone.sha;
+  return e;
+}
+
 /**
  * This function tells if a child command gets the token of the train. Only `git clone`, `git fetch` and `git push` get it.
  * They start no code of the repository. Each other command, and each package manager, gets no token.
@@ -345,7 +395,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
   /**
    * This function starts `conventions fix` of the target version, when the update moves the repository to a version that
    * has the command. It gives the changed files. A break that stays does not stop the update: CI of the pull request shows it.
-   * The rules read the repository from GITHUB_REPOSITORY, so it names the repository of the clone, not the train.
+   * The rules read the repository from GITHUB_REPOSITORY, so it names the repository of the clone, not the train (`cloneEnv`).
    * The rule typed-files reads the tsconfig files with the typescript of the repository, so the packages are installed
    * first, with no install scripts. The install and the fix get no git credentials: they need none.
    *
@@ -484,11 +534,10 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
     return { ...outcome, fixed: [...new Set([...outcome.fixed, ...reports])] };
   };
 
-  /** The environment of a script of the repository: the environment with no token, no step summary, and the repository of the clone in GITHUB_REPOSITORY. */
-  const scriptEnv = (repo: string): NodeJS.ProcessEnv => {
-    const e: NodeJS.ProcessEnv = { ...env, GITHUB_REPOSITORY: `${o.owner}/${repo}` };
-    delete e["GITHUB_STEP_SUMMARY"];
-    return e;
+  /** The environment of a script of the repository has no token. It names the repository, the commit, the branch and the folder of the clone (`cloneEnv`). */
+  const scriptEnv = async (dir: string, repo: string, branch: string): Promise<NodeJS.ProcessEnv> => {
+    const head = await run("git", ["rev-parse", "HEAD"], { cwd: dir, env });
+    return cloneEnv(env, { repository: `${o.owner}/${repo}`, workspace: dir, branch, sha: head.code === 0 ? head.stdout.trim() : undefined });
   };
 
   /** This function gives the install of one clone: the packages with no install scripts, at most one time. */
@@ -825,7 +874,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
 
         // 2. The version script of each package with a new version. A script can change the version of another package of
         // the workspace, so the lockfile gets the new versions.
-        const fixEnv = scriptEnv(u.repo);
+        const fixEnv = await scriptEnv(dir, u.repo, ctx.defaultBranch);
         const install = installer(dir, u, fixEnv);
         const hooks = await versionScripts(dir, u, bumped, fixEnv, install);
         if (hooks.error !== null) return fail(hooks.error);
@@ -990,7 +1039,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
         if (plans.length === 0) return { status: "no-change", sha: head, done: [], left, error: null };
         const w = writeFixes(dir, plans, viaChangeset);
         const lockKind: LockKind = existsSync(join(dir, "pnpm-lock.yaml")) ? "pnpm" : existsSync(join(dir, "package-lock.json")) ? "npm" : "none";
-        const e = scriptEnv(job.repo);
+        const e = await scriptEnv(dir, job.repo, job.branch);
         const install = installer(dir, { lockKind }, e);
         const hooks = await versionScripts(dir, { lockKind }, w.bumped, e, install);
         if (hooks.error !== null) return { status: "failed", sha: null, done: [], left, error: hooks.error };

@@ -428,6 +428,7 @@ node packages/release-train/src/bin.ts version-fix --owner <owner> --author "<na
 
 - Only `git clone`, `git fetch` and `git push` get the token of the App. The package managers, the scripts of the repositories and the other git commands get no token.
 - The train removes each variable with `TOKEN`, `SECRET` or `_KEY` in its name from the environment of each command. It also removes the settings `RELEASE_TRAIN_*`.
+- A script of a repository gets the repository, the commit, the branch and the folder of its clone in `GITHUB_REPOSITORY`, `GITHUB_SHA`, `GITHUB_REF` and `GITHUB_WORKSPACE`. It gets no file of the job of the train: no `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT` or `GITHUB_STEP_SUMMARY`.
 - A manual start has the inputs `dry-run` (default true), `only`, `cascade` and `urgent`. Give only public names to `only`, `cascade` and `urgent`, because GitHub shows the inputs.
 - The schedule and `repository_dispatch` change repositories only when `LIVE` in `train.yml` is `"true"`. It is `"true"` since 2026-10-25. Set it to `"false"` to stop the train.
 - The log, the step summary and the artifact `apply` give each private repository only as a count or a hash. The run also masks each private name in the log.
