@@ -11,7 +11,7 @@ import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import { addChangelogSection, awaitRelease, changesetText, dispatchReleased, decideBump, decisionBreaks, namesModule, setManifestVersion, typedFiles } from "./release.ts";
 import type { Manifest, NpmInfo, RepoSnapshot } from "./types.ts";
-import { changesetName, cloneEnv, CREDENTIAL_NAME, gitUpdater, needsGitAuth, TRAIN_ONLY_VARIABLES, UPDATE_SCRIPT } from "./workspace.ts";
+import { changesetName, cloneEnv, CREDENTIAL_NAME, gitUpdater, needsGitAuth, reportBuildArgs, TRAIN_ONLY_VARIABLES, UPDATE_SCRIPT } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 /** This function makes a gzip tar file with the given files. */
@@ -172,6 +172,33 @@ describe("cloneEnv", () => {
 
   it("gives no GITHUB_SHA when the commit of the clone is not known, so a tool reads HEAD", () => {
     for (const sha of [undefined, ""]) expect(cloneEnv(train, { ...clone, sha }), String(sha)).not.toHaveProperty("GITHUB_SHA");
+  });
+});
+
+describe("reportBuildArgs", () => {
+  const REPORT = "test/api/public-api.txt";
+
+  it("builds each folder with a report and its dependencies, once and in order", () => {
+    expect(reportBuildArgs([`packages/z/${REPORT}`, `packages/a/${REPORT}`, `packages/a/${REPORT}`], REPORT)).toEqual([
+      "-r",
+      "--if-present",
+      "--filter",
+      "{packages/a}...",
+      "--filter",
+      "{packages/z}...",
+      "run",
+      "build",
+    ]);
+  });
+
+  it("builds each package when no folder has a report, or the root package has one", () => {
+    const each = ["-r", "--if-present", "run", "build"];
+    expect(reportBuildArgs([], REPORT)).toEqual(each);
+    expect(reportBuildArgs([REPORT, `packages/a/${REPORT}`], REPORT)).toEqual(each);
+  });
+
+  it("reads the report path that the repository names", () => {
+    expect(reportBuildArgs(["packages/a/api.md"], "api.md")).toEqual(["-r", "--if-present", "--filter", "{packages/a}...", "run", "build"]);
   });
 });
 

@@ -237,6 +237,24 @@ export function cloneEnv(env: Readonly<NodeJS.ProcessEnv>, clone: CloneIdentity)
 }
 
 /**
+ * This function gives the arguments of `pnpm` that build the packages of the API reports and the packages that they depend
+ * on. A package with no report does not build. An example is a site: its build can read the history of git, and the clone of
+ * the train has one commit. With no report file, or with a report of the root package, each package builds.
+ * @param files - The files of the reports on the default branch, relative to the root of the clone, with `/`.
+ * @param report - The path of the report in a package folder, for example `test/api/public-api.txt`.
+ */
+export function reportBuildArgs(files: readonly string[], report: string): string[] {
+  const each = ["-r", "--if-present", "run", "build"];
+  const folders = new Set<string>();
+  for (const file of files) {
+    if (!file.endsWith(`/${report}`)) return each;
+    folders.add(file.slice(0, -report.length - 1));
+  }
+  if (folders.size === 0) return each;
+  return ["-r", "--if-present", ...[...folders].sort().flatMap((folder) => ["--filter", `{${folder}}...`]), "run", "build"];
+}
+
+/**
  * This function tells if a child command gets the token of the train. Only `git clone`, `git fetch` and `git push` get it.
  * They start no code of the repository. Each other command, and each package manager, gets no token.
  */
@@ -408,14 +426,19 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
    * So the function writes the first reports in the same commit. It updates the lockfile, builds and starts `api-report update`. When a step
    * fails, the root `package.json` and the lockfile go back. Thus an update cannot add the script without its reports.
    * The build follows CI: the root script when the repository has one, else the script of each package.
+   *
+   * An update that moves `api-report` builds only the packages with a report and their dependencies (`reportBuildArgs`).
    */
-  /** This function gives the steps that write the API reports: the lockfile, the install, the build as CI does it, and `api-report update`. */
-  const reportSteps = (dir: string, u: RepoUpdate): readonly (readonly [string, readonly string[]])[] => {
+  /**
+   * This function gives the steps that write the API reports: the lockfile, the install, the build as CI does it, and `api-report update`.
+   * With the files of the reports on the default branch, a pnpm build with no root script builds only their packages.
+   */
+  const reportSteps = (dir: string, u: RepoUpdate, reports: readonly string[] = []): readonly (readonly [string, readonly string[]])[] => {
     const manifest = join(dir, "package.json");
     const npm = u.lockKind === "npm";
     const quiet = ["--ignore-scripts", "--no-audit", "--no-fund"];
     const workspaces = (JSON.parse(readFileSync(manifest, "utf8")) as { workspaces?: unknown }).workspaces !== undefined;
-    const eachBuild: readonly (readonly [string, readonly string[]])[] = npm ? (workspaces ? [["npm", ["run", "build", "--workspaces", "--if-present"]]] : []) : [["pnpm", ["-r", "--if-present", "run", "build"]]];
+    const eachBuild: readonly (readonly [string, readonly string[]])[] = npm ? (workspaces ? [["npm", ["run", "build", "--workspaces", "--if-present"]]] : []) : [["pnpm", reportBuildArgs(reports, reportFile(manifest))]];
     const scripts = readScripts(manifest);
     const check = scripts?.[API_SCRIPT];
     const update = apiReportUpdateArgs(typeof check === "string" ? check : undefined);
@@ -446,7 +469,10 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
     const isReport = (file: string): boolean => file === report || file.endsWith(`/${report}`);
     // The fix wrote the first reports after the lockfile moved, so they have the new form.
     if (fixed.some(isReport)) return { reports: [], error: null };
-    for (const [cmd, args] of reportSteps(dir, u)) {
+    // The default branch passed `check:api`, so each package that `api-report` reads has its report there.
+    const tracked = await run("git", ["ls-files"], { cwd: dir, env: fixEnv });
+    const committed = tracked.code === 0 ? tracked.stdout.split("\n").filter(isReport) : [];
+    for (const [cmd, args] of reportSteps(dir, u, committed)) {
       const result = await run(cmd, [...args], { cwd: dir, env: fixEnv });
       if (result.code !== 0) {
         const error = errorLines(`${result.stdout}\n${result.stderr}`).slice(0, 5).join("\n");
