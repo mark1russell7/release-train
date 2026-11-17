@@ -18,6 +18,7 @@ import { ownScopes } from "./settings.ts";
 import type { FixDone } from "./version-fix.ts";
 import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, TEMPLATE_REPO, apiFiles, renovateDays, syncBody, syncNeeds, syncRepo } from "./sync.ts";
 import type { RepoFiles, RunFacts, SyncFacts, SyncPush, SyncResult, SyncRule, SyncUpdater, WorkflowsMode } from "./sync.ts";
+import type { SyncStarts } from "./state.ts";
 
 /** The branch of each pull request of the release train. */
 export const TRAIN_BRANCH = "release-train/update";
@@ -563,6 +564,11 @@ export interface SyncOptions {
   /** Can the App change workflow files? `auto`: the first push that GitHub refuses tells. */
   workflows: WorkflowsMode;
   rules?: readonly SyncRule[];
+  /**
+   * The first sight of the sync need of each repository, from the state (refer to `needStarts`). A sync with no open pull request
+   * waits from it. Absent: the sync waits from the date of the template commit, so each new template commit starts the wait again.
+   */
+  starts?: SyncStarts;
 }
 
 /**
@@ -2068,7 +2074,8 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       : s.facts;
     const syncOpen = await openOf(SYNC_BRANCH);
     const syncPushed = pacing ? await pushedAt(syncOpen) : new Map<string, string | undefined>();
-    // A repository with no open sync pull request waits from the template commit that it needs, not from for ever.
+    // A repository with no open sync pull request waits from the first run that saw its need (`s.starts`). A new need
+    // waits from the template commit that it needs, not from for ever.
     const syncSince = pacing ? ((await commitDate(TEMPLATE_REPO, s.facts.templateSha)) ?? runStart) : runStart;
     const pending = pendingVersions(o.plan, o.only ?? null);
     const changesets = new Set(o.plan.repos.filter((r) => (r.pendingChangesets ?? 0) > 0).map((r) => r.name));
@@ -2098,6 +2105,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         const applied = (r: SyncResult): string[] => r.outcomes.filter((x) => x.state === "applied").map((x) => x.rule);
         /** This function closes the open sync pull request, or reports the problems of a repository with no change. */
         const nothing = async (r: SyncResult): Promise<void> => {
+          s.starts?.done(repo);
           const common = commonOf(r);
           if (existing) {
             if (!o.dryRun) await closeTrainPr(repo, existing, "the template files of this repository are in sync now", SYNC_BRANCH);
@@ -2110,6 +2118,8 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
           await nothing(planned);
           return;
         }
+        // The need stays in the state until a run finds the files in sync, also while the push waits.
+        s.starts?.need(repo, syncSince);
         const metaRes = await gh.request<RepoMeta>("GET", `${base}/${repo}`);
         if (!metaRes.data) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
         const meta = metaRes.data;
@@ -2202,7 +2212,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       await syncOne(repo, record);
       pairOf(repo, privateOf.get(repo) ?? true, "sync", record, results.slice(before));
     };
-    return list.map((repo, i) => ({ at: waitMs(syncPushed.get(repo) ?? syncSince), tie: tie0 + i, run: () => syncPaired(repo) }));
+    return list.map((repo, i) => ({ at: waitMs(syncPushed.get(repo) ?? s.starts?.since(repo) ?? syncSince), tie: tie0 + i, run: () => syncPaired(repo) }));
   }
 
   // 5. The releases. A public package whose version on main is newer than npm is in flight: its release workflow publishes it.

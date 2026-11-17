@@ -563,6 +563,8 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     const p = plan(graph);
     // Without a state file the train keeps no first sight of a need, so the run gives no start for a need with no publish time.
     const starts = read ? needStarts(data.npm, read.state.seen, (o.now ?? new Date()).toISOString(), (k) => hashName(k, key)) : null;
+    // The sync need of each listed repository stays in the state, also in a run with no sync or with --only.
+    starts?.keepSync(data.repos.map((r) => r.name));
     const updater = gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author), fetch: guard.fetch });
     const facts = o.sync ? await syncFacts({ gh, owner: o.owner, fetch: guard.fetch }) : null;
     const urgentList = urgent !== undefined ? urgent : await urgentNames(o, gh, log);
@@ -575,7 +577,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       plan: p,
       gh,
       updater,
-      sync: o.sync ? { updater, facts, workflows: o.workflows } : null,
+      sync: o.sync ? { updater, facts, workflows: o.workflows, ...(starts ? { starts: starts.sync } : {}) } : null,
       ...paceOptions({ ...o, urgent: urgentList }),
       runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
       dryRun: o.dryRun,
@@ -594,7 +596,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     if (o.state !== undefined && starts) {
       writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen() })}\n`);
       const c = starts.counts();
-      log(`need starts: ${c.npm} from npm, ${c.state} from the state`);
+      log(`need starts: ${c.npm} from npm, ${c.state} from the state, ${c.sync} sync waits from the state`);
     }
     return finish(report);
   } catch (e) {

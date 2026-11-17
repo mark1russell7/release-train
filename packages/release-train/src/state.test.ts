@@ -67,9 +67,49 @@ describe("the state of the train", () => {
       "h:lib||@ex/new|2.0.0": "2026-11-09T20:30:00Z",
       "h:lib|settings": "2026-11-09T20:30:00Z",
     });
-    expect(run.counts()).toEqual({ npm: 1, state: 4 });
+    expect(run.counts()).toEqual({ npm: 1, state: 4, sync: 0 });
     // The next run keeps the first sight, so the start does not renew in each run.
     const next = needStarts({}, run.seen(), "2026-11-09T21:00:00Z", hash);
     expect(next.since("lib", [{ path: "", dep: "@ex/new", from: "2.0.0" }])).toBe("2026-11-09T20:30:00Z");
+  });
+
+  describe("the sync needs", () => {
+    const hash = (k: string): string => `h:${k.replaceAll("\0", "|")}`;
+    const T1 = "2026-11-09T10:00:00Z";
+    const T2 = "2026-11-10T10:00:00Z";
+
+    it("keeps the first sight of a sync need while the template moves, and counts it", () => {
+      const first = needStarts({}, {}, "2026-11-09T11:00:00Z", hash);
+      expect(first.sync.since("app")).toBeUndefined();
+      expect(first.sync.need("app", T1)).toBe(T1);
+      expect(first.seen()).toEqual({ "h:app|sync": T1 });
+      expect(first.counts().sync).toBe(0);
+      // A later run has a newer template commit. The need keeps its first sight, so its wait does not start again.
+      const second = needStarts({}, first.seen(), "2026-11-10T11:00:00Z", hash);
+      expect(second.sync.since("app")).toBe(T1);
+      expect(second.sync.need("app", T2)).toBe(T1);
+      expect(second.seen()).toEqual({ "h:app|sync": T1 });
+      expect(second.counts().sync).toBe(1);
+    });
+
+    it("drops a sync need when the files are in sync, and a later need starts again", () => {
+      const run = needStarts({}, { "h:app|sync": T1 }, "2026-11-10T11:00:00Z", hash);
+      run.keepSync(["app"]);
+      run.sync.done("app");
+      expect(run.sync.since("app")).toBeUndefined();
+      expect(run.seen()).toEqual({});
+      // A need after the sync in the same run does not take the old first sight back.
+      expect(run.sync.need("app", T2)).toBe(T2);
+      expect(run.counts().sync).toBe(0);
+    });
+
+    it("keeps the sync need of each listed repository in a run with no sync, and drops the others", () => {
+      const prior = { "h:app|sync": T1, "h:gone|sync": T1, "h:lib||@ex/new|2.0.0": T1 };
+      const run = needStarts({}, prior, "2026-11-10T11:00:00Z", hash);
+      run.keepSync(["app", "lib"]);
+      // The other needs stay only when the run reads them, as before.
+      expect(run.seen()).toEqual({ "h:app|sync": T1 });
+      expect(needStarts({}, run.seen(), "2026-11-10T12:00:00Z", hash).sync.since("app")).toBe(T1);
+    });
   });
 });
