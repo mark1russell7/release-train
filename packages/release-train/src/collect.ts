@@ -1,5 +1,6 @@
 import { retry, retryAfterDelay, type Clock } from "@mark1russell7/service";
 import type { Backoff } from "@mark1russell7/service/backoff";
+import { accountOfPath, repositoryIdOf, runAccounts, type Accounts } from "./accounts.ts";
 import { attestationsUrl, workflowProvenance, type Attestations } from "./attest.ts";
 import { RateStop } from "./meter.ts";
 import { DEP_TYPES } from "./types.ts";
@@ -12,8 +13,15 @@ export type FetchFn = (url: string, init?: RequestInit) => Promise<Response>;
 
 /** The options of `collect`. */
 export interface CollectOptions {
+  /** The home account. It owns the npm scope. */
   owner: string;
+  /** The token of the home account, or null. */
   token: string | null;
+  /**
+   * The accounts of the run, with the token of each. The home account of it is `owner`. The default is `owner` with
+   * `token` and no other account.
+   */
+  accounts?: Accounts;
   fetch?: FetchFn;
   /** When this option is true, the collector reads no private repository. */
   publicOnly?: boolean;
@@ -162,9 +170,12 @@ export interface Collected {
   npmTimes?: Record<string, NpmTimes>;
   /** The count of the full npm documents that the collector read. */
   fullReads?: number;
+  /** The accounts that the collector did not read, because they have no token. */
+  noRead?: string[];
 }
 
 export interface GhRepo {
+  id?: number;
   name: string;
   private: boolean;
   archived: boolean;
@@ -295,6 +306,48 @@ export async function listRepos(read: PageRead, opts: { owner: string; token: st
   return keep(listed ?? (await paginate<GhRepo>(listUrl)));
 }
 
+/** A repository of a list of several accounts, with its account. */
+export type AccountRepo = GhRepo & { account: string };
+
+/**
+ * This function lists the repositories of each account of a run, with the home account first. It gives the repositories in
+ * the order of their names.
+ *
+ * - An account other than the home account with no token is not read. Its name goes into `noRead`, and the log tells it.
+ *   The other accounts stay in the list. With `publicOnly`, the account takes the home token, because a public list
+ *   needs no token of the account.
+ * - A repository name in two accounts throws an error. The train keys each repository by its name.
+ *
+ * @param readOf - This function gives the page read of an account, with the token of that account.
+ */
+export async function listAccounts(
+  accounts: Accounts,
+  readOf: (account: string) => PageRead,
+  opts: { publicOnly: boolean; log?: (line: string) => void },
+): Promise<{ repos: AccountRepo[]; noRead: string[] }> {
+  const homeToken = accounts.token(accounts.home);
+  const noRead: string[] = [];
+  const byName = new Map<string, AccountRepo>();
+  for (const account of [accounts.home, ...accounts.others]) {
+    const own = accounts.token(account);
+    const token = own ?? (opts.publicOnly ? homeToken : null);
+    if (account !== accounts.home && own === null && !opts.publicOnly) {
+      noRead.push(account);
+      opts.log?.(`The account ${account} has no token in GH_TOKENS, so the run does not read its repositories: no read.`);
+      continue;
+    }
+    for (const r of await listRepos(readOf(account), { owner: account, token, publicOnly: opts.publicOnly })) {
+      const key = r.name.toLowerCase();
+      const other = byName.get(key);
+      if (other !== undefined) {
+        throw new Error(`The repository name ${r.name} is in the accounts ${other.account} and ${account}. The train keys each repository by its name, so each name must be in one account only.`);
+      }
+      byName.set(key, { ...r, account: r.owner?.login ?? account });
+    }
+  }
+  return { repos: [...byName.values()].sort((a, b) => a.name.localeCompare(b.name)), noRead };
+}
+
 /** This function reads the repositories, the manifests, the lockfiles and the npm state of one owner. */
 export async function collect(opts: CollectOptions): Promise<Collected> {
   const f: FetchFn = opts.fetch ?? ((u, i) => fetch(u, i));
@@ -341,21 +394,36 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   const failure = (res: Response, url: string): HttpError =>
     new HttpError(res.status, url, triesAgain(res) ? attempts : 1, rateLimitText(res, Date.now()));
 
-  const ghHeaders = (accept: string): Record<string, string> => {
+  // Each read takes the token of its account. A read of an account with no token takes the home token in a public run.
+  const accounts = opts.accounts ?? runAccounts(opts.owner, opts.token ?? null);
+  const publicOnly = opts.publicOnly ?? false;
+  const homeToken = accounts.token(accounts.home);
+  const tokenOf = (account: string): string | null => accounts.token(account) ?? (publicOnly ? homeToken : null);
+  const ids = new Map<number, string>();
+  const ghHeaders = (accept: string, account: string): Record<string, string> => {
     const h: Record<string, string> = { accept, "x-github-api-version": "2022-11-28", "user-agent": "release-train" };
-    if (opts.token) h["authorization"] = `Bearer ${opts.token}`;
+    const token = tokenOf(account);
+    if (token) h["authorization"] = `Bearer ${token}`;
     return h;
   };
 
-  const ghJson = async <T>(url: string): Promise<{ data: T; next: string | null }> => {
-    const res = await gh(url.startsWith("http") ? url : `${api}${url}`, { headers: ghHeaders("application/vnd.github+json") });
+  const ghJson = async <T>(url: string, account?: string): Promise<{ data: T; next: string | null }> => {
+    const as = account ?? accountOfPath(url, ids, api) ?? accounts.home;
+    const res = await gh(url.startsWith("http") ? url : `${api}${url}`, { headers: ghHeaders("application/vnd.github+json", as) });
     if (!res.ok) throw failure(res, url);
-    return { data: (await res.json()) as T, next: nextLink(res.headers.get("link")) };
+    const next = nextLink(res.headers.get("link"));
+    const id = repositoryIdOf(next);
+    if (id !== null) ids.set(id, as);
+    return { data: (await res.json()) as T, next };
   };
 
+  // The account of each repository of the list. The list sets it before the first read of a repository.
+  const accountOf = new Map<string, string>();
+  const slug = (repo: string): string => `${accountOf.get(repo) ?? accounts.home}/${repo}`;
+
   const ghRaw = async (repo: string, path: string, ref: string): Promise<string | null> => {
-    const url = `${api}/repos/${opts.owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`;
-    const res = await gh(url, { headers: ghHeaders("application/vnd.github.raw") });
+    const url = `${api}/repos/${slug(repo)}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`;
+    const res = await gh(url, { headers: ghHeaders("application/vnd.github.raw", accountOf.get(repo) ?? accounts.home) });
     if (res.status === 404) return null;
     if (!res.ok) throw failure(res, url);
     return res.text();
@@ -372,9 +440,11 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     return all;
   };
 
-  const ghRepos = await listRepos(ghJson, { owner: opts.owner, token: opts.token ?? null, publicOnly: opts.publicOnly ?? false });
+  const listed = await listAccounts(accounts, (account) => <T,>(url: string) => ghJson<T>(url, account), { publicOnly, log });
+  const ghRepos = listed.repos;
+  for (const r of ghRepos) accountOf.set(r.name, r.account);
   opts.onRepos?.(ghRepos.map((r) => ({ name: r.name, private: r.private })));
-  log(`repositories: ${ghRepos.length}`);
+  log(`repositories: ${ghRepos.length}${listed.noRead.length > 0 ? `, no read of the accounts ${listed.noRead.join(", ")}` : ""}`);
 
   // Phase 1: the manifests of each repository.
   interface Partial1 {
@@ -384,6 +454,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   const phase1 = await pool(ghRepos, limit, async (r): Promise<Partial1 | null> => {
     const snap: RepoSnapshot = {
       name: r.name,
+      account: r.account,
       private: r.private,
       defaultBranch: r.default_branch,
       manifests: [],
@@ -394,7 +465,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     let tree: { tree: TreeEntry[]; truncated?: boolean };
     try {
       tree = (await ghJson<{ tree: TreeEntry[]; truncated?: boolean }>(
-        `/repos/${opts.owner}/${r.name}/git/trees/${encodeURIComponent(r.default_branch)}?recursive=1`,
+        `/repos/${slug(r.name)}/git/trees/${encodeURIComponent(r.default_branch)}?recursive=1`,
       )).data;
     } catch (e) {
       // An empty repository gives HTTP 409.
@@ -486,10 +557,10 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     const folders = new Set(snap.manifests.filter((m) => typeof m.manifest.version === "string").map((m) => m.path));
     if (folders.size === 0) return;
     try {
-      const open = await paginate<{ number: number }>(`/repos/${opts.owner}/${snap.name}/pulls?state=open&per_page=100`);
+      const open = await paginate<{ number: number }>(`/repos/${slug(snap.name)}/pulls?state=open&per_page=100`);
       const found: PullVersion[] = [];
       for (const pr of open) {
-        const files = await paginate<{ filename: string; patch?: string }>(`/repos/${opts.owner}/${snap.name}/pulls/${pr.number}/files?per_page=100`);
+        const files = await paginate<{ filename: string; patch?: string }>(`/repos/${slug(snap.name)}/pulls/${pr.number}/files?per_page=100`);
         for (const file of files) {
           const path = manifestFolder(file.filename);
           const version = path !== null && folders.has(path) ? patchVersion(file.patch) : null;
@@ -502,14 +573,15 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     }
   });
 
-  // A package is foreign when its npm repository is not of the owner and no maintainer is the owner.
+  // A package is foreign when its npm repository is not of an account of the run and no maintainer is the owner.
   const npmUser = (opts.npmUser ?? opts.owner).toLowerCase();
+  const own = [accounts.home, ...accounts.others].map((a) => a.toLowerCase());
   const isForeign = async (n: string, version: string): Promise<boolean> => {
     const res = await f(`${registry}/${n.replaceAll("/", "%2f")}/${encodeURIComponent(version)}`, { headers: { "user-agent": "release-train" } });
     if (!res.ok) return false;
     const m = (await res.json()) as { repository?: string | { url?: string }; maintainers?: { name?: string }[] };
     const repoUrl = (typeof m.repository === "string" ? m.repository : (m.repository?.url ?? "")).toLowerCase();
-    const ownRepo = repoUrl.includes(`github.com/${opts.owner.toLowerCase()}/`) || repoUrl.startsWith(`github:${opts.owner.toLowerCase()}/`) || repoUrl.startsWith(`${opts.owner.toLowerCase()}/`);
+    const ownRepo = own.some((a) => repoUrl.includes(`github.com/${a}/`) || repoUrl.startsWith(`github:${a}/`) || repoUrl.startsWith(`${a}/`));
     const ownMaint = (m.maintainers ?? []).some((x) => x.name?.toLowerCase() === npmUser);
     return !ownRepo && !ownMaint;
   };
@@ -560,5 +632,5 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     return [n, { exists: true, latest, foreign, ...known, ...(latest && !foreign ? { provenance: await provenanceOf(n, latest) } : {}), ...(times ? { times } : {}) }];
   });
   log(`packages: ${names.length}, full npm documents read: ${fullReads}`);
-  return { repos: snaps.map((s) => s.snap), npm: Object.fromEntries(infos), warnings, npmTimes, fullReads };
+  return { repos: snaps.map((s) => s.snap), npm: Object.fromEntries(infos), warnings, npmTimes, fullReads, noRead: listed.noRead };
 }

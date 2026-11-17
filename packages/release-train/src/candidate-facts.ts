@@ -1,6 +1,7 @@
 import { COMPARE_FILES_MAX, ciState, latestRuns } from "./apply.ts";
 import { commitHealth, jobMinutes, surfaceChanged } from "./candidate-policy.ts";
 import type { CandidateCi, CandidateFacts, CandidateNeed, CandidatePolicy, CommitHealth, JobCost, MainHealth, RunHealth } from "./candidate-policy.ts";
+import { accountFn, type AccountOf } from "./accounts.ts";
 import type { GhResponse, GitHub } from "./github.ts";
 
 /** A pull request, as far as the readers of the candidate facts read it. */
@@ -77,9 +78,12 @@ export function stuckCi(runs: readonly CheckRun[], status: { state: string; tota
  * This function makes the readers of the candidate facts for one run. It reads only with GET. It keeps each response by
  * its path, so two reads of the same path cost one request. The pull requests of `branches` give the train merges of R4,
  * and the train reads them only when the policy has a bound for R4.
+ *
+ * @param owner - The account of each repository, or one account for each.
  */
-export function candidateReader(gh: GitHub, owner: string, policy: CandidatePolicy, now: number, branches: readonly string[]): CandidateReader {
-  const base = `/repos/${owner}`;
+export function candidateReader(gh: GitHub, owner: string | AccountOf, policy: CandidatePolicy, now: number, branches: readonly string[]): CandidateReader {
+  const accountOf = accountFn(owner);
+  const at = (repo: string): string => `/repos/${accountOf(repo)}/${repo}`;
   const cache = new Map<string, Promise<GhResponse<unknown>>>();
   let count = 0;
   const get = <T>(path: string): Promise<GhResponse<T>> => {
@@ -93,19 +97,19 @@ export function candidateReader(gh: GitHub, owner: string, policy: CandidatePoli
   };
 
   const compare = async (repo: string, sha: string, defaultBranch: string): Promise<CandidateCompare | null> => {
-    const res = await get<{ behind_by?: number; files?: { filename: string }[]; merge_base_commit?: { sha?: string } }>(`${base}/${repo}/compare/${encodeURIComponent(defaultBranch)}...${sha}`);
+    const res = await get<{ behind_by?: number; files?: { filename: string }[]; merge_base_commit?: { sha?: string } }>(`${at(repo)}/compare/${encodeURIComponent(defaultBranch)}...${sha}`);
     if (typeof res.data?.behind_by !== "number") return null;
     const files = (res.data.files ?? []).map((f) => f.filename);
     return { behind: res.data.behind_by, files, cut: files.length >= COMPARE_FILES_MAX, mergeBase: res.data.merge_base_commit?.sha ?? null };
   };
 
   const runsOf = async (repo: string, sha: string): Promise<WorkflowRun[] | null> => {
-    const res = await get<{ workflow_runs?: WorkflowRun[] }>(`${base}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
+    const res = await get<{ workflow_runs?: WorkflowRun[] }>(`${at(repo)}/actions/runs?head_sha=${sha}&per_page=100`);
     return res.ok && res.data ? (res.data.workflow_runs ?? []) : null;
   };
 
   const closedOf = async (repo: string, branch: string): Promise<CandidatePull[] | null> => {
-    const res = await get<CandidatePull[]>(`${base}/${repo}/pulls?state=closed&head=${owner}:${encodeURIComponent(branch)}&per_page=100`);
+    const res = await get<CandidatePull[]>(`${at(repo)}/pulls?state=closed&head=${accountOf(repo)}:${encodeURIComponent(branch)}&per_page=100`);
     return res.ok && Array.isArray(res.data) ? res.data : null;
   };
 
@@ -121,13 +125,13 @@ export function candidateReader(gh: GitHub, owner: string, policy: CandidatePoli
     async ci(t) {
       if (!t.pr) return { ci: { state: "none", stuck: false } };
       const sha = t.pr.head.sha;
-      const runs = await get<{ check_runs?: CheckRun[] }>(`${base}/${t.repo}/commits/${sha}/check-runs?per_page=100`);
-      const status = await get<{ state: string; total_count: number }>(`${base}/${t.repo}/commits/${sha}/status`);
+      const runs = await get<{ check_runs?: CheckRun[] }>(`${at(t.repo)}/commits/${sha}/check-runs?per_page=100`);
+      const status = await get<{ state: string; total_count: number }>(`${at(t.repo)}/commits/${sha}/status`);
       return { ci: stuckCi(runs.data?.check_runs ?? [], status.data, (await runsOf(t.repo, sha)) ?? [], now, policy.stuckCiHours) };
     },
     async mergeable(t) {
       if (!t.pr) return { mergeable: null };
-      const res = await get<{ mergeable?: boolean | null }>(`${base}/${t.repo}/pulls/${t.pr.number}`);
+      const res = await get<{ mergeable?: boolean | null }>(`${at(t.repo)}/pulls/${t.pr.number}`);
       return { mergeable: res.data?.mergeable ?? null };
     },
     async behind(t) {
@@ -139,7 +143,7 @@ export function candidateReader(gh: GitHub, owner: string, policy: CandidatePoli
       const c = await compare(t.repo, t.pr.head.sha, t.defaultBranch);
       if (c === null || c.mergeBase === null) return { surfaceChanged: true };
       if (c.behind === 0) return { surfaceChanged: false };
-      const res = await get<{ files?: { filename: string }[] }>(`${base}/${t.repo}/compare/${c.mergeBase}...${encodeURIComponent(t.defaultBranch)}`);
+      const res = await get<{ files?: { filename: string }[] }>(`${at(t.repo)}/compare/${c.mergeBase}...${encodeURIComponent(t.defaultBranch)}`);
       if (!res.ok || !res.data) return { surfaceChanged: true };
       const main = (res.data.files ?? []).map((f) => f.filename);
       const mainCut = main.length >= COMPARE_FILES_MAX;
@@ -149,7 +153,7 @@ export function candidateReader(gh: GitHub, owner: string, policy: CandidatePoli
     async otherRuns(t) {
       let n = 0;
       for (const status of ["in_progress", "queued"]) {
-        const res = await get<{ workflow_runs?: { head_branch: string | null; created_at?: string }[] }>(`${base}/${t.repo}/actions/runs?status=${status}&per_page=100`);
+        const res = await get<{ workflow_runs?: { head_branch: string | null; created_at?: string }[] }>(`${at(t.repo)}/actions/runs?status=${status}&per_page=100`);
         for (const run of res.data?.workflow_runs ?? []) {
           if (run.head_branch === t.branch || run.head_branch === t.defaultBranch) continue;
           // A run that is queued or in progress for more than stuckCiHours is stuck, as in R1, so it does not count.
@@ -162,10 +166,10 @@ export function candidateReader(gh: GitHub, owner: string, policy: CandidatePoli
     async lastPush(t) {
       const last = await lastOf(t);
       if (!last) return { lastPushAt: null };
-      const res = await get<{ commit?: { committer?: { date?: string } } }>(`${base}/${t.repo}/commits/${last.head.sha}`);
-      const at = Date.parse(res.data?.commit?.committer?.date ?? last.updated_at ?? last.created_at ?? "");
+      const res = await get<{ commit?: { committer?: { date?: string } } }>(`${at(t.repo)}/commits/${last.head.sha}`);
+      const pushed = Date.parse(res.data?.commit?.committer?.date ?? last.updated_at ?? last.created_at ?? "");
       // A time that is not readable counts as now, so the pace waits and does not push too soon.
-      return { lastPushAt: Number.isNaN(at) ? now : at };
+      return { lastPushAt: Number.isNaN(pushed) ? now : pushed };
     },
     async cost(t) {
       const last = await lastOf(t);
@@ -174,7 +178,7 @@ export function candidateReader(gh: GitHub, owner: string, policy: CandidatePoli
       if (runs === null) return { costMinutes: null };
       let minutes = 0;
       for (const run of runs) {
-        const jobs = await get<{ jobs?: JobCost[] }>(`${base}/${t.repo}/actions/runs/${run.id}/jobs?per_page=100`);
+        const jobs = await get<{ jobs?: JobCost[] }>(`${at(t.repo)}/actions/runs/${run.id}/jobs?per_page=100`);
         if (!jobs.ok || !jobs.data) return { costMinutes: null };
         for (const job of jobs.data.jobs ?? []) minutes += jobMinutes(job, t.private, now);
       }
@@ -197,7 +201,7 @@ export function candidateReader(gh: GitHub, owner: string, policy: CandidatePoli
     if (ids.size === 0) return { head: "no-read", redMerges: null };
     // A failed read, or no run of the set, gives no read.
     const healthOfSha = async (sha: string): Promise<CommitHealth> => commitHealth((await runsOf(t.repo, sha))?.filter((r) => ids.has(r.workflow_id)));
-    const headSha = (await get<{ sha?: string }>(`${base}/${t.repo}/commits/${encodeURIComponent(t.defaultBranch)}`)).data?.sha;
+    const headSha = (await get<{ sha?: string }>(`${at(t.repo)}/commits/${encodeURIComponent(t.defaultBranch)}`)).data?.sha;
     const head = headSha ? await healthOfSha(headSha) : "no-read";
     if (policy.redMainBound === null) return { head, redMerges: null };
     const since = now - policy.redMainWindowDays * 24 * HOUR_MS;

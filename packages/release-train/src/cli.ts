@@ -4,16 +4,17 @@ import { extensionFaults, holdsOfFile, readHolds } from "./holds.ts";
 import type { HoldReading, LagHold } from "./holds.ts";
 import { applyHolds, lagOver, lagReport, lagSummary } from "./lag.ts";
 import type { LagReport } from "./lag.ts";
-import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, pendingVersions, publicReport } from "./apply.ts";
+import { accountOfRepos, parseTokens, runAccounts, type Accounts } from "./accounts.ts";
+import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pendingVersions, publicReport } from "./apply.ts";
 import type { ApplyReport } from "./apply.ts";
 import { budgetGate, DEFAULT_NEED, DEFAULT_WAIT_MINUTES, goOnUrgent, rateGuard } from "./budget.ts";
-import { collect, listRepos, pool } from "./collect.ts";
+import { collect, listAccounts, pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { writeDb } from "./db.ts";
 import { buildGraph, publicView } from "./graph.ts";
 import { plan } from "./plan.ts";
 import type { Plan } from "./plan.ts";
-import { type GitHub, gitHub, pageRead, readRateLimit } from "./github.ts";
+import { accountsGitHub, type GitHub, gitHub, pageRead, readRateLimit } from "./github.ts";
 import { moveCheck, moveSummary } from "./move.ts";
 import { addProgress } from "./progress.ts";
 import type { Progress } from "./progress.ts";
@@ -30,7 +31,13 @@ import { RateStop, requestMeter } from "./meter.ts";
 /** The options of the command line. */
 export interface CliOptions {
   command: string;
+  /** The home account: it has the template, the npm scope and the App of the train. */
   owner: string;
+  /**
+   * The other accounts with repositories of the train (`--also-owner`). The variable `GH_TOKENS` gives their tokens. An
+   * account with no token is not read, except in a public run.
+   */
+  alsoOwners: string[];
   json: boolean;
   out: string | null;
   writeDb: string | null;
@@ -101,6 +108,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   const o: CliOptions = {
     command: "plan",
     owner: "mark1russell7",
+    alsoOwners: [],
     json: false,
     out: null,
     writeDb: null,
@@ -138,6 +146,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--out") o.out = value();
     else if (a === "--write-db") o.writeDb = value();
     else if (a === "--owner") o.owner = value();
+    else if (a === "--also-owner") o.alsoOwners = [...o.alsoOwners, ...value().split(",").map((x) => x.trim()).filter(Boolean)];
     else if (a === "--public-only") o.publicOnly = true;
     else if (a === "--no-progress") o.progress = false;
     else if (a === "--dry-run") o.dryRun = true;
@@ -260,6 +269,14 @@ export function summary(p: Plan, progress: Readonly<Record<string, Progress>> = 
   return lines.join("\n");
 }
 
+/**
+ * This function gives the accounts of a run: the home account with its token, and each account of `--also-owner` with its
+ * token from `GH_TOKENS`.
+ */
+export function accountsOf(o: Pick<CliOptions, "owner" | "alsoOwners">, homeToken: string | null, env: NodeJS.ProcessEnv = process.env): Accounts {
+  return runAccounts(o.owner, homeToken, o.alsoOwners, parseTokens(env["GH_TOKENS"]));
+}
+
 function token(): string | null {
   const env = process.env["GH_TOKEN"] ?? process.env["GITHUB_TOKEN"];
   if (env) return env;
@@ -354,27 +371,30 @@ async function runVersionFix(o: CliOptions): Promise<number> {
   const redact = (text: string): string => (o.showPrivate ? text : redactNames(text, secrets, key));
   const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);
   try {
-    const gh = gitHub({ token: tok });
-    const all = await listRepos(pageRead(gh), { owner: o.owner, token: tok, publicOnly: false });
+    const accounts = accountsOf(o, tok);
+    const clients = accountsGitHub(accounts);
+    const gh = clients.gh;
+    const listed = await listAccounts(accounts, (account) => pageRead(clients.of(account)), { publicOnly: false, log });
+    const all = listed.repos;
     for (const r of all.filter((x) => x.private)) {
       if (secrets.has(r.name)) continue;
       secrets.add(r.name);
       if (inActions) process.stdout.write(`::add-mask::${r.name}\n`);
     }
-    const repos = all.filter((r) => o.only === null || o.only.includes(r.name)).map((r) => ({ name: r.name, private: r.private }));
+    const repos = all.filter((r) => o.only === null || o.only.includes(r.name)).map((r) => ({ name: r.name, private: r.private, account: r.account }));
     log(`version fix: ${repos.length} repositories, ${repos.filter((r) => r.private).length} of them private${o.dryRun ? ", dry run" : ""}`);
     const author = parseAuthor(o.author);
     const rows = await versionFixRun({
       gh,
       owner: o.owner,
       repos,
-      fixer: o.dryRun ? null : gitUpdater({ owner: o.owner, token: tok, author }),
+      fixer: o.dryRun ? null : gitUpdater({ owner: o.owner, token: tok, accounts, accountOf: accountOfRepos(o.owner, repos), author }),
       // The login of the App is the name of its commit author, for example "name[bot]".
       trainLogin: o.author === null ? null : author.name,
       log,
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
     });
-    const text = redact(versionFixSummary(rows, o.dryRun));
+    const text = redact(`${versionFixSummary(rows, o.dryRun)}${listed.noRead.length > 0 ? `\n${noReadLine(listed.noRead)}` : ""}`);
     const summaryFile = process.env["GITHUB_STEP_SUMMARY"];
     if (summaryFile) appendFileSync(summaryFile, ["", "```", text, "```", ""].join("\n"));
     process.stdout.write(`${text}\n`);
@@ -388,37 +408,39 @@ async function runVersionFix(o: CliOptions): Promise<number> {
 async function runPlan(o: CliOptions): Promise<number> {
   const tok = token();
   const log = (l: string): void => void process.stderr.write(`${l}\n`);
-  const data = await collect({ owner: o.owner, token: tok, publicOnly: o.publicOnly, log });
+  const accounts = accountsOf(o, tok);
+  const data = await collect({ owner: o.owner, token: tok, accounts, publicOnly: o.publicOnly, log });
   let graph = buildGraph({ owner: o.owner, repos: data.repos, npm: data.npm, warnings: data.warnings });
   if (o.publicOnly) graph = publicView(graph);
   const p = plan(graph);
-  const progress = o.progress ? await addProgress(p, { owner: o.owner, token: tok }) : {};
-  const sync = o.sync ? await planSync(p, tok, o.workflows, log) : null;
-  const full = { ...p, progress, ...(sync ? { sync } : {}) };
+  const progress = o.progress ? await addProgress(p, { owner: o.owner, token: tok, accounts }) : {};
+  const sync = o.sync ? await planSync(p, accounts, o.workflows, log) : null;
+  const noRead = data.noRead ?? [];
+  const full = { ...p, progress, ...(sync ? { sync } : {}), ...(noRead.length > 0 ? { noRead } : {}) };
   if (o.out) writeFileSync(o.out, `${JSON.stringify(full, null, 2)}\n`);
   if (o.writeDb) writeDb(o.writeDb, p, progress);
-  const text = `${summary(p, progress)}${sync ? `\n${syncSummary(sync)}` : ""}`;
+  const text = `${summary(p, progress)}${noRead.length > 0 ? `\n${noReadLine(noRead)}` : ""}${sync ? `\n${syncSummary(sync)}` : ""}`;
   process.stdout.write(o.json ? `${JSON.stringify(full, null, 2)}\n` : `${text}\n`);
   return 0;
 }
 
 /** This function gives the template sync of each repository of a plan, with no change: the dry run of the sync. */
-async function planSync(p: Plan, tok: string | null, workflows: WorkflowsMode, log: (l: string) => void): Promise<SyncPlanItem[] | null> {
-  const gh = gitHub({ token: tok });
+async function planSync(p: Plan, accounts: Accounts, workflows: WorkflowsMode, log: (l: string) => void): Promise<SyncPlanItem[] | null> {
+  const gh = accountsGitHub(accounts).gh;
   const facts = await syncFacts({ gh, owner: p.owner });
   if (!facts) {
     log("Template sync: the template is not readable.");
     return null;
   }
   const pending = pendingVersions(p);
-  const read = await pool(p.repos, 6, async (r) => ({ repo: r.name, files: await apiFiles(gh, p.owner, r.name) }));
+  const read = await pool(p.repos, 6, async (r) => ({ repo: r.name, files: await apiFiles(gh, r.account ?? p.owner, r.name) }));
   const filesOf = new Map(read.map((x) => [x.repo, x.files]));
   const runFacts = { ...facts, renovateDay: await renovateDays(read, facts) };
   const items = await pool(p.repos, 6, async (r): Promise<SyncPlanItem | null> => {
     const files = filesOf.get(r.name) ?? null;
     if (!files) return null;
     const releaseInFlight = pending.has(r.name) || (r.pendingChangesets ?? 0) > 0;
-    const result = await syncRepo(files, { ...runFacts, repo: r.name, releaseInFlight }, SYNC_RULES, workflows !== "no");
+    const result = await syncRepo(files, { ...runFacts, repo: r.name, account: r.account, releaseInFlight }, SYNC_RULES, workflows !== "no");
     return { repo: r.name, private: r.private, result };
   });
   return items.filter((i): i is SyncPlanItem => i !== null);
@@ -479,6 +501,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
   // The end of a run that the guard stopped. The `try` block sets it after the gate.
   let guardStop: ((stop: RateStop) => Promise<number>) | null = null;
   try {
+    const accounts = accountsOf(o, tok);
     const read = o.state === undefined ? null : readState(o.state);
     if (read?.note) log(read.note);
     // The meter counts each GitHub request of the run by its route. Each part of the run that takes a fetch gets its fetch.
@@ -527,7 +550,8 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       ...(deps.now ? { now: deps.now } : {}),
       ...(deps.sleep ? { sleep: deps.sleep } : {}),
     });
-    const gh = gitHub({ token: tok, fetch: guard.fetch });
+    // One client for each account with a token: each request takes the token of the account in its path.
+    const gh = accountsGitHub(accounts, { fetch: guard.fetch }).gh;
     // The reads of the rate limit at the start and at the end give the GitHub requests of the run. A failed read is no read.
     const rateStart = gate.read;
     const rateReport = async (): Promise<NonNullable<ApplyReport["rateLimit"]>> => ({
@@ -550,6 +574,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     const data = await collect({
       owner: o.owner,
       token: tok,
+      accounts,
       fetch: guard.fetch,
       log,
       onRepos: (repos) => hide(repos.filter((r) => r.private).map((r) => r.name)),
@@ -565,7 +590,8 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     const starts = read ? needStarts(data.npm, read.state.seen, (o.now ?? new Date()).toISOString(), (k) => hashName(k, key)) : null;
     // The sync need of each listed repository stays in the state, also in a run with no sync or with --only.
     starts?.keepSync(data.repos.map((r) => r.name));
-    const updater = gitUpdater({ owner: o.owner, token: tok, author: parseAuthor(o.author), fetch: guard.fetch });
+    const accountOf = accountOfRepos(o.owner, data.repos);
+    const updater = gitUpdater({ owner: o.owner, token: tok, accounts, accountOf, author: parseAuthor(o.author), fetch: guard.fetch });
     const facts = o.sync ? await syncFacts({ gh, owner: o.owner, fetch: guard.fetch }) : null;
     const urgentList = urgent !== undefined ? urgent : await urgentNames(o, gh, log);
     const planned = guard.stopped();
@@ -579,7 +605,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       updater,
       sync: o.sync ? { updater, facts, workflows: o.workflows, ...(starts ? { starts: starts.sync } : {}) } : null,
       ...paceOptions({ ...o, urgent: urgentList }),
-      runnersBusy: busyRunners(gh, o.owner, data.repos.map((r) => r.name)),
+      runnersBusy: busyRunners(gh, accountOf, data.repos.map((r) => r.name)),
       dryRun: o.dryRun,
       only: o.only,
       releaseDispatch: o.releaseDispatch,
@@ -590,6 +616,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       ...(starts ? { needSince: (u) => starts.since(u.repo, u.items) } : {}),
     });
     report.rateLimit = await rateReport();
+    if ((data.noRead ?? []).length > 0) report.noRead = data.noRead ?? [];
     // A stop of the guard during the writes keeps the report: each write before the stop is in it.
     const applied = guard.stopped();
     if (applied && inActions) process.stdout.write(`::notice::${applied.message}\n`);
@@ -660,16 +687,21 @@ function runHolds(o: CliOptions): number {
 async function readLag(o: CliOptions): Promise<LagReport> {
   const tok = token();
   const log = (l: string): void => void process.stderr.write(`${l}\n`);
-  const data = await collect({ owner: o.owner, token: tok, publicOnly: o.publicOnly, log });
+  const accounts = accountsOf(o, tok);
+  const data = await collect({ owner: o.owner, token: tok, accounts, publicOnly: o.publicOnly, log });
   const graph = buildGraph({ owner: o.owner, repos: data.repos, npm: data.npm, warnings: data.warnings });
-  return lagReport({
+  const noRead = data.noRead ?? [];
+  const report = await lagReport({
     owner: o.owner,
-    gh: gitHub({ token: tok }),
+    gh: accountsGitHub(accounts).gh,
+    accountOf: accountOfRepos(o.owner, data.repos),
+    accounts: [accounts.home, ...accounts.others.filter((a) => !noRead.includes(a))],
     packages: graph.packages,
     branches: new Map(data.repos.map((r) => [r.name, r.defaultBranch])),
     publicOnly: o.publicOnly,
     log,
   });
+  return noRead.length > 0 ? { ...report, noRead } : report;
 }
 
 async function runTags(o: CliOptions): Promise<number> {
@@ -679,9 +711,11 @@ async function runTags(o: CliOptions): Promise<number> {
   const redact = (text: string): string => (o.showPrivate ? text : redactNames(text, secrets, key));
   const log = (l: string): void => void process.stderr.write(`${redact(l)}\n`);
   try {
+    const tok = token();
     const data = await collect({
       owner: o.owner,
-      token: token(),
+      token: tok,
+      accounts: accountsOf(o, tok),
       publicOnly: o.publicOnly,
       log,
       onRepos: (repos) => {

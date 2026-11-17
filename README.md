@@ -16,6 +16,18 @@ A package is a `package.json` with a name and without `"private": true`. An edge
 
 The prefix of `GH_TOKEN` gives the list of the repositories. An installation token (`ghs_`) reads the list of its installation. The token of the owner reads each repository of the owner. Another token reads the public repositories. A failed read of the list stops the command, because a different list is not a correct answer.
 
+### Several accounts
+
+The home account (`--owner`) has the template, the npm scope and the GitHub App of the train. Each other account (`--also-owner <account>`, one or more times) has only repositories.
+
+- `GH_TOKEN` is the token of the home account. `GH_TOKENS` is a JSON object with the token of each other account, for example `{"other-org": "ghs_..."}`.
+- Each request to GitHub gets the token of the account in its path. A clone and a push of a repository get only the token of its account.
+- The name of a repository is its key in the plan, the state and the reports. A name in two accounts stops the command with an error.
+- The pins of the template, the shared workflows and the scope of the packages stay in the home account.
+- The train does not read an account with no token. The log, the report and the summary show "No read" for it, not a pass. The other accounts continue.
+- A public read (`--public-only`) needs no token of the other account, so it uses the home token.
+- `train.yml` gives the other account in `ALSO_OWNER`. A second step makes a token of the App for that account. When the App has no installation there, that step fails, and the summary shows "No read".
+
 ## The actions of the plan
 
 | Action | When |

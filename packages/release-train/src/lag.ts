@@ -1,3 +1,4 @@
+import { accountOfPath, type AccountOf } from "./accounts.ts";
 import { pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { BLOCKED_LABEL, TRAIN_BRANCH, latestRuns } from "./apply.ts";
@@ -90,12 +91,20 @@ export interface LagReport {
   idleHolds?: LagHold[];
   /** The holds that stop an update in one repository. A held update has no row, so these holds do not change the gate. */
   repoHolds?: LagHold[];
+  /** The accounts that the run did not read, because they have no token. Their packages are not in the rows. */
+  noRead?: string[];
 }
 
 /** The input of `lagReport`. */
 export interface LagInput {
+  /** The home account. */
   owner: string;
+  /** The client of the reads. A client of several accounts gives each read the token of its account. */
   gh: GitHub;
+  /** This function gives the account of each repository. The default is `owner` for each repository. */
+  accountOf?: AccountOf;
+  /** The accounts whose pull requests the report searches. The default is `owner` only. */
+  accounts?: readonly string[];
   packages: readonly PackageNode[];
   /** The default branch of each repository. */
   branches: ReadonlyMap<string, string>;
@@ -231,7 +240,7 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
   const headers = { "user-agent": "release-train" };
   const log = i.log ?? (() => {});
   const encoded = (name: string): string => name.replaceAll("/", "%2f");
-  const slug = (repo: string): string => `/repos/${i.owner}/${repo}`;
+  const slug = (repo: string): string => `/repos/${(i.accountOf ?? (() => i.owner))(repo)}/${repo}`;
 
   const ids = new Map<string, Promise<string | null>>();
   const repositoryId = (repo: string): Promise<string | null> => {
@@ -448,25 +457,28 @@ const FAILED: ReadonlySet<string> = new Set(["failure", "timed_out", "startup_fa
  */
 async function redRows(i: LagInput, now: number, log: (line: string) => void): Promise<RedRow[]> {
   const out: RedRow[] = [];
-  for (const branch of [TRAIN_BRANCH, SYNC_BRANCH]) {
-    const q = `user:${i.owner} is:pr is:open head:${branch}${i.publicOnly ? " is:public" : ""}`;
+  // One search for each account and branch: the search of an account takes the token of that account.
+  const searches = (i.accounts ?? [i.owner]).flatMap((account) => [TRAIN_BRANCH, SYNC_BRANCH].map((branch) => ({ account, branch })));
+  for (const { account: searched, branch } of searches) {
+    const q = `user:${searched} is:pr is:open head:${branch}${i.publicOnly ? " is:public" : ""}`;
     const found = await i.gh.request<SearchAnswer>("GET", `/search/issues?per_page=100&q=${encodeURIComponent(q)}`);
     if (found.data === null) {
-      log(`GitHub did not search the pull requests of ${branch}: ${found.message ?? found.status}`);
+      log(`GitHub did not search the pull requests of ${branch} in ${searched}: ${found.message ?? found.status}`);
       continue;
     }
     const items = found.data.items ?? [];
     const rows = await pool(items, i.concurrency ?? 6, async (item): Promise<RedRow | null> => {
       const repo = item.repository_url.split("/").pop() ?? "";
-      const pull = await i.gh.request<{ head?: { sha?: string } }>("GET", `/repos/${i.owner}/${repo}/pulls/${item.number}`);
+      const account = accountOfPath(item.repository_url) ?? searched;
+      const pull = await i.gh.request<{ head?: { sha?: string } }>("GET", `/repos/${account}/${repo}/pulls/${item.number}`);
       const sha = pull.data?.head?.sha;
       if (sha === undefined) return null;
-      const checks = await i.gh.request<CheckAnswer>("GET", `/repos/${i.owner}/${repo}/commits/${sha}/check-runs?per_page=100`);
-      const workflows = await i.gh.request<WorkflowAnswer>("GET", `/repos/${i.owner}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
+      const checks = await i.gh.request<CheckAnswer>("GET", `/repos/${account}/${repo}/commits/${sha}/check-runs?per_page=100`);
+      const workflows = await i.gh.request<WorkflowAnswer>("GET", `/repos/${account}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
       const latest = latestRuns(checks.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []);
       const failed = latest.filter((c) => c.conclusion !== null && FAILED.has(c.conclusion));
       if (failed.length === 0) return null;
-      const events = await i.gh.request<EventAnswer[]>("GET", `/repos/${i.owner}/${repo}/issues/${item.number}/events?per_page=100`);
+      const events = await i.gh.request<EventAnswer[]>("GET", `/repos/${account}/${repo}/issues/${item.number}/events?per_page=100`);
       const blocks = (events.data ?? []).filter((e) => e.event === "labeled" && e.label?.name === BLOCKED_LABEL).map((e) => e.created_at);
       const times = [...blocks, ...failed.map((c) => c.completed_at)].filter((t): t is string => typeof t === "string").sort();
       const since = times[0] ?? new Date(now).toISOString();
@@ -526,6 +538,7 @@ export function lagSummary(r: LagReport): string {
   const lines = [
     `# Release lag of ${r.owner} at ${r.generatedAt}`,
     "",
+    ...(r.noRead !== undefined && r.noRead.length > 0 ? [`No read: the run has no token for the accounts ${r.noRead.join(", ")}, so their packages are not in this report.`, ""] : []),
     gateLine(r),
     "",
     `${r.packages} published packages: ${over.length} over the limit of ${days(LAG_LIMIT_MS)} days, ${held.length} held over it, ${watch.length} under it, ${r.unread.length} not read. ${r.red.filter((x) => x.over).length} of ${r.red.length} red train pull requests are over ${days(RED_LIMIT_MS)} day.`,

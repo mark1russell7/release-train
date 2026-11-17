@@ -1,3 +1,4 @@
+import { accountOfPath, repositoryIdOf, type Accounts } from "./accounts.ts";
 import { nextLink } from "./collect.ts";
 import type { FetchFn, PageRead } from "./collect.ts";
 import type { GateRecord, GuardRecord } from "./budget.ts";
@@ -23,7 +24,8 @@ export interface GhResponse<T> {
 /** A small client for the REST API and the GraphQL API of GitHub. */
 export interface GitHub {
   request<T>(method: string, path: string, body?: unknown): Promise<GhResponse<T>>;
-  graphql<T>(query: string, variables: Record<string, unknown>): Promise<{ data: T | null; errors: string[] }>;
+  /** The account is the account of the target. A client of one token does not read it. A client of several accounts takes its token. */
+  graphql<T>(query: string, variables: Record<string, unknown>, account?: string): Promise<{ data: T | null; errors: string[] }>;
   /** This function reads a text response, for example the log of a job. A client with no text read does not have it. */
   text?(path: string): Promise<GhResponse<string>>;
 }
@@ -76,6 +78,63 @@ export function gitHub(opts: { token: string | null; fetch?: FetchFn; apiBase?: 
         .concat(!res.ok && doc.message ? [doc.message] : []);
       return { data: doc.data ?? null, errors };
     },
+  };
+}
+
+/**
+ * This function makes one client for the accounts of a run. Each request goes to the client of the account of its path
+ * (`accountOfPath`). A path with no account, or with an account that has no client, goes to the client of the home account.
+ * When an answer links its next page as `/repositories/{id}/...`, the client keeps the account of the id for that page.
+ *
+ * @param o.home - The home account. Its client must be in `clients`.
+ * @param o.clients - The client of each account, by name. A name in a different case is the same account.
+ * @param o.ids - The account of each known repository id. The client adds each id that it learns.
+ */
+export function routedGitHub(o: { home: string; clients: ReadonlyMap<string, GitHub>; ids?: Map<number, string>; apiBase?: string }): GitHub {
+  const ids = o.ids ?? new Map<number, string>();
+  const byName = new Map([...o.clients].map(([a, c]) => [a.toLowerCase(), { account: a, client: c }]));
+  const home = byName.get(o.home.toLowerCase());
+  if (home === undefined) throw new Error(`The home account ${o.home} has no client.`);
+  const pick = (account: string | null | undefined): { account: string; client: GitHub } => (account ? byName.get(account.toLowerCase()) : undefined) ?? home;
+  const ofPath = (path: string): { account: string; client: GitHub } => pick(accountOfPath(path, ids, o.apiBase));
+  return {
+    async request<T>(method: string, path: string, body?: unknown): Promise<GhResponse<T>> {
+      const to = ofPath(path);
+      const res = await to.client.request<T>(method, path, body);
+      const id = repositoryIdOf(res.next);
+      if (id !== null) ids.set(id, to.account);
+      return res;
+    },
+    async text(path: string): Promise<GhResponse<string>> {
+      const { client } = ofPath(path);
+      if (client.text === undefined) return { status: 0, ok: false, data: null, message: "The client has no text read." };
+      return client.text(path);
+    },
+    graphql<T>(query: string, variables: Record<string, unknown>, account?: string): Promise<{ data: T | null; errors: string[] }> {
+      return pick(account).client.graphql<T>(query, variables);
+    },
+  };
+}
+
+/**
+ * This function makes the clients of the accounts of a run. Each account with a token has its own client, and the home
+ * account has a client also with no token.
+ *
+ * - `gh` is one client for each read of the run (`routedGitHub`).
+ * - `of` gives the own client of an account, for the reads with no account in the path. An account with no client gets
+ *   the client of the home account.
+ */
+export function accountsGitHub(accounts: Accounts, opts: { fetch?: FetchFn; apiBase?: string } = {}): { gh: GitHub; of(account: string): GitHub } {
+  const clients = new Map<string, GitHub>([[accounts.home, gitHub({ token: accounts.token(accounts.home), ...opts })]]);
+  for (const account of accounts.others) {
+    const token = accounts.token(account);
+    if (token !== null) clients.set(account, gitHub({ token, ...opts }));
+  }
+  const home = clients.get(accounts.home) as GitHub;
+  const byName = new Map([...clients].map(([a, c]) => [a.toLowerCase(), c]));
+  return {
+    gh: clients.size === 1 ? home : routedGitHub({ home: accounts.home, clients, ...(opts.apiBase !== undefined ? { apiBase: opts.apiBase } : {}) }),
+    of: (account) => byName.get(account.toLowerCase()) ?? home,
   };
 }
 

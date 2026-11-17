@@ -1,5 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import semver from "semver";
+import { accountFn, accountOfRepos, type AccountOf } from "./accounts.ts";
 import { candidateReader } from "./candidate-facts.ts";
 import type { CandidateTarget } from "./candidate-facts.ts";
 import { CANDIDATE_POLICY, bodyAttempt, bodyItems, candidateItems, decide, decideWith, markLines, modeFor, nextAttempt } from "./candidate-policy.ts";
@@ -394,12 +395,22 @@ export interface RepoResult {
   mergedBehind?: number | null;
 }
 
+/** This function gives the line of the accounts with no read. A run with no token for an account does not pass for it. */
+export function noReadLine(accounts: readonly string[]): string {
+  return `No read: the run has no token for the accounts ${accounts.join(", ")}, so it did not read or change their repositories.`;
+}
+
 /** The result of one run of the train. */
 export interface ApplyReport {
   owner: string;
   at: string;
   dryRun: boolean;
   results: RepoResult[];
+  /**
+   * The accounts that the run did not read, because they have no token. Their repositories are not in the results. The
+   * names are of accounts, not of repositories, so the report stays public. The command `apply` adds them.
+   */
+  noRead?: string[];
   /** The public packages whose version on main is not on npm yet. The release workflow of each repository publishes them. */
   inFlight?: { name: string; version: string }[];
   /** The count of the names of `urgent` that change no ready update. The report has only the count, so it stays public. */
@@ -538,8 +549,11 @@ export interface ApplyOptions {
    * later run. Absent: no limit.
    */
   maxPushes?: number;
-  /** This function gives the number of jobs that run at this time on the runners of the account, or null when it is not known. */
-  runnersBusy?: () => Promise<number | null>;
+  /**
+   * This function gives the number of jobs that run at this time on the runners of the account of a repository. It gives
+   * null when the number is not known.
+   */
+  runnersBusy?: (repo?: string) => Promise<number | null>;
   /** A sync push waits while `runnersBusy` gives this number of jobs or more. The default is `BUSY_LIMIT`. An update push does not wait. */
   busyLimit?: number;
   /**
@@ -657,28 +671,36 @@ export function inheritedWait(own: number, start: readonly string[], dependentsO
 }
 
 /**
- * This function gives a counter of the jobs that run on the runners of the account. It counts the jobs `in_progress` of
- * each run `in_progress` of the repositories. It keeps a count for `ttlMs`, and gives null for a list that it cannot read.
+ * This function gives a counter of the jobs that run on the runners of an account. It counts the jobs `in_progress` of
+ * each run `in_progress` of the repositories of the account. It keeps a count for `ttlMs`, and gives null for a list
+ * that it cannot read. Each account has its own runners, so the counter of a repository counts only its account. With no
+ * repository, it counts the account of the first repository.
+ *
+ * @param owner - The account of each repository, or one account for each.
  */
-export function busyRunners(gh: GitHub, owner: string, repos: readonly string[], ttlMs = 60_000, now: () => number = Date.now): () => Promise<number | null> {
-  let cached: { at: number; value: number | null } | null = null;
-  const count = async (): Promise<number | null> => {
+export function busyRunners(gh: GitHub, owner: string | AccountOf, repos: readonly string[], ttlMs = 60_000, now: () => number = Date.now): (repo?: string) => Promise<number | null> {
+  const accountOf = accountFn(owner);
+  const cached = new Map<string, { at: number; value: number | null }>();
+  const count = async (account: string): Promise<number | null> => {
     let jobs = 0;
-    for (const repo of repos) {
-      const runs = await gh.request<{ workflow_runs: { id: number }[] }>("GET", `/repos/${owner}/${repo}/actions/runs?status=in_progress&per_page=100`);
+    for (const repo of repos.filter((r) => accountOf(r) === account)) {
+      const runs = await gh.request<{ workflow_runs: { id: number }[] }>("GET", `/repos/${account}/${repo}/actions/runs?status=in_progress&per_page=100`);
       if (!runs.data) return null;
       for (const run of runs.data.workflow_runs) {
-        const list = await gh.request<{ jobs: { status: string }[] }>("GET", `/repos/${owner}/${repo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`);
+        const list = await gh.request<{ jobs: { status: string }[] }>("GET", `/repos/${account}/${repo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`);
         if (!list.data) return null;
         jobs += list.data.jobs.filter((j) => j.status === "in_progress").length;
       }
     }
     return jobs;
   };
-  return async () => {
-    if (cached && now() - cached.at < ttlMs) return cached.value;
-    cached = { at: now(), value: await count() };
-    return cached.value;
+  return async (repo) => {
+    const account = accountOf(repo ?? repos[0] ?? "");
+    const known = cached.get(account);
+    if (known && now() - known.at < ttlMs) return known.value;
+    const fresh = { at: now(), value: await count(account) };
+    cached.set(account, fresh);
+    return fresh.value;
   };
 }
 
@@ -1000,6 +1022,7 @@ export function publicReport(r: ApplyReport, key = ""): ApplyReport {
 /** This function gives a text summary of a report: the pull requests by wave and the state of each repository. */
 export function applySummary(r: ApplyReport): string {
   const lines = [`Release train apply for ${r.owner} at ${r.at}${r.dryRun ? " (dry run)" : ""}`];
+  if (r.noRead !== undefined && r.noRead.length > 0) lines.push(noReadLine(r.noRead));
   const prStates = new Set<RepoState>(["planned", "opened", "updated", "unchanged", "merged", "blocked"]);
   const isPr = (x: RepoResult): boolean => prStates.has(x.state) && x.kind !== SYNC_KIND && x.kind !== MERGE_KIND;
   const waves = [...new Set(r.results.filter(isPr).map((x) => x.wave ?? 0))].sort((a, b) => a - b);
@@ -1134,10 +1157,13 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   const label = o.label ?? ((repo: string, priv: boolean) => (priv ? hashName(repo) : repo));
   const gh = o.gh;
   const owner = o.owner;
-  const base = `/repos/${owner}`;
+  // Each repository of the plan has its account. The paths, the branch heads and the searches of a repository use it.
+  const accountOf = accountOfRepos(owner, o.plan.repos);
+  const accounts = [owner, ...new Set(o.plan.repos.map((r) => r.account ?? owner).filter((a) => a !== owner))];
+  const at = (repo: string): string => `/repos/${accountOf(repo)}/${repo}`;
   /** This function tells if the last run of the release workflow did not fail: a failed run does not publish again by itself. */
   const lastReleaseFlies = async (repo: string): Promise<boolean> => {
-    const last = (await gh.request<{ workflow_runs: { status: string; conclusion: string | null }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?per_page=1`)).data?.workflow_runs?.[0];
+    const last = (await gh.request<{ workflow_runs: { status: string; conclusion: string | null }[] }>("GET", `${at(repo)}/actions/workflows/release.yml/runs?per_page=1`)).data?.workflow_runs?.[0];
     return !last || last.status !== "completed" || last.conclusion === "success";
   };
   // A version that starts by hand is not in flight, so a range can still go into it. An error of a read holds the item for one run.
@@ -1145,7 +1171,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   for (const repo of pendingVersions(o.plan, o.only ?? null).keys()) {
     if (!o.plan.actions.some((a) => a.kind === "adopt-breaking" && a.repo === repo)) continue;
     try {
-      const wf = await gh.request<{ content?: string }>("GET", `${base}/${repo}/contents/.github/workflows/release.yml`);
+      const wf = await gh.request<{ content?: string }>("GET", `${at(repo)}/contents/.github/workflows/release.yml`);
       const text = wf.data?.content ? Buffer.from(wf.data.content, "base64").toString("utf8") : "";
       if (text && !dispatchOnly(text) && (await lastReleaseFlies(repo))) flying.add(repo);
     } catch (e) {
@@ -1169,7 +1195,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   const openOf = async (branch: string): Promise<Map<string, Pull>> => {
     const found = new Map<string, Pull>();
     await pool(scan, o.concurrency ?? 6, async (repo) => {
-      const res = await gh.request<Pull[]>("GET", `${base}/${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(branch)}&per_page=10`);
+      const res = await gh.request<Pull[]>("GET", `${at(repo)}/pulls?state=open&head=${accountOf(repo)}:${encodeURIComponent(branch)}&per_page=10`);
       const pr = (res.data ?? []).find((p) => p.head.ref === branch);
       if (pr) found.set(repo, pr);
     });
@@ -1185,7 +1211,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     // Only the mode one-candidate reads the retry label, so only that mode makes it.
     if (modeOf(repo, privateOf.get(repo) ?? true) === "one-candidate") labels.push([policy.retryLabel, "fbca04", "Add this label for one new build of a red pull request of the release train."]);
     for (const [name, color, description] of labels) {
-      await gh.request("POST", `${base}/${repo}/labels`, { name, color, description });
+      await gh.request("POST", `${at(repo)}/labels`, { name, color, description });
     }
   };
 
@@ -1194,9 +1220,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
    * head, also when the default branch moved after the run. Two lockfile changes then merge with no conflict into a lockfile
    * that does not agree with `package.json`. So only `settle` merges, after it compares the branch with the default branch.
    */
-  const disableAutoMerge = async (pr: Pull): Promise<"train"> => {
+  const disableAutoMerge = async (pr: Pull, repo: string): Promise<"train"> => {
     if (pr.auto_merge) {
-      await gh.graphql("mutation($id: ID!) { disablePullRequestAutoMerge(input: { pullRequestId: $id }) { clientMutationId } }", { id: pr.node_id });
+      await gh.graphql("mutation($id: ID!) { disablePullRequestAutoMerge(input: { pullRequestId: $id }) { clientMutationId } }", { id: pr.node_id }, accountOf(repo));
     }
     return "train";
   };
@@ -1206,7 +1232,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
    * answer. A branch that is behind has CI on an old base. A merge then can give a lockfile with no entry for a version.
    */
   const compareOf = async (repo: string, sha: string, defaultBranch: string): Promise<{ behind: number; workflows: boolean } | null> => {
-    const res = await gh.request<{ behind_by: number; files?: { filename: string }[] }>("GET", `${base}/${repo}/compare/${encodeURIComponent(defaultBranch)}...${sha}`);
+    const res = await gh.request<{ behind_by: number; files?: { filename: string }[] }>("GET", `${at(repo)}/compare/${encodeURIComponent(defaultBranch)}...${sha}`);
     if (typeof res.data?.behind_by !== "number") return null;
     const files = res.data.files ?? [];
     // GitHub gives at most COMPARE_FILES_MAX files. A longer list can hide a workflow file, so it counts as one.
@@ -1219,7 +1245,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
    * progress). It gives null when GitHub does not answer. A repository without a release workflow has none.
    */
   const releaseRunsOpen = async (repo: string, defaultBranch: string): Promise<number | null> => {
-    const res = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(defaultBranch)}&per_page=10`);
+    const res = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${at(repo)}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(defaultBranch)}&per_page=10`);
     if (res.status === 404) return 0;
     if (!res.ok || !res.data) return null;
     return (res.data.workflow_runs ?? []).filter((r) => r.status !== "completed").length;
@@ -1227,9 +1253,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
 
   /** The CI state of a commit, and its release check, from one read of its check runs. */
   const checksOf = async (repo: string, sha: string): Promise<{ ci: CiState; release: ReleaseCheck }> => {
-    const runs = await gh.request<{ check_runs: CheckRun[] }>("GET", `${base}/${repo}/commits/${sha}/check-runs?per_page=100`);
-    const status = await gh.request<{ state: string; total_count: number }>("GET", `${base}/${repo}/commits/${sha}/status`);
-    const workflows = await gh.request<{ workflow_runs: WorkflowRun[] }>("GET", `${base}/${repo}/actions/runs?head_sha=${sha}&per_page=100`);
+    const runs = await gh.request<{ check_runs: CheckRun[] }>("GET", `${at(repo)}/commits/${sha}/check-runs?per_page=100`);
+    const status = await gh.request<{ state: string; total_count: number }>("GET", `${at(repo)}/commits/${sha}/status`);
+    const workflows = await gh.request<{ workflow_runs: WorkflowRun[] }>("GET", `${at(repo)}/actions/runs?head_sha=${sha}&per_page=100`);
     const latest = latestRuns(runs.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []);
     return { ci: ciState(latest, status.data), release: releaseCheckOf(latest) };
   };
@@ -1242,7 +1268,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   const publishesOf = new Map<string, boolean | null>();
   const publishes = async (repo: string): Promise<boolean | null> => {
     if (!publishesOf.has(repo)) {
-      const res = await gh.request("GET", `${base}/${repo}/contents/.github/workflows/release.yml`);
+      const res = await gh.request("GET", `${at(repo)}/contents/.github/workflows/release.yml`);
       publishesOf.set(repo, res.ok ? true : res.status === 404 ? false : null);
     }
     return publishesOf.get(repo) ?? null;
@@ -1271,7 +1297,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   const otherRuns = async (repo: string, branch: string, meta: RepoMeta | null): Promise<number> => {
     let count = 0;
     for (const status of ["in_progress", "queued"]) {
-      const res = await gh.request<{ workflow_runs: { head_branch: string | null }[] }>("GET", `${base}/${repo}/actions/runs?status=${status}&per_page=100`);
+      const res = await gh.request<{ workflow_runs: { head_branch: string | null }[] }>("GET", `${at(repo)}/actions/runs?status=${status}&per_page=100`);
       for (const run of res.data?.workflow_runs ?? []) {
         if (run.head_branch !== branch && run.head_branch !== (meta?.default_branch ?? "main")) count++;
       }
@@ -1292,16 +1318,16 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   const catchUp = async (repo: string, pr: Pull, main: string): Promise<{ note: string; pushed: boolean }> => {
     const no = (note: string) => ({ note, pushed: false });
     if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX)) return no("");
-    if (pr.head.repo === null || (pr.head.repo !== undefined && pr.head.repo.full_name !== `${owner}/${repo}`)) return no("");
+    if (pr.head.repo === null || (pr.head.repo !== undefined && pr.head.repo.full_name !== `${accountOf(repo)}/${repo}`)) return no("");
     const conflict = ` The branch has a conflict with ${main}: its author must merge ${main} into it.`;
-    const full = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${pr.number}`)).data;
+    const full = (await gh.request<Pull>("GET", `${at(repo)}/pulls/${pr.number}`)).data;
     if (full?.mergeable === false || full?.mergeable_state === "dirty") return no(conflict);
     // The merge starts CI as a push does, so it counts in the limit of pushes of the run.
     const done = caught.get(`${repo}#${pr.number}`);
     if (done !== undefined) return no(done);
     const wait = limitWait();
     if (wait !== null) return no(` The merge of ${main} into the branch waits: ${wait}`);
-    const r = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/update-branch`, { expected_head_sha: pr.head.sha });
+    const r = await gh.request("PUT", `${at(repo)}/pulls/${pr.number}/update-branch`, { expected_head_sha: pr.head.sha });
     if (r.ok) {
       pushes += 1;
       return { note: ` The train merged ${main} into the branch, so CI runs again.`, pushed: true };
@@ -1324,7 +1350,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   ): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number; caughtUp?: boolean; held?: HeldCause; mergedBehind?: number }> => {
     const { ci, release } = await checksOf(repo, pr.head.sha);
     if (ci === "failed") {
-      if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
+      if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${at(repo)}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
       return { state: "blocked", ci, detail: "CI failed. The pull request stays open with the blocked label." };
     }
     if (ci === "green") {
@@ -1357,9 +1383,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       }
       const hold = await releaseHold(repo, pr.head.sha, release);
       if (hold !== null) return { state: "unchanged", ci, held: "release-check", detail: hold };
-      const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
+      const m = await gh.request("PUT", `${at(repo)}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
-        if (deleteBranch) await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);
+        if (deleteBranch) await gh.request("DELETE", `${at(repo)}/git/refs/heads/${branch}`);
         return { state: "merged", ci, detail: "CI was green. The train merged the pull request.", mergedBehind: cmp.behind };
       }
       return { state: "unchanged", ci, detail: `CI is green, but the merge failed (HTTP ${m.status}${m.message ? `: ${m.message}` : ""}).` };
@@ -1373,14 +1399,14 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
 
   /** This function closes a pull request of the train with a comment, marks it as closed by the train and deletes the branch. */
   const closeTrainPr = async (repo: string, pr: Pull, why: string, branch: string = TRAIN_BRANCH): Promise<void> => {
-    await gh.request("POST", `${base}/${repo}/issues/${pr.number}/comments`, { body: `The release train closes this pull request: ${why}.\n\n${CLAUDE_LINE}` });
-    await gh.request("PATCH", `${base}/${repo}/pulls/${pr.number}`, { state: "closed", body: `${pr.body ?? ""}\n${CLOSED_MARK}` });
-    await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${branch}`);
+    await gh.request("POST", `${at(repo)}/issues/${pr.number}/comments`, { body: `The release train closes this pull request: ${why}.\n\n${CLAUDE_LINE}` });
+    await gh.request("PATCH", `${at(repo)}/pulls/${pr.number}`, { state: "closed", body: `${pr.body ?? ""}\n${CLOSED_MARK}` });
+    await gh.request("DELETE", `${at(repo)}/git/refs/heads/${branch}`);
   };
 
   /** This function finds a pull request of a branch that a person closed with the same changes. The train does not open it again. */
   const declinedPr = async (repo: string, branch: string, fp: string): Promise<Pull | undefined> => {
-    const closed = await gh.request<Pull[]>("GET", `${base}/${repo}/pulls?state=closed&head=${owner}:${encodeURIComponent(branch)}&per_page=20`);
+    const closed = await gh.request<Pull[]>("GET", `${at(repo)}/pulls?state=closed&head=${accountOf(repo)}:${encodeURIComponent(branch)}&per_page=20`);
     return (closed.data ?? []).find((p) => !p.merged_at && !(p.body ?? "").includes(CLOSED_MARK) && bodyFingerprint(p.body) === fp);
   };
 
@@ -1391,7 +1417,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
    */
   const needsRebuild = async (repo: string, existing: Pull | null, defaultBranch: string): Promise<boolean> => {
     if (!existing) return false;
-    const full = await gh.request<Pull>("GET", `${base}/${repo}/pulls/${existing.number}`);
+    const full = await gh.request<Pull>("GET", `${at(repo)}/pulls/${existing.number}`);
     if (full.data?.mergeable === false) return true;
     return ((await behindBy(repo, existing.head.sha, defaultBranch)) ?? 0) > 0;
   };
@@ -1430,30 +1456,30 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       pr = existing;
       state = p.pushed ? "updated" : "unchanged";
       if (p.pushed || existing.body !== p.body || existing.title !== p.title) {
-        const upd = await gh.request<Pull>("PATCH", `${base}/${repo}/pulls/${existing.number}`, { title: p.title, body: p.body });
+        const upd = await gh.request<Pull>("PATCH", `${at(repo)}/pulls/${existing.number}`, { title: p.title, body: p.body });
         if (upd.data) pr = { ...upd.data, labels: existing.labels ?? [] };
       }
       if (p.pushed) {
         pr = { ...pr, head: { ...pr.head, sha: p.sha ?? pr.head.sha } };
         if (hasLabel(existing, BLOCKED_LABEL)) {
-          await gh.request("DELETE", `${base}/${repo}/issues/${existing.number}/labels/${encodeURIComponent(BLOCKED_LABEL)}`);
+          await gh.request("DELETE", `${at(repo)}/issues/${existing.number}/labels/${encodeURIComponent(BLOCKED_LABEL)}`);
           pr = { ...pr, labels: (pr.labels ?? []).filter((l) => l.name !== BLOCKED_LABEL) };
         }
         if (p.removeLabel && hasLabel(existing, p.removeLabel)) {
-          await gh.request("DELETE", `${base}/${repo}/issues/${existing.number}/labels/${encodeURIComponent(p.removeLabel)}`);
+          await gh.request("DELETE", `${at(repo)}/issues/${existing.number}/labels/${encodeURIComponent(p.removeLabel)}`);
           const gone = p.removeLabel;
           pr = { ...pr, labels: (pr.labels ?? []).filter((l) => l.name !== gone) };
         }
       }
     } else {
-      const made = await gh.request<Pull>("POST", `${base}/${repo}/pulls`, { title: p.title, body: p.body, head: p.branch, base: p.meta.default_branch });
+      const made = await gh.request<Pull>("POST", `${at(repo)}/pulls`, { title: p.title, body: p.body, head: p.branch, base: p.meta.default_branch });
       if (!made.data) throw new Error(`GitHub did not open the pull request (HTTP ${made.status}${made.message ? `: ${made.message}` : ""}).`);
       pr = made.data;
       state = "opened";
     }
     await ensureLabels(repo);
-    if (!hasLabel(pr, TRAIN_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [TRAIN_LABEL] });
-    const autoMerge = await disableAutoMerge(pr);
+    if (!hasLabel(pr, TRAIN_LABEL)) await gh.request("POST", `${at(repo)}/issues/${pr.number}/labels`, { labels: [TRAIN_LABEL] });
+    const autoMerge = await disableAutoMerge(pr, repo);
     const how = "The train merges it on green in a later run.";
     if (state === "opened" || state === "updated") {
       result({ ...p.common, state, pr: prRef(pr), autoMerge, ci: "none", detail: `${how}${p.note}` });
@@ -1478,7 +1504,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   // share of the policy selects the repositories of the mode `one-candidate`. The other repositories stay in `shadow`.
   const policy = o.candidatePolicy ?? CANDIDATE_POLICY;
   const nowMs = (o.now ?? new Date()).getTime();
-  const reader = candidateReader(gh, owner, policy, nowMs, [TRAIN_BRANCH, SYNC_BRANCH]);
+  const reader = candidateReader(gh, accountOf, policy, nowMs, [TRAIN_BRANCH, SYNC_BRANCH]);
   const pairs = new Map<string, CandidatePair>();
   const heldPairs = new Map<string, CandidateHeld>();
   const actedCounts = new Map<string, CandidateActed>();
@@ -1617,11 +1643,11 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       result({ ...common, state: "waiting", paced: true, pr: null, autoMerge: null, ci: null, detail: `${d.reason}.` });
       return null;
     }
-    const autoMerge = await disableAutoMerge(pr);
+    const autoMerge = await disableAutoMerge(pr, repo);
     if (d.action === "wait") {
       // A red candidate keeps the blocked label, as in the strict rule.
       const failed = ci === "failed";
-      if (failed && !hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${base}/${repo}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
+      if (failed && !hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${at(repo)}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
       result({ ...common, state: failed ? "blocked" : "unchanged", pr: prRef(pr), autoMerge, ci, detail: `${d.reason}.` });
       return null;
     }
@@ -1643,9 +1669,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       result({ ...common, state: "unchanged", pr: prRef(pr), autoMerge, ci, detail: hold });
       return null;
     }
-    const m = await gh.request("PUT", `${base}/${repo}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
+    const m = await gh.request("PUT", `${at(repo)}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
     if (m.ok) {
-      await gh.request("DELETE", `${base}/${repo}/git/refs/heads/${t.branch}`);
+      await gh.request("DELETE", `${at(repo)}/git/refs/heads/${t.branch}`);
       result({ ...common, state: "merged", pr: prRef(pr), autoMerge, ci, detail: `The train merged the pull request: ${d.reason}.`, mergedBehind: dr.facts.behind ?? null });
       return null;
     }
@@ -1718,7 +1744,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
    */
   /** This function gives the committer date of a commit, or undefined when the commit is not readable. */
   const commitDate = async (repo: string, sha: string): Promise<string | undefined> => {
-    const res = await gh.request<{ commit?: { committer?: { date?: string } } }>("GET", `${base}/${repo}/commits/${sha}`);
+    const res = await gh.request<{ commit?: { committer?: { date?: string } } }>("GET", `${at(repo)}/commits/${sha}`);
     return res.data?.commit?.committer?.date;
   };
   /** This function gives the time of the last push of a pull request: the committer date of its head, else `updated_at`. */
@@ -1749,9 +1775,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   const caught = new Map<string, string>();
   let startFallbacks = 0;
   /** This function gives the reason why a sync push waits for the busy runners, or null when it can push. */
-  const busyWait = async (): Promise<string | null> => {
+  const busyWait = async (repo: string): Promise<string | null> => {
     if (!o.runnersBusy) return null;
-    const busy = await o.runnersBusy();
+    const busy = await o.runnersBusy(repo);
     const limit = o.busyLimit ?? BUSY_LIMIT;
     return busy !== null && busy >= limit ? `${busy} jobs run on the runners of the account, and a sync push waits at ${limit} or more. A later run pushes this one.` : null;
   };
@@ -1773,11 +1799,11 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       const base0 = { repo, actionId: `merge:${repo}#${number}`, kind: MERGE_KIND, wave: null, items: 0, autoMerge: "train" as const };
       try {
         const meta = await metaOf(repo);
-        const pr = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${number}`)).data;
+        const pr = (await gh.request<Pull>("GET", `${at(repo)}/pulls/${number}`)).data;
         if (!pr || pr.state !== "open") continue;
         const main = meta?.default_branch ?? "main";
         // A branch of a fork has a name that can match a branch of this repository, and a merge into another base is not a release path.
-        if (pr.head.repo?.full_name !== `${owner}/${repo}` || pr.base.ref !== main || pr.draft) {
+        if (pr.head.repo?.full_name !== `${accountOf(repo)}/${repo}` || pr.base.ref !== main || pr.draft) {
           result({ ...base0, state: "skipped", pr: prRef(pr), ci: null, detail: `The train merges only a branch of this repository into ${main}, and not a draft.` });
           continue;
         }
@@ -1785,14 +1811,14 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
           result({ ...base0, state: "planned", pr: prRef(pr), ci: null, detail: "The run merges the pull request when CI is green." });
           continue;
         }
-        await disableAutoMerge(pr);
+        await disableAutoMerge(pr, repo);
         const s = await settle(repo, pr, meta, pr.head.ref, false);
         let detail = s.detail;
         if ((s.behind ?? 0) > 0) {
           const body = pr.body ?? "";
           // settle merges the default branch into a branch with no rebase box.
           if (body.includes(RENOVATE_REBASE_BOX)) {
-            const r = await gh.request("PATCH", `${base}/${repo}/pulls/${pr.number}`, { body: body.replace(RENOVATE_REBASE_BOX, "- [x] <!-- rebase-check -->") });
+            const r = await gh.request("PATCH", `${at(repo)}/pulls/${pr.number}`, { body: body.replace(RENOVATE_REBASE_BOX, "- [x] <!-- rebase-check -->") });
             detail += r.ok ? " The train ticked the rebase box, so Renovate rebases the branch." : ` The tick of the rebase box failed (HTTP ${r.status}).`;
           }
         }
@@ -1808,18 +1834,23 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   let labeled: Promise<{ repo: string; number: number }[] | null> | undefined;
   const findLabeled = (): Promise<{ repo: string; number: number }[] | null> =>
     (labeled ??= (async () => {
-      const q = `user:${owner} is:pr is:open label:${MERGE_LABEL}`;
-      const found = await gh.request<{ items?: { number: number; repository_url: string }[] }>("GET", `/search/issues?per_page=100&q=${encodeURIComponent(q)}`);
-      if (!found.ok || !found.data) {
-        log(`GitHub did not search the pull requests with the label ${MERGE_LABEL} (HTTP ${found.status}).`);
-        return null;
+      // One search for each account: the search of an account takes the token of that account.
+      const items: { number: number; repository_url: string }[] = [];
+      for (const account of accounts) {
+        const q = `user:${account} is:pr is:open label:${MERGE_LABEL}`;
+        const found = await gh.request<{ items?: { number: number; repository_url: string }[] }>("GET", `/search/issues?per_page=100&q=${encodeURIComponent(q)}`);
+        if (!found.ok || !found.data) {
+          log(`GitHub did not search the pull requests with the label ${MERGE_LABEL} (HTTP ${found.status}).`);
+          return null;
+        }
+        items.push(...(found.data.items ?? []));
       }
       const inScan = new Set(scan);
-      return (found.data.items ?? []).map((i) => ({ repo: i.repository_url.split("/").pop() ?? "", number: i.number })).filter((i) => inScan.has(i.repo));
+      return items.map((i) => ({ repo: i.repository_url.split("/").pop() ?? "", number: i.number })).filter((i) => inScan.has(i.repo));
     })());
   const metas = new Map<string, RepoMeta | null>();
   const metaOf = async (repo: string): Promise<RepoMeta | null> => {
-    if (!metas.has(repo)) metas.set(repo, (await gh.request<RepoMeta>("GET", `${base}/${repo}`)).data);
+    if (!metas.has(repo)) metas.set(repo, (await gh.request<RepoMeta>("GET", `${at(repo)}`)).data);
     return metas.get(repo) ?? null;
   };
 
@@ -1835,8 +1866,8 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     for (const { repo, number } of (await findLabeled()) ?? []) {
       const meta = await metaOf(repo);
       const main = meta?.default_branch ?? "main";
-      const pr = (await gh.request<Pull>("GET", `${base}/${repo}/pulls/${number}`)).data;
-      if (!pr || pr.state !== "open" || pr.draft || pr.base.ref !== main || pr.head.repo?.full_name !== `${owner}/${repo}`) continue;
+      const pr = (await gh.request<Pull>("GET", `${at(repo)}/pulls/${number}`)).data;
+      if (!pr || pr.state !== "open" || pr.draft || pr.base.ref !== main || pr.head.repo?.full_name !== `${accountOf(repo)}/${repo}`) continue;
       if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX) || pr.mergeable === false || pr.mergeable_state === "dirty") continue;
       if ((await ciOf(repo, pr.head.sha)) !== "green") continue;
       const ageHours = pr.created_at ? ((o.now ?? new Date()).getTime() - Date.parse(pr.created_at)) / 3_600_000 : 0;
@@ -1871,8 +1902,8 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     const pr = open.get(w.repo);
     const base0 = { repo: w.repo, private: w.private, actionId: w.actionId, kind: null, wave: w.wave, items: 0, autoMerge: null };
     if (pr && !o.dryRun && w.holdsOpen !== true) {
-      const meta = (await gh.request<RepoMeta>("GET", `${base}/${w.repo}`)).data;
-      await disableAutoMerge(pr);
+      const meta = (await gh.request<RepoMeta>("GET", `${at(w.repo)}`)).data;
+      await disableAutoMerge(pr, w.repo);
       const s = await settle(w.repo, pr, meta);
       result({ ...base0, state: s.state === "unchanged" ? "waiting" : s.state, pr: { number: pr.number, url: pr.html_url }, ci: s.ci, detail: `${s.detail} The rest of the update waits for ${w.dependsOn.join(", ") || "npm"}.`, ...mergedOf(s) });
       continue;
@@ -1950,7 +1981,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       return;
     }
     try {
-      const metaRes = await gh.request<RepoMeta>("GET", `${base}/${u.repo}`);
+      const metaRes = await gh.request<RepoMeta>("GET", `${at(u.repo)}`);
       if (!metaRes.data) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
       const meta = metaRes.data;
       if (!existing) {
@@ -1982,13 +2013,13 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       if (wait !== null && act) {
         // The candidate rules decided the push, so the branch waits with no settle. The limit of the run holds the push.
         record.cause = "limit";
-        if (existing && !o.dryRun) await disableAutoMerge(existing);
+        if (existing && !o.dryRun) await disableAutoMerge(existing, u.repo);
         result({ ...common, state: "waiting", paced: true, pr: prRef(existing), autoMerge: existing ? "train" : null, ci: null, detail: `${act.reason}. ${wait}` });
         return;
       }
       if (wait !== null) {
         // No clone: each clone can push. The next run reads the plan again, so it pushes the newest versions.
-        if (existing && !o.dryRun) await disableAutoMerge(existing);
+        if (existing && !o.dryRun) await disableAutoMerge(existing, u.repo);
         const s = existing && !o.dryRun ? await settle(u.repo, existing, meta) : null;
         const state: RepoState = !s || (due && s.state === "unchanged") ? "waiting" : s.state;
         record.cause = state === "waiting" ? "limit" : (s?.held ?? null);
@@ -2058,7 +2089,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     const filesOf = (repo: string): Promise<RepoFiles | null> => {
       let p = filesCache.get(repo);
       if (!p) {
-        p = apiFiles(gh, owner, repo);
+        p = apiFiles(gh, accountOf(repo), repo);
         filesCache.set(repo, p);
       }
       return p;
@@ -2084,7 +2115,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     const syncOne = async (repo: string, record: DecisionRecord): Promise<void> => {
       const isPrivate = privateOf.get(repo) ?? true;
       const existing = syncOpen.get(repo) ?? null;
-      const facts: SyncFacts = { ...facts0, repo, releaseInFlight: pending.has(repo) || changesets.has(repo) };
+      const facts: SyncFacts = { ...facts0, repo, account: accountOf(repo), releaseInFlight: pending.has(repo) || changesets.has(repo) };
       const commonOf = (r: SyncResult) => ({
         repo,
         private: isPrivate,
@@ -2120,7 +2151,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         }
         // The need stays in the state until a run finds the files in sync, also while the push waits.
         s.starts?.need(repo, syncSince);
-        const metaRes = await gh.request<RepoMeta>("GET", `${base}/${repo}`);
+        const metaRes = await gh.request<RepoMeta>("GET", `${at(repo)}`);
         if (!metaRes.data) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
         const meta = metaRes.data;
         if (!existing) {
@@ -2137,7 +2168,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         const waitOf = async (): Promise<{ wait: string | null; cause: HeldCause | null }> => {
           const limit = limitWait();
           if (limit !== null) return { wait: limit, cause: "limit" };
-          const busy = await busyWait();
+          const busy = await busyWait(repo);
           return { wait: busy, cause: busy !== null ? "busy" : null };
         };
         const early = mode === "shadow" && !existing ? await waitOf() : null;
@@ -2230,7 +2261,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     const changesets = info?.pendingChangesets ?? 0;
     const base0 = { repo, private: false, actionId: `release:${repo}`, kind: "release", wave: null, items: 0, autoMerge: null };
     try {
-      const wf = await gh.request<{ content?: string }>("GET", `${base}/${repo}/contents/.github/workflows/release.yml`);
+      const wf = await gh.request<{ content?: string }>("GET", `${at(repo)}/contents/.github/workflows/release.yml`);
       const text = wf.data?.content ? Buffer.from(wf.data.content, "base64").toString("utf8") : "";
       if (!text) continue;
       if (!dispatchOnly(text)) {
@@ -2239,11 +2270,11 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         continue;
       }
       if (!o.releaseDispatch) continue;
-      const metaRes = await gh.request<RepoMeta>("GET", `${base}/${repo}`);
+      const metaRes = await gh.request<RepoMeta>("GET", `${at(repo)}`);
       const meta = metaRes.data;
       if (!meta) throw new Error(`The repository is not readable (HTTP ${metaRes.status}).`);
       // A version pull request of changesets merges on green. Its merge makes the version on main newer than npm.
-      const vpr = (await gh.request<Pull[]>("GET", `${base}/${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(VERSION_BRANCH)}&per_page=5`)).data?.[0];
+      const vpr = (await gh.request<Pull[]>("GET", `${at(repo)}/pulls?state=open&head=${accountOf(repo)}:${encodeURIComponent(VERSION_BRANCH)}&per_page=5`)).data?.[0];
       if (vpr) {
         if (o.dryRun) {
           result({ ...base0, state: "planned", pr: { number: vpr.number, url: vpr.html_url }, ci: null, detail: "The run merges the version pull request when CI is green." });
@@ -2253,13 +2284,13 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         result({ ...base0, state: s.state, pr: { number: vpr.number, url: vpr.html_url }, ci: s.ci, detail: `Version pull request: ${s.detail}`, ...mergedOf(s) });
         continue;
       }
-      const runs = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${base}/${repo}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(meta.default_branch)}&per_page=5`);
+      const runs = await gh.request<{ workflow_runs: { status: string }[] }>("GET", `${at(repo)}/actions/workflows/release.yml/runs?branch=${encodeURIComponent(meta.default_branch)}&per_page=5`);
       if ((runs.data?.workflow_runs ?? []).some((x) => x.status !== "completed")) {
         fly(repo);
         result({ ...base0, state: "waiting", pr: null, ci: null, detail: "The release workflow runs." });
         continue;
       }
-      const head = (await gh.request<{ sha: string }>("GET", `${base}/${repo}/commits/${encodeURIComponent(meta.default_branch)}`)).data?.sha;
+      const head = (await gh.request<{ sha: string }>("GET", `${at(repo)}/commits/${encodeURIComponent(meta.default_branch)}`)).data?.sha;
       const ci = head ? await ciOf(repo, head) : "none";
       if (ci !== "green") {
         result({ ...base0, state: "waiting", pr: null, ci, detail: `The release waits for green CI on ${meta.default_branch}.` });
@@ -2270,7 +2301,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         result({ ...base0, state: "planned", pr: null, ci, detail: `The run starts the release workflow for ${what}.` });
         continue;
       }
-      const d = await gh.request("POST", `${base}/${repo}/actions/workflows/release.yml/dispatches`, { ref: meta.default_branch });
+      const d = await gh.request("POST", `${at(repo)}/actions/workflows/release.yml/dispatches`, { ref: meta.default_branch });
       if (!d.ok) {
         const need = d.status === 403 || d.status === 404 ? " The GitHub App needs the permission Actions: write." : "";
         result({ ...base0, state: "error", pr: null, ci, detail: `The dispatch of the release workflow failed (HTTP ${d.status}).${need}` });
