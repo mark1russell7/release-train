@@ -891,6 +891,39 @@ describe("apply with the template sync", () => {
     });
   });
 
+  describe("when the template moves while a sync with no pull request waits", () => {
+    // demo-repo needs a sync and an update of @ex/tool. The update waits from 11-09 12:00Z. The first run sees the sync
+    // need at the template commit of 11-09 10:00Z. The second run has a template commit of 13:30Z, after the need of the update.
+    const NEED = "2026-11-09T12:00:00Z";
+    const snap: RepoSnapshot = { name: "demo-repo", private: false, defaultBranch: "main", manifests: [{ path: "", manifest: { name: "demo", private: true, devDependencies: { "@ex/tool": "^1.0.0" } } }], lockKind: "pnpm", resolved: { "": { "@ex/tool": "1.0.0" } }, warnings: [] };
+    const tool: RepoSnapshot = { name: "tool-repo", private: false, defaultBranch: "main", manifests: [{ path: "", manifest: { name: "@ex/tool", version: "1.1.0" } }], lockKind: "pnpm", resolved: {}, warnings: [] };
+    const p = () => plan(buildGraph({ owner: OWNER, repos: [snap, tool], npm: { "@ex/tool": { exists: true, latest: "1.1.0" } }, now: new Date("2026-01-01T00:00:00Z") }));
+    /** This function makes one run. A prior of null gives a run with no state, as before the state kept the sync needs. */
+    const run = async (template: string, now: string, maxPushes: number, prior: Record<string, string> | null) => {
+      const { gh } = server(repoRoutes("demo-repo", { [`GET ${base}/template/commits/${NEW}`]: () => [200, { commit: { committer: { date: template } } }] }));
+      const order: string[] = [];
+      const inner = syncer([]);
+      const up: SyncUpdater = { sync: async (job, ctx) => { order.push("sync"); return inner.sync(job, ctx); } };
+      const updater: Updater = { async update() { order.push("update"); return { status: "pushed", sha: "s8", changes: [], unresolved: [], young: [], tool: "pnpm 12.0.0", error: null }; } };
+      const starts = prior === null ? null : needStarts({}, prior, now, (k) => k);
+      starts?.keepSync(["demo-repo", "tool-repo"]);
+      await apply({ owner: OWNER, plan: p(), gh, updater, dryRun: false, sync: { updater: up, facts: runFacts(), workflows: "no", ...(starts ? { starts: starts.sync } : {}) }, maxPushes, needSince: () => NEED, now: new Date(now) });
+      return { order, seen: starts?.seen() ?? null };
+    };
+
+    it("waits from the first run that saw the need, so a newer template commit does not put the sync behind the update", async () => {
+      // The first run pushes nothing, and the state keeps the first sight of the sync need, also for a push that waits.
+      const first = await run("2026-11-09T10:00:00Z", "2026-11-09T12:30:00Z", 0, {});
+      expect(first.order).toEqual([]);
+      expect(first.seen).toEqual({ "demo-repo\0sync": "2026-11-09T10:00:00Z" });
+      const second = await run("2026-11-09T13:30:00Z", "2026-11-09T14:00:00Z", 1, first.seen);
+      expect(second.order).toEqual(["sync"]);
+      expect(second.seen).toEqual({ "demo-repo\0sync": "2026-11-09T10:00:00Z" });
+      // With no state, the sync waits from the newest template commit, so the update goes first in each run.
+      expect((await run("2026-11-09T13:30:00Z", "2026-11-09T14:00:00Z", 1, null)).order).toEqual(["update"]);
+    });
+  });
+
   it("gives the same waiting state in a dry run, and pushes nothing", async () => {
     const { gh, calls } = server(repoRoutes("demo-repo"));
     const up = syncer([]);

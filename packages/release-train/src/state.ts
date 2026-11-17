@@ -75,6 +75,19 @@ export interface Need {
   from: string | null;
 }
 
+/**
+ * The template sync need of each repository, with the time when the train saw it first. A sync with no open pull request waits from
+ * this time. Without it, the sync waits from the date of the newest template commit, so each template merge starts its wait again.
+ */
+export interface SyncStarts {
+  /** This function gives the first sight of the sync need of a repository, or undefined when the state has none. */
+  since(repo: string): string | undefined;
+  /** This function keeps the sync need of a repository: its first sight from the state, else `start`. It gives that time. */
+  need(repo: string, start: string): string;
+  /** This function drops the sync need of a repository, because the template files of the repository are in sync. */
+  done(repo: string): void;
+}
+
 /** The starts of the needs of one run, from npm and from the state. The repository of each need is the first argument of `since`. */
 export interface NeedStarts {
   /**
@@ -83,10 +96,17 @@ export interface NeedStarts {
    * need for its repository.
    */
   since(repo: string, needs: readonly Need[]): string;
+  /**
+   * This function keeps the sync need of each repository of the list in the next state. Thus a run with no sync, a run
+   * with `--only` or a run that stops early does not start these waits again. A repository that is not in the list loses its need.
+   */
+  keepSync(repos: readonly string[]): void;
+  /** The template sync needs of the run. */
+  sync: SyncStarts;
   /** The `seen` field for the next state: only the needs of this run, so the field does not grow. */
   seen(): Record<string, string>;
-  /** The count of the needs that got their start from npm and from the state. */
-  counts(): { npm: number; state: number };
+  /** The count of the needs that got their start from npm and from the state, and of the sync needs that the state had. */
+  counts(): { npm: number; state: number; sync: number };
 }
 
 /**
@@ -97,6 +117,7 @@ export function needStarts(npm: Readonly<Record<string, NpmInfo>>, prior: Readon
   const next: Record<string, string> = {};
   let fromNpm = 0;
   let fromState = 0;
+  let syncKept = 0;
   const seenAt = (key: string): string => {
     const h = hash(key);
     const at = next[h] ?? prior[h] ?? now;
@@ -104,7 +125,32 @@ export function needStarts(npm: Readonly<Record<string, NpmInfo>>, prior: Readon
     fromState++;
     return at;
   };
+  // The key of a sync need. The keys of the other needs have one part (settings) or three parts after the repository.
+  const syncKey = (repo: string): string => hash(`${repo}\0sync`);
+  // A repository whose template files are in sync in this run. Its sync need from the state does not come back.
+  const synced = new Set<string>();
+  const syncAt = (repo: string): string | undefined => (synced.has(repo) ? next[syncKey(repo)] : (next[syncKey(repo)] ?? prior[syncKey(repo)]));
   return {
+    keepSync(repos) {
+      for (const repo of repos) {
+        const at = syncAt(repo);
+        if (at !== undefined) next[syncKey(repo)] = at;
+      }
+    },
+    sync: {
+      since: syncAt,
+      need(repo, start) {
+        const known = syncAt(repo);
+        if (known !== undefined && prior[syncKey(repo)] === known) syncKept++;
+        const at = known ?? start;
+        next[syncKey(repo)] = at;
+        return at;
+      },
+      done(repo) {
+        synced.add(repo);
+        delete next[syncKey(repo)];
+      },
+    },
     since(repo, needs) {
       if (needs.length === 0) return seenAt(`${repo}\0settings`);
       let best: string | undefined;
@@ -117,6 +163,6 @@ export function needStarts(npm: Readonly<Record<string, NpmInfo>>, prior: Readon
       return best as string;
     },
     seen: () => ({ ...next }),
-    counts: () => ({ npm: fromNpm, state: fromState }),
+    counts: () => ({ npm: fromNpm, state: fromState, sync: syncKept }),
   };
 }
