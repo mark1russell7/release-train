@@ -370,7 +370,7 @@ describe("the site config of a repository in a second account", () => {
       ],
       config: null,
     });
-    expect(move?.error ?? null).toBeNull();
+    expect(move?.needs).toEqual([]);
     expect(move?.config).toMatchObject({ base: "/{owner}/{repo}/" });
     const written = Object.values(move?.writes ?? {}).join("\n");
     expect(written).toContain(`uses: ${TEMPLATE_OWNER}/`);
