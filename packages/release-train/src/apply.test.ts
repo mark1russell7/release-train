@@ -23,21 +23,24 @@ import {
   longestWaitFirst,
   otherCommits,
   othersText,
+  plannedHooks,
   prBody,
   publicReport,
   releaseCheckLets,
   releaseCheckOf,
   rotate,
   selectUpdates,
+  updateFilesLine,
 } from "./apply.ts";
 import type { CompareCommit, RepoUpdate, UpdateResult, Updater } from "./apply.ts";
 import { CANDIDATE_POLICY, shareOf } from "./candidate-policy.ts";
 import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
-import { buildGraph } from "./graph.ts";
+import { buildGraph, repoHooks } from "./graph.ts";
 import type { LagHold } from "./holds.ts";
 import { RateStop } from "./meter.ts";
 import { plan } from "./plan.ts";
+import { UPDATE_SCRIPT } from "./types.ts";
 import type { Manifest, NpmInfo, RepoSnapshot, Resolved } from "./types.ts";
 import { API_REPORT_PACKAGE, CONVENTIONS, ageExcluded, apiReportUpdateArgs, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
@@ -242,6 +245,72 @@ describe("a release in flight", () => {
       const r = await apply({ owner: OWNER, plan: pending(), gh, updater: updater(), dryRun: true });
       expect(r.results.find((x) => x.repo === "pub-repo" && x.actionId === "update:pub-repo"), text).toMatchObject({ state: "planned" });
     }
+  });
+});
+
+describe("the scripts of a repository that the updater starts", () => {
+  /** A plan where lib-repo adopts a new major version of a runtime dependency, so @ex/lib releases with the update. */
+  const hooked = (scripts: Record<string, unknown>, tools: Record<string, unknown> = {}) =>
+    plan(
+      buildGraph({
+        owner: OWNER,
+        repos: [
+          repo("core-repo", { "": { name: "@ex/core", version: "2.0.0" } }),
+          repo("lib-repo", { "": { name: "@ex/lib", version: "1.0.0", scripts, dependencies: { "@ex/core": "^1.0.0" } }, tools: { name: "tools", private: true, scripts: tools } }, {
+            resolved: { "": { "@ex/core": "1.0.0" } },
+          }),
+        ],
+        npm: { "@ex/core": npm("2.0.0"), "@ex/lib": npm("1.0.0") },
+        now: new Date("2026-01-01T00:00:00Z"),
+      }),
+    );
+
+  it("keeps in the graph only the scripts that the updater starts", () => {
+    const p = hooked({ version: "node v.ts", [UPDATE_SCRIPT]: "node u.ts", test: "vitest" }, { version: "node v.ts" });
+    expect(p.repos.find((r) => r.name === "lib-repo")?.hooks).toEqual({ update: true, version: ["", "tools"] });
+    expect(p.repos.find((r) => r.name === "core-repo")).not.toHaveProperty("hooks");
+    // Only the root package.json can have the update script, and a script must be a string.
+    expect(repoHooks([{ path: "tools", manifest: { scripts: { [UPDATE_SCRIPT]: "node u.ts" } } }])).toEqual({});
+    expect(repoHooks([{ path: "", manifest: { scripts: { version: 1, [UPDATE_SCRIPT]: null } } }])).toEqual({});
+  });
+
+  it("gives the version script of each package that releases, then the update script", () => {
+    const releases = [{ name: "@ex/a", path: "a", from: "1.0.0", changes: [] }, { name: "@ex/b", path: "b", from: "1.0.0", changes: [] }];
+    expect(plannedHooks({ update: true, version: ["", "a"] }, { releases })).toEqual(["the version script of a/package.json", `the script ${UPDATE_SCRIPT} of package.json`]);
+    expect(plannedHooks(undefined, { releases })).toEqual([]);
+    expect(plannedHooks({ version: [""] }, {})).toEqual([]);
+  });
+
+  it("names the scripts of the update in the dry-run plan", async () => {
+    const { gh } = server({ [`GET ${base}/lib-repo/pulls`]: () => [200, []], [`GET ${base}/lib-repo`]: meta });
+    const detail = async (p: ReturnType<typeof hooked>) => (await apply({ owner: OWNER, plan: p, gh, updater: updater(), dryRun: true, only: ["lib-repo"] })).results.find((x) => x.repo === "lib-repo")?.detail;
+    const both = await detail(hooked({ version: "node v.ts", [UPDATE_SCRIPT]: "node u.ts" }));
+    expect(both).toContain("with the release of @ex/lib.");
+    expect(both).toContain(`It starts the version script of ./package.json, then the script ${UPDATE_SCRIPT} of package.json.`);
+    expect(await detail(hooked({ [UPDATE_SCRIPT]: "node u.ts" }))).toContain(`It starts the script ${UPDATE_SCRIPT} of package.json.`);
+    expect(await detail(hooked({}))).not.toContain("It starts");
+  });
+
+  it("lists the new files of the update script in the step log and in the pull request", async () => {
+    const { gh, calls } = server({
+      [`GET ${base}/lib-repo/pulls`]: () => [200, []],
+      [`GET ${base}/lib-repo`]: meta,
+      [`POST ${base}/lib-repo/pulls`]: (b) => [201, { ...pull(9, "lib-repo"), ...b, labels: [] }],
+      [`POST ${base}/lib-repo/labels`]: () => [201, {}],
+      [`POST ${base}/lib-repo/issues/9/labels`]: () => [200, []],
+      [`POST /graphql`]: () => [200, { data: { enablePullRequestAutoMerge: { clientMutationId: null } } }],
+    });
+    const lines: string[] = [];
+    const up = updater({ updateFiles: ["data/new.json", "data/b.json"] });
+    const r = await apply({ owner: OWNER, plan: hooked({ [UPDATE_SCRIPT]: "node u.ts" }), gh, updater: up, dryRun: false, only: ["lib-repo"], log: (l) => lines.push(l) });
+    expect(r.results.find((x) => x.repo === "lib-repo")).toMatchObject({ state: "opened" });
+    expect(lines).toContain(`lib-repo: the train added 2 new files of the script ${UPDATE_SCRIPT} to the commit: data/new.json, data/b.json.`);
+    const body = String(calls.find((c) => c.method === "POST" && c.path.endsWith("/pulls"))?.body?.["body"]);
+    expect(body).toContain(`## New files of ${UPDATE_SCRIPT}`);
+    expect(body).toContain("- `data/new.json`\n- `data/b.json`");
+    // A private repository gets only a count in the step log.
+    expect(updateFilesLine("1f2e3d", true, ["data/hidden.json"])).toBe(`1f2e3d: the train added 1 new file of the script ${UPDATE_SCRIPT} to the commit.`);
+    expect(updateFilesLine("lib-repo", false, [])).toBeNull();
   });
 });
 
