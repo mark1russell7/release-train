@@ -427,12 +427,24 @@ The template sync keeps the files from the repository `template` current in each
 
 A rule writes a JSON file in the layout of Prettier, so the check `prettier --check` of the repository passes on it (`formatJson`). It keeps the indent and the line ends of the file. `package.json`, `package-lock.json` and `composer.json` get the layout of `JSON.stringify`, as with the parser `json-stringify` of Prettier. In another JSON file, an array goes on one line when it has no object and fits in the `printWidth`. The `printWidth` comes from the Prettier config of the repository, and it is 80 when no config sets it.
 
+### The kept answers
+
+The workflow also keeps the answers of the GitHub API from one run to the next in the Actions cache (`--kept train-kept.sealed`, `src/kept.ts`). Most GET requests of a run read files and lists that did not change since the run before.
+
+- A GET of the API sends the validators of its kept answer (`If-None-Match`, `If-Modified-Since`). When the resource did not change, GitHub answers 304, and the run reads the kept body. GitHub does not count a 304 against the rate limit.
+- The store and the conditional fetch come from `polite-crawler/api` (`keptFetch`, `keptStore`, `sealKept`, `openKept`). The kept fetch is between the guard and the meter, so the meter counts each real 304 (`notModified` of each route).
+- The need of a run does not count the answers 304, because GitHub does not count them.
+- The cache of this public repository can be read by others, and a kept answer of a private repository holds its body. So the file is sealed with AES-256-GCM. The key comes from the secret `RELEASE_TRAIN_KEPT_KEY` by HKDF with the label `release-train-kept/1`. The workflow gives it the value of `RELEASE_TRAIN_HASH_KEY`: the label gives the seal a key of its own.
+- After a complete run, the store has only the answers that the run used. A run that stopped early (a stop of the gate or the guard, `--only`, an error) also keeps the answers of the run before.
+- A missing file, a file that does not open, or a secret with fewer than 16 bytes does not stop a run. The run writes a note in the log and reads each answer in full.
+
 The rules do not change the repository `template`. Each repository gets one branch `release-train/template` and one pull request with the label `release-train`, apart from the update pull request. The body tells each change and its reason, the changes that wait, and the problems that need a hand. The fingerprint in the body stops a push when the changes are the same. It covers the text of each change, the content of each written file and each removed path. Thus a new content, for example from a fix of the train, gives a new build of the open pull request. CI, the label `release-train:blocked`, the merge on green and the close follow the rules of the update pull request.
 
 GitHub refuses a change to a workflow file from an App without the permission Workflows: write. Until the App has this permission, the rules `pins` and `release-scripts` wait, and the pull request and the summary tell "The change waits for the Workflows permission of the App." The other rules work. The run does not fail.
 
 - `--no-sync` turns off the template sync.
 - `--state <file>` reads the state of the train at the start of the run and writes it at the end.
+- `--kept <file>` opens the sealed kept answers at the start of the run and seals them at the end. The secret is `RELEASE_TRAIN_KEPT_KEY`.
 - `--workflows auto|yes|no` tells if the App can change workflow files. With `auto` (the default), the train tries, and when GitHub refuses the push, it pushes again without the workflow changes.
 - `plan` lists the sync actions of each repository and the count for each rule.
 

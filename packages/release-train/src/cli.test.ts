@@ -1,11 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_NEED, DEFAULT_WAIT_MINUTES } from "./budget.ts";
 import { applyHolding, hashKey, paceOptions, parseArgs, runApply } from "./cli.ts";
 import type { FetchFn } from "./collect.ts";
+import { keptStore } from "polite-crawler/api";
+import type { Kept } from "polite-crawler/api";
+import { openTrainKept, sealTrainKept } from "./kept.ts";
 
 const workflow = readFileSync(new URL("../../../.github/workflows/train.yml", import.meta.url), "utf8");
 
@@ -155,6 +158,59 @@ describe("the options of the rate budget", () => {
     expect(() => parseArgs(["apply", "--rate-need", "2.5"])).toThrow("--rate-need needs a whole number");
     expect(() => parseArgs(["apply", "--rate-wait", "soon"])).toThrow("--rate-wait needs a number");
     expect(() => parseArgs(["apply", "--rate-wait"])).toThrow("--rate-wait needs a value");
+  });
+});
+
+describe("the kept answers of train.yml", () => {
+  it("gives the step the sealed file and the secret of the seal", () => {
+    const args = argsOfStep({ EVENT: "schedule" });
+    expect(args[args.indexOf("--kept") + 1]).toBe("train-kept.sealed");
+    expect(workflow).toContain("RELEASE_TRAIN_KEPT_KEY: ${{ secrets.RELEASE_TRAIN_HASH_KEY }}");
+    expect(workflow).toContain("path: train-kept.sealed");
+  });
+});
+
+describe("runApply and the kept answers", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+  const SECRET = "a-random-key-of-32-characters-00";
+  const old: [string, Kept] = ["application/vnd.github+json https://api.github.com/repos/acme/widget", { etag: 'W/"x"', status: 200, headers: {}, body: "{}" }];
+  const stopped = async (file: string): Promise<{ code: number; logs: string }> => {
+    vi.stubEnv("GH_TOKEN", "ghs_example");
+    vi.stubEnv("RELEASE_TRAIN_HASH_KEY", "example-key");
+    vi.stubEnv("GITHUB_ACTIONS", "true");
+    vi.stubEnv("GITHUB_STEP_SUMMARY", "");
+    vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const now = Date.parse("2026-11-15T12:00:00Z");
+    const fetch: FetchFn = async (url) =>
+      url.endsWith("/rate_limit")
+        ? new Response(JSON.stringify({ resources: { core: { limit: 10_200, used: 10_160, remaining: 40, reset: now / 1000 + 45 * 60 } } }), { status: 200 })
+        : new Response("{}", { status: 500 });
+    const code = await runApply(parseArgs(["apply", "--owner", "example-owner", "--kept", file]), { fetch, now: () => now, sleep: async () => {} });
+    return { code, logs: stderr.mock.calls.map((c) => String(c[0])).join("") };
+  };
+
+  it("keeps the entries of the run before when the gate stops the run", async () => {
+    const file = join(mkdtempSync(join(tmpdir(), "kept-run-")), "train-kept.sealed");
+    await sealTrainKept(file, { store: keptStore([old]), opened: [old], note: null }, SECRET, false);
+    vi.stubEnv("RELEASE_TRAIN_KEPT_KEY", SECRET);
+    const { code, logs } = await stopped(file);
+    expect(code).toBe(0);
+    expect(logs).toContain("kept answers: 1 from the run before");
+    expect(logs).toContain("kept answers: sealed 1 entries");
+    expect((await openTrainKept(file, SECRET)).opened.map(([key]) => key)).toEqual([old[0]]);
+  });
+
+  it("keeps no answer, and does not fail, with a secret that is too short", async () => {
+    const file = join(mkdtempSync(join(tmpdir(), "kept-run-")), "train-kept.sealed");
+    vi.stubEnv("RELEASE_TRAIN_KEPT_KEY", "short");
+    const { code, logs } = await stopped(file);
+    expect(code).toBe(0);
+    expect(logs).toContain("kept answers: off, because the secret of the seal has 5 bytes");
+    expect(existsSync(file)).toBe(false);
   });
 });
 
