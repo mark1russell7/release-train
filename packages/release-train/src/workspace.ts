@@ -24,7 +24,7 @@ export function changesetName(exists: (name: string) => boolean, fingerprint: st
 import { parseNpmLock, parsePnpmLock } from "./parse.ts";
 import { SYNC_BRANCH, syncCommitMessage, syncRepo, workflowsRefused } from "./sync.ts";
 import type { RepoFiles, SyncJob, SyncPush, SyncResult, SyncUpdater } from "./sync.ts";
-import type { LockKind, Resolved } from "./types.ts";
+import { UPDATE_SCRIPT, type LockKind, type Resolved } from "./types.ts";
 import { FIX_TEXT, fixCommitMessage, fixFingerprint, fixTrailer, parseFixMarks, patchTarget } from "./version-fix.ts";
 import type { FixDone, FixJob, FixMark, FixResult, VersionFixer } from "./version-fix.ts";
 
@@ -187,8 +187,7 @@ export const FIX_SINCE = "0.8.2";
 /** The root script that checks the API reports, and the report of a package when the repository names no other file. */
 export const API_SCRIPT = "check:api";
 
-/** The root script that the train starts after the install of each update. Its file changes go into the train commit. */
-export const UPDATE_SCRIPT = "release-train:update";
+export { UPDATE_SCRIPT } from "./types.ts";
 
 /** The names of the environment variables that no child command gets: tokens, secrets, keys and the settings of the train. */
 export const CREDENTIAL_NAME: RegExp = /TOKEN|SECRET|_KEY$|^RELEASE_TRAIN_/i;
@@ -956,7 +955,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
           ...u.items.map((i) => `- ${i.dep} in ${i.path || "."}: ${i.newRange ? `${i.range} -> ${i.newRange}` : i.range}, lockfile -> ${after[i.path]?.[i.dep] ?? i.to}`),
           ...releases.map((r) => `- release ${r.name}: ${r.from} -> ${r.to} (${r.type}, ${r.via === "changeset" ? "changeset" : "package.json"})`),
           ...(hooks.ran.length > 0 ? [`- version script: ${hooks.ran.map((p) => `${p}/package.json`).join(", ")}`] : []),
-          ...(own.ran ? [`- script ${UPDATE_SCRIPT} of package.json`] : []),
+          ...(own.ran ? [`- script ${UPDATE_SCRIPT} of package.json${own.added.length > 0 ? `, new files: ${own.added.join(", ")}` : ""}`] : []),
           ...(settingsChanged ? [`- pnpm-workspace.yaml: ${[...(u.ageScopes ?? []), ...urgentAge].join(", ")} in minimumReleaseAgeExclude`] : []),
           ...(fixed.length > 0 ? [`- conventions fix: ${fixed.join(", ")}`] : []),
           ...(reverted.length > 0 ? [`- conventions fix removed, it broke ${fixStep ?? "typecheck"}: ${reverted.join(", ")}`] : []),
@@ -975,7 +974,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
 
         // 7. No push when the branch already has the same content in the files of the train.
         const pushed = await pushHead(dir, sh, TRAIN_BRANCH, remote, ctx.rebuild);
-        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(urgentAge.size > 0 ? { urgentAge: [...urgentAge].sort() } : {}), ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError, ...(fixStep === undefined ? {} : { fixStep }) } : {}), ...(apiReports.length > 0 ? { apiReports } : {}), ...(apiReportError !== null ? { apiReportError, ...(apiReportStep === undefined ? {} : { apiReportStep }) } : {}), ...(carried.done.length > 0 ? { versionFixes: carried.done } : {}) };
+        return { status: pushed.status, sha: pushed.sha, changes, unresolved, young, tool, error: null, releases, ...(urgentAge.size > 0 ? { urgentAge: [...urgentAge].sort() } : {}), ...(fixed.length > 0 ? { fixed } : {}), ...(reverted.length > 0 ? { reverted, fixError, ...(fixStep === undefined ? {} : { fixStep }) } : {}), ...(apiReports.length > 0 ? { apiReports } : {}), ...(apiReportError !== null ? { apiReportError, ...(apiReportStep === undefined ? {} : { apiReportStep }) } : {}), ...(carried.done.length > 0 ? { versionFixes: carried.done } : {}), ...(own.added.length > 0 ? { updateFiles: own.added } : {}) };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       } finally {

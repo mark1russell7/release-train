@@ -26,6 +26,19 @@ export interface Manifest {
   devDependencies?: Record<string, string>;
   workspaces?: string[] | { packages?: string[] };
   packageManager?: string;
+  /** The graph reads only the names of the scripts that the updater starts (`RepoHooks`). */
+  scripts?: Record<string, unknown>;
+}
+
+/** The root script that the train starts after the install of each update. Its file changes go into the train commit. */
+export const UPDATE_SCRIPT = "release-train:update";
+
+/** The scripts of a repository that the updater of the train starts, so a dry run can name them. */
+export interface RepoHooks {
+  /** This value is true when the root `package.json` has the script `release-train:update`. */
+  update?: boolean;
+  /** The folders of the `package.json` files with a `version` script. The root folder is the empty string. */
+  version?: string[];
 }
 
 /** A `package.json` file and its folder in the repository. The root folder is the empty string. */
@@ -152,6 +165,8 @@ export interface RepoInfo {
   pendingChangesets?: number;
   /** The git submodules in the folders of the workspace. */
   submodules?: string[];
+  /** The scripts of the repository that the updater starts. Absent: the repository has none of them. */
+  hooks?: RepoHooks;
 }
 
 /** The dependency graph of the packages of one owner. */

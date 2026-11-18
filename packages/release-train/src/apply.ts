@@ -14,7 +14,7 @@ import { outsideLine, RateStop, readsOutside, refusalLine, routeLines } from "./
 import type { LagHold } from "./holds.ts";
 import { adoptWhy, moveSets } from "./plan.ts";
 import type { Action, ActionItem, Plan } from "./plan.ts";
-import type { DepType, LockKind } from "./types.ts";
+import { UPDATE_SCRIPT, type DepType, type LockKind, type RepoHooks } from "./types.ts";
 import { ownScopes } from "./settings.ts";
 import type { FixDone } from "./version-fix.ts";
 import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, TEMPLATE_REPO, apiFiles, renovateDays, syncBody, syncNeeds, syncRepo } from "./sync.ts";
@@ -342,6 +342,8 @@ export interface UpdateResult {
   versionFixes?: FixDone[];
   /** The step that failed. */
   apiReportStep?: string;
+  /** The new files that the root script `release-train:update` wrote. The train stages each one by name. */
+  updateFiles?: string[];
 }
 
 /** The part of the train that changes the files: a clone, the range changes, the lockfile update and the push. */
@@ -740,6 +742,24 @@ export function mergeMethod(meta: { allow_merge_commit?: boolean; allow_squash_m
   return meta.allow_squash_merge !== false ? "squash" : "rebase";
 }
 
+/**
+ * This function gives the scripts of the repository that an update starts, in their sequence. First come the `version` scripts
+ * of the packages that release with the update, then the root script `release-train:update`. A dry run names them. A version
+ * fix of the branch can add a version script that the plan does not know.
+ */
+export function plannedHooks(hooks: RepoHooks | undefined, u: Pick<RepoUpdate, "releases">): string[] {
+  const version = new Set(hooks?.version ?? []);
+  const paths = [...new Set((u.releases ?? []).map((x) => x.path))].filter((path) => version.has(path));
+  return [...paths.map((path) => `the version script of ${path || "."}/package.json`), ...(hooks?.update ? [`the script ${UPDATE_SCRIPT} of package.json`] : [])];
+}
+
+/** This function gives the line of the step log for the new files of the script `release-train:update`, or null. A private repository gets only a count. */
+export function updateFilesLine(name: string, isPrivate: boolean, files: readonly string[]): string | null {
+  if (files.length === 0) return null;
+  const count = `${files.length} new ${files.length === 1 ? "file" : "files"}`;
+  return `${name}: the train added ${count} of the script ${UPDATE_SCRIPT} to the commit${isPrivate ? "." : `: ${files.join(", ")}.`}`;
+}
+
 /** This function gives the title of the pull request of an update. */
 export function prTitle(u: RepoUpdate): string {
   if (u.items.length === 0) return "chore(pnpm): no release age wait for the packages of the owner";
@@ -749,7 +769,7 @@ export function prTitle(u: RepoUpdate): string {
 }
 
 /** This function gives the body of the pull request of an update. */
-export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; apiReports?: string[]; apiReportError?: string; apiReportStep?: string; fixStep?: string; fixError?: string | null; urgentAge?: string[]; versionFixes?: FixDone[] }) | null, marks: TrailerMarks | null = null): string {
+export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unresolved" | "tool"> & { young?: YoungItem[]; releases?: ReleaseDone[]; fixed?: string[]; reverted?: string[]; apiReports?: string[]; apiReportError?: string; apiReportStep?: string; fixStep?: string; fixError?: string | null; urgentAge?: string[]; versionFixes?: FixDone[]; updateFiles?: string[] }) | null, marks: TrailerMarks | null = null): string {
   const lockOf = new Map((r?.changes ?? []).map((c) => [`${c.path}|${c.dep}`, c]));
   const rows = u.items.map((i) => {
     const c = lockOf.get(`${i.path}|${i.dep}`);
@@ -805,6 +825,17 @@ export function prBody(u: RepoUpdate, r: (Pick<UpdateResult, "changes" | "unreso
       "| Package | Version |",
       "|---|---|",
       ...versionFixes.map((x) => `| \`${x.name}\` | ${x.via === "changeset" ? "a patch changeset" : `${x.from ?? "?"} -> ${x.to ?? "?"}`} |`),
+      "",
+    );
+  }
+  const updateFiles = r?.updateFiles ?? [];
+  if (updateFiles.length > 0) {
+    lines.push(
+      `## New files of ${UPDATE_SCRIPT}`,
+      "",
+      `The root script \`${UPDATE_SCRIPT}\` wrote these new files after the install, and the train added each one to this commit. Git does not ignore them. Make sure that each file belongs in the repository.`,
+      "",
+      ...updateFiles.map((file) => `- \`${file}\``),
       "",
     );
   }
@@ -2026,9 +2057,10 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       const due = act !== null || !existing || rebuild || bodyFingerprint(existing.body) !== u.fingerprint;
       const wait = urgent ? null : limitWait();
       if (o.dryRun && (wait === null || !due)) {
-        const what = !existing ? "The run opens a pull request" : due ? `The run updates PR #${existing.number}` : `The run keeps PR #${existing.number}`;
+        const hooks = plannedHooks(o.plan.repos.find((x) => x.name === u.repo)?.hooks, u);
+        const what =!existing ? "The run opens a pull request" : due ? `The run updates PR #${existing.number}` : `The run keeps PR #${existing.number}`;
         if (due && !urgent) pushes += 1;
-        result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length === 0 ? "the pnpm settings" : `${u.items.length} ${u.items.length === 1 ? "change" : "changes"}`}${u.items.length > 0 && u.ageScopes ? " and the pnpm settings" : ""}${u.releases?.length ? `, with the release of ${u.releases.map((x) => x.name).join(", ")}` : ""}.` });
+        result({ ...common, state: "planned", pr: prRef(existing), autoMerge: null, ci: null, detail: `${what} for ${u.items.length === 0 ? "the pnpm settings" : `${u.items.length} ${u.items.length === 1 ? "change" : "changes"}`}${u.items.length > 0 && u.ageScopes ? " and the pnpm settings" : ""}${u.releases?.length ? `, with the release of ${u.releases.map((x) => x.name).join(", ")}` : ""}.${hooks.length > 0 ? ` It starts ${hooks.join(", then ")}.` : ""}` });
         return;
       }
       if (wait !== null && act) {
@@ -2071,6 +2103,8 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         result({ ...common, state: "skipped", pr: null, autoMerge: null, ci: null, detail: why });
         return;
       }
+      const filesLine = updateFilesLine(label(u.repo, u.private), u.private, r.updateFiles ?? []);
+      if (filesLine !== null) log(filesLine);
       const shown: RepoUpdate = { ...u, items: u.items.filter((i) => !r.young.some((y) => y.dep === i.dep)) };
       const pushed = r.status === "pushed";
       await publish({

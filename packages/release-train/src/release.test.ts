@@ -401,7 +401,9 @@ describe("gitUpdater with a cascade release", () => {
     const staged = cmds.filter((c) => c.startsWith("git add -- ")).join(" ");
     expect(staged).toContain("data/new.json");
     expect(staged).not.toContain("old.txt");
-    expect(seen.message).toContain(`- script ${UPDATE_SCRIPT} of package.json`);
+    expect(seen.message).toContain(`- script ${UPDATE_SCRIPT} of package.json, new files: data/new.json`);
+    // The result names the new files, so the step log and the pull request list them.
+    expect(r).toMatchObject({ updateFiles: ["data/new.json"] });
     const failed = await go(2);
     expect(failed.r).toMatchObject({ status: "failed", error: expect.stringContaining(`The script ${UPDATE_SCRIPT} of package.json failed (exit 2): the engine is missing`) });
     expect(failed.cmds.some((c) => c.includes("commit"))).toBe(false);

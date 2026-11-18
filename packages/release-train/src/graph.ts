@@ -1,5 +1,5 @@
-import { BLOCKING_KINDS, DEP_TYPES } from "./types.ts";
-import type { Edge, Graph, Importer, NpmInfo, PackageNode, RepoInfo, RepoSnapshot } from "./types.ts";
+import { BLOCKING_KINDS, DEP_TYPES, UPDATE_SCRIPT } from "./types.ts";
+import type { Edge, Graph, Importer, ManifestFile, NpmInfo, PackageNode, RepoHooks, RepoInfo, RepoSnapshot } from "./types.ts";
 import { parseSpec } from "./parse.ts";
 import { needsAgeRule, ownScopes } from "./settings.ts";
 
@@ -16,6 +16,21 @@ export interface GraphInput {
 export function importerId(repo: string, path: string): string {
   return `${repo}:${path || "."}`;
 }
+
+/**
+ * This function gives the scripts of a repository that the updater starts: the root script `release-train:update` and the
+ * `version` script of each package. A dry run names them. The graph keeps no other script.
+ */
+export function repoHooks(manifests: readonly ManifestFile[]): RepoHooks {
+  const update = manifests.some(({ path, manifest: m }) => path === "" && typeof m.scripts?.[UPDATE_SCRIPT] === "string");
+  const version = manifests.filter(({ manifest: m }) => typeof m.scripts?.["version"] === "string").map(({ path }) => path);
+  return { ...(update ? { update: true } : {}), ...(version.length > 0 ? { version } : {}) };
+}
+
+const hooksField = (manifests: readonly ManifestFile[]): { hooks?: RepoHooks } => {
+  const hooks = repoHooks(manifests);
+  return Object.keys(hooks).length > 0 ? { hooks } : {};
+};
 
 /** This function makes the dependency graph from the repository data and the npm data. */
 export function buildGraph(input: GraphInput): Graph {
@@ -36,6 +51,7 @@ export function buildGraph(input: GraphInput): Graph {
       pendingChangesets: repo.pendingChangesets ?? 0,
       ...(repo.submodules?.length ? { submodules: repo.submodules } : {}),
       needsAgeRule: needsAgeRule({ lockKind: repo.lockKind, pnpmWorkspace: repo.pnpmWorkspace ?? null, packageManager: repo.packageManager ?? null }, ownScopes(input.owner)),
+      ...hooksField(repo.manifests),
     };
     for (const { path, manifest: m } of repo.manifests) {
       const published = Boolean(m.name) && m.private !== true;
