@@ -1,4 +1,4 @@
-import { accountOfPath, accountOfRepos, type Accounts } from "./accounts.ts";
+import { accountOfPath, accountOfRepos, authorizationOf, type Accounts } from "./accounts.ts";
 import type { FetchFn } from "./collect.ts";
 import { pool } from "./collect.ts";
 import { BLOCKED_LABEL, latestRuns, TRAIN_BRANCH } from "./apply.ts";
@@ -73,7 +73,8 @@ export async function addProgress(
   const get = async <T>(path: string): Promise<T | null> => {
     const headers: Record<string, string> = { accept: "application/vnd.github+json", "user-agent": "release-train" };
     const token = opts.accounts?.token(accountOfPath(path) ?? opts.owner) ?? opts.token;
-    if (token) headers["authorization"] = `Bearer ${token}`;
+    const authorization = authorizationOf(token);
+    if (authorization) headers["authorization"] = authorization;
     const res = await f(`${api}${path}`, { headers });
     return res.ok ? ((await res.json()) as T) : null;
   };

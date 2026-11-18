@@ -4,7 +4,7 @@
 import { realClock } from "@mark1russell7/service/clock";
 import { resetTime, spentLimit, type FetchFn } from "./collect.ts";
 import type { RateLimitRead } from "./github.ts";
-import { countedRequest, GITHUB_API, RateStop, type RateTracker } from "./meter.ts";
+import { countedRequest, credentialOf, GITHUB_API, RateStop, type RateTracker } from "./meter.ts";
 
 /**
  * The GitHub requests that one run of `apply` needs at its start. On 2026-11-15, 31 runs used 73 to 9,768 requests each.
@@ -85,6 +85,11 @@ export interface GateOptions {
    * first value: a window of the answers with fewer requests left comes first. Without it, the gate decides on the read.
    */
   tracker?: RateTracker;
+  /**
+   * The credential of the reads (`credentialOf` of meter.ts): the header `authorization` of their client. The gate adds the
+   * reads to the windows of this token, and it decides on the live budget of this token. The default is "": no token.
+   */
+  credential?: string;
   /** This function gives the current time, in milliseconds after the epoch. The default is `Date.now`. Tests give a fake clock. */
   now?: () => number;
   /** This function waits for a time in milliseconds. The default is {@link keepAliveSleep}. Tests give a wait that only moves a fake clock. */
@@ -138,8 +143,9 @@ export async function budgetGate(o: GateOptions): Promise<GateResult> {
       record: { outcome: "no read", need: o.need, left: null, reset: null, waitedMs: 0, note: "Rate budget: the read of the rate limit failed, so the run goes on." },
     };
   }
-  o.tracker?.seed(first);
-  const basis = o.tracker?.live(now()) ?? first;
+  const credential = o.credential ?? "";
+  o.tracker?.seed(first, credential);
+  const basis = o.tracker?.live(now(), credential) ?? first;
   const need = Math.min(o.need, basis.limit);
   const step = budgetStep(basis, o.need, now(), o.maxWaitMs, o.marginMs);
   const base = { need, left: basis.remaining, reset: basis.reset };
@@ -151,7 +157,7 @@ export async function budgetGate(o: GateOptions): Promise<GateResult> {
   }
   await sleep(step.ms);
   const after = await o.read();
-  if (after !== null) o.tracker?.seed(after);
+  if (after !== null) o.tracker?.seed(after, credential);
   const left = after === null ? "The read after the wait failed" : `Now ${after.remaining} requests are left`;
   const note = `${short} The run waited ${minutes(step.ms)} minutes for the reset at ${basis.reset}. ${left}, and the run goes on.`;
   return { read: after, record: { ...base, outcome: "waited", waitedMs: step.ms, note } };
@@ -165,10 +171,17 @@ export interface GuardOptions {
   /** The live budget. The meter of the run adds each answer to it (meter.ts). */
   tracker: RateTracker;
   /**
-   * The requests that the run needs at its start. Before each request, the requests that are left must cover this need
-   * minus the requests that the guard sent. With 0, only a spent window holds a request.
+   * The requests that the run needs at its start. Before each request, the requests left to its token must cover the share
+   * of the token in this need. The guard takes away the requests that it sent with the token. With 0, only a spent window
+   * holds a request.
    */
   need: number;
+  /**
+   * This function gives the share of the need for a credential (`credentialOf` of meter.ts), from 0 to 1. Each token has a
+   * rate limit of its own, so each token needs only its share (`needShares` of accounts.ts). The default gives each token the
+   * full need.
+   */
+  share?: (credential: string) => number;
   /** The longest wait for the reset, in milliseconds. */
   maxWaitMs: number;
   /** True when the run waited one time already, at the gate of its start. Then each shortage stops the run. */
@@ -211,8 +224,8 @@ export interface RateGuard {
  * This function makes the guard of the rate budget around a `fetch` function. It does the step of the gate for each
  * request of the run, on the live budget of the answers.
  *
- * - Before a request, the requests that are left must cover the need minus the requests that the guard sent. When too
- *   few are left, the guard waits for the reset, or it stops the run.
+ * - Before a request, the requests left to its token must cover the share of the token in the need. The guard takes away
+ *   the requests that it sent with the token. When too few are left, the guard waits for the reset, or it stops the run.
  * - GitHub can refuse a request with 403 or 429 and `x-ratelimit-remaining: 0`. Then the guard waits for the reset, and
  *   it sends the request again one time.
  * - The guard waits one time in a run, until the reset plus the margin. A second shortage, or a reset after the longest
@@ -270,28 +283,42 @@ export function rateGuard(inner: FetchFn, o: GuardOptions): RateGuard {
     return pause;
   };
 
-  // The step of the gate before a request, on the live budget.
-  const before = async (): Promise<void> => {
+  // The requests that the guard sent with each credential.
+  const sentBy = new Map<string, number>();
+  const count = (credential: string): void => {
+    record.sent += 1;
+    sentBy.set(credential, (sentBy.get(credential) ?? 0) + 1);
+  };
+
+  // The step of the gate before a request, on the live budget of the token of the request.
+  const before = async (credential: string): Promise<void> => {
     halted();
     if (pause !== null) await pause;
     halted();
-    const live = o.tracker.live(now());
+    const live = o.tracker.live(now(), credential);
     if (live === null) return;
-    const want = Math.max(1, Math.min(o.need, live.limit) - record.sent);
+    const share = Math.min(1, Math.max(0, o.share?.(credential) ?? 1));
+    const need = Math.ceil(o.need * share);
+    const want = Math.max(1, Math.min(need, live.limit) - (sentBy.get(credential) ?? 0));
     if (live.remaining >= want) return;
-    await shortage(Date.parse(live.reset), `Rate guard: ${live.remaining} requests are left until ${live.reset}, and the run needs ${want} more.`);
+    const many = new Set(o.tracker.windows().map((w) => w.token)).size > 1;
+    const cause = many
+      ? `Rate guard: ${live.remaining} requests of token ${o.tracker.token(credential)} are left until ${live.reset}, and its share of the run needs ${want} more.`
+      : `Rate guard: ${live.remaining} requests are left until ${live.reset}, and the run needs ${want} more.`;
+    await shortage(Date.parse(live.reset), cause);
   };
 
   const send: FetchFn = async (url, init) => {
     if (!countedRequest(url, init, apiBase)) return inner(url, init);
-    await before();
-    record.sent += 1;
+    const credential = credentialOf(init);
+    await before(credential);
+    count(credential);
     const res = await inner(url, init);
     const reset = spentLimit(res) ? resetTime(res.headers) : null;
     if (reset === null) return res;
     await shortage(reset, `Rate guard: GitHub refused a request, because the rate limit is spent until ${new Date(reset).toISOString()}.`);
-    await before();
-    record.sent += 1;
+    await before(credential);
+    count(credential);
     record.repeats += 1;
     const again = await inner(url, init);
     const second = spentLimit(again) ? resetTime(again.headers) : null;
