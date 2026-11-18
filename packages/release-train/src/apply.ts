@@ -3,7 +3,7 @@ import semver from "semver";
 import { accountFn, accountOfRepos, type AccountOf } from "./accounts.ts";
 import { candidateReader } from "./candidate-facts.ts";
 import type { CandidateTarget } from "./candidate-facts.ts";
-import { CANDIDATE_POLICY, bodyAttempt, bodyItems, candidateItems, decide, decideWith, markLines, modeFor, nextAttempt } from "./candidate-policy.ts";
+import { CANDIDATE_POLICY, bodyAttempt, bodyFiles, bodyItems, candidateItems, decide, decideWith, markLines, modeFor, nextAttempt, syncItems } from "./candidate-policy.ts";
 import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateKind, CandidateMode, CandidatePolicy, CandidateRule, DecideResult } from "./candidate-policy.ts";
 import { guardLine } from "./budget.ts";
 import { pool } from "./collect.ts";
@@ -1619,10 +1619,12 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   /** This function gives the mode of the candidate rules for a repository. The share uses the label of the log, so it reads no private name. */
   const modeOf = (repo: string, isPrivate: boolean): CandidateMode => modeFor(policy, label(repo, isPrivate));
   /** This function gives the marks of the candidate rules for the body of a pull request, or null in the mode `strict`. */
-  const marksOf = (mode: CandidateMode, attempt: number, items: readonly CandidateItem[] | null): TrailerMarks | null => {
+  const marksOf = (mode: CandidateMode, attempt: number, items: readonly CandidateItem[] | null, files: readonly CandidateItem[] | null = null): TrailerMarks | null => {
     if (mode === "strict") return null;
-    return { lines: markLines(items ? { attempt, items } : { attempt }), ...(mode === "one-candidate" ? { retryLabel: policy.retryLabel } : {}) };
+    return { lines: markLines({ attempt, ...(items ? { items } : {}), ...(files ? { files } : {}) }), ...(mode === "one-candidate" ? { retryLabel: policy.retryLabel } : {}) };
   };
+  /** This function gives the file changes of a sync result for the files mark and the plan of the candidate rules. */
+  const filesOfSync = (r: SyncResult): CandidateItem[] | null => syncItems(Object.keys(r.writes), r.removes, r.install);
 
   /**
    * This function reads the commits of the branch of an open pull request after the default branch. It gives a hold when a
@@ -1695,7 +1697,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       yieldMaxHours: YIELD_MAX_HOURS,
       plan,
       open: pr
-        ? { fingerprint: bodyFingerprint(pr.body), attempt: bodyAttempt(pr.body), items: bodyItems(pr.body), createdAt: pr.created_at ? Date.parse(pr.created_at) : null, retryLabel: hasLabel(pr, policy.retryLabel) }
+        ? { fingerprint: bodyFingerprint(pr.body), attempt: bodyAttempt(pr.body), items: kind === "sync" ? bodyFiles(pr.body) : bodyItems(pr.body), createdAt: pr.created_at ? Date.parse(pr.created_at) : null, retryLabel: hasLabel(pr, policy.retryLabel) }
         : null,
     };
     if (!read) {
@@ -2335,7 +2337,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
           return { wait: busy, cause: busy !== null ? "busy" : null };
         };
         const early = mode === "shadow" && !existing ? await waitOf() : null;
-        const step = await candidateStep(mode, "sync", commonOf(planned), target, meta, { fingerprint: planned.fingerprint, items: null }, false, record, early?.cause ?? null);
+        const step = await candidateStep(mode, "sync", commonOf(planned), target, meta, { fingerprint: planned.fingerprint, items: filesOfSync(planned) }, false, record, early?.cause ?? null);
         if (step.done) return;
         const act = step.act;
         const rebuild = act ? act.rebuild === true : await needsRebuild(repo, existing, meta.default_branch);
@@ -2394,7 +2396,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
           sha: r.sha,
           title: SYNC_TITLE,
           // Without a new clone, the body keeps the name of the tool that made the lockfile.
-          body: existing && r.status === "same" && r.tool === null && existing.body ? existing.body : syncPrBody(done, r.tool, rules, marksOf(mode, attemptOf(existing, done.fingerprint, pushed, act, record.facts?.ci?.state === "failed"), null)),
+          body: existing && r.status === "same" && r.tool === null && existing.body ? existing.body : syncPrBody(done, r.tool, rules, marksOf(mode, attemptOf(existing, done.fingerprint, pushed, act, record.facts?.ci?.state === "failed"), null, filesOfSync(done))),
           note: "",
           settle: act === null,
           ...(act?.removeLabel ? { removeLabel: policy.retryLabel } : {}),
