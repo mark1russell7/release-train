@@ -62,6 +62,33 @@ export function parseTokens(text: string | undefined): Record<string, string> {
 }
 
 /**
+ * This function gives the value of the header `authorization` for a token. No token gives "", and a request with "" sends
+ * no header. Each client of the train uses this function, so the rate budget finds the token of a request (meter.ts).
+ */
+export function authorizationOf(token: string | null | undefined): string {
+  return token ? `Bearer ${token}` : "";
+}
+
+/**
+ * This function gives the share of the need of a run for each credential (the header `authorization` of a request), from
+ * 0 to 1. The share of a credential is the share of the repositories of its accounts. Each token has a rate limit of its own,
+ * so each token needs only its share. An account with no token is in the share of the home token, because its client is the
+ * home client. A credential of no account has the share 0. An empty list gives each credential the share 1.
+ *
+ * @param repos - The repositories of the run, each with its account. A repository with no account is in the home account.
+ */
+export function needShares(accounts: Accounts, repos: readonly { account?: string }[]): (credential: string) => number {
+  const home = authorizationOf(accounts.token(accounts.home));
+  const counts = new Map<string, number>();
+  for (const r of repos) {
+    const token = accounts.token(r.account ?? accounts.home);
+    const credential = token === null ? home : authorizationOf(token);
+    counts.set(credential, (counts.get(credential) ?? 0) + 1);
+  }
+  return (credential) => (repos.length === 0 ? 1 : (counts.get(credential) ?? 0) / repos.length);
+}
+
+/**
  * This function gives the account of each repository from a list. A repository that the list does not have is in the home
  * account.
  */

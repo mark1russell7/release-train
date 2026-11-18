@@ -9,6 +9,7 @@ import {
   CLAUDE_LINE,
   COMPARE_FILES_MAX,
   MERGE_LABEL,
+  OTHERS_MARK,
   RENOVATE_REBASE_BOX,
   RUN_MS,
   TRAIN_BRANCH,
@@ -20,6 +21,8 @@ import {
   hashName,
   latestRuns,
   longestWaitFirst,
+  otherCommits,
+  othersText,
   plannedHooks,
   prBody,
   publicReport,
@@ -29,7 +32,7 @@ import {
   selectUpdates,
   updateFilesLine,
 } from "./apply.ts";
-import type { RepoUpdate, UpdateResult, Updater } from "./apply.ts";
+import type { CompareCommit, RepoUpdate, UpdateResult, Updater } from "./apply.ts";
 import { CANDIDATE_POLICY, shareOf } from "./candidate-policy.ts";
 import type { FetchFn } from "./collect.ts";
 import { gitHub } from "./github.ts";
@@ -2435,5 +2438,99 @@ describe("a stop of the guard in a run of apply", () => {
       throw new Error("example failure");
     });
     await expect(r).rejects.toThrow("example failure");
+  });
+});
+
+describe("a commit of another author on a train branch", () => {
+  const author = { name: "train-app[bot]", email: "1+train-app[bot]@users.noreply.github.com" };
+  const byTrain = (sha: string): CompareCommit => ({ sha, commit: { author: { name: author.name, email: author.email } }, author: { login: author.name } });
+  const byPerson = (sha: string): CompareCommit => ({ sha, commit: { author: { name: "A Person", email: "a.person@example.com" } }, author: { login: "a-person" } });
+
+  it("finds the commits that the train did not write, by the git email or the GitHub user", () => {
+    expect(otherCommits({ ahead_by: 2, commits: [byTrain("aaaaaaa1"), byPerson("bbbbbbb2")] }, author)).toEqual(["bbbbbbb by a-person"]);
+    // The email matches with no GitHub user (case ignored), and the GitHub user matches with another email.
+    const mixed = [{ sha: "c1", commit: { author: { email: author.email.toUpperCase() } }, author: null }, { sha: "c2", commit: { author: { email: "other@example.com" } }, author: { login: author.name } }];
+    expect(otherCommits({ ahead_by: 2, commits: mixed }, author)).toEqual([]);
+    expect(otherCommits({ ahead_by: 1, commits: [{ sha: "d1234567", commit: { author: { name: "Somebody", email: "s@example.com" } }, author: null }] }, author)).toEqual(["d123456 by Somebody"]);
+    // GitHub did not list each commit after the default branch, or gave no count.
+    expect(otherCommits({ ahead_by: 3, commits: [byTrain("a1")] }, author)).toBeNull();
+    expect(otherCommits({ commits: [] }, author)).toBeNull();
+  });
+
+  it("tells how to keep the commits or let the train build the branch again", () => {
+    const one = othersText(["bbbbbbb by a-person"], "main", CANDIDATE_POLICY.retryLabel);
+    expect(one).toContain("The branch has 1 commit that the train did not write (bbbbbbb by a-person).");
+    expect(one).toContain("It merges the pull request at green CI with them.");
+    expect(one).toContain(`add the label \`${CANDIDATE_POLICY.retryLabel}\``);
+    const two = othersText(["a by x", "b by y"], "main", null);
+    expect(two).toContain("2 commits");
+    expect(two).not.toContain("label");
+    expect(othersText(null, "main", null)).toMatch(/^GitHub did not list the commits of the branch after main/);
+  });
+
+  /** A run with an open pull request whose branch is 0 commits behind main and has a new plan, so the strict rule pushes. */
+  const run = async (commits: CompareCommit[] | null, opts: { ci?: "green" | "running"; comments?: { body: string }[]; dryRun?: boolean } = {}) => {
+    const s = server({
+      ...green,
+      ...(opts.ci === "running" ? { [`GET ${base}/secret-repo/commits/sha7/check-runs`]: () => [200, { check_runs: [{ status: "in_progress", conclusion: null }] }] as [number, unknown] } : {}),
+      [`GET ${base}/secret-repo/compare/main...sha7`]: () => (commits ? [200, { behind_by: 0, ahead_by: commits.length, commits }] : [404, { message: "Not Found" }]),
+      [`GET ${base}/secret-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo")] : []],
+      [`GET ${base}/secret-repo/pulls/7`]: () => [200, { ...pull(7, "secret-repo"), mergeable: true }],
+      [`PATCH ${base}/secret-repo/pulls/7`]: (b) => [200, { ...pull(7, "secret-repo"), ...b }],
+      [`GET ${base}/secret-repo`]: meta,
+      [`POST ${base}/secret-repo/labels`]: () => [201, {}],
+      [`GET ${base}/secret-repo/issues/7/comments`]: () => [200, opts.comments ?? []],
+      [`POST ${base}/secret-repo/issues/7/comments`]: () => [201, {}],
+      [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
+      [`DELETE ${base}/secret-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+    });
+    const up = updater();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh: s.gh, updater: up, dryRun: opts.dryRun ?? false, only: ["secret-repo"], candidatePolicy: SHADOW, author });
+    const posted = s.calls.filter((c) => c.method === "POST" && c.path === `${base}/secret-repo/issues/7/comments`);
+    return { r, up, calls: s.calls, posted };
+  };
+
+  it("does not push to a branch with a commit of a person, writes one comment for each head, and waits for CI", async () => {
+    const held = await run([byTrain("aaaaaaa1"), byPerson("bbbbbbb2")], { ci: "running" });
+    expect(held.up.seen).toEqual([]);
+    expect(held.r.results[0]).toMatchObject({ state: "waiting", autoMerge: "train" });
+    expect(held.r.results[0]?.detail).toContain("The branch has 1 commit that the train did not write (bbbbbbb by a-person).");
+    expect(held.posted).toHaveLength(1);
+    const body = String(held.posted[0]?.body?.["body"]);
+    expect(body).toContain(`${OTHERS_MARK} sha7 -->`);
+    expect(body).toContain(CLAUDE_LINE);
+    expect(held.calls.some((c) => c.method === "PUT")).toBe(false);
+    // The next run finds the comment of this head and writes no second one.
+    const again = await run([byTrain("aaaaaaa1"), byPerson("bbbbbbb2")], { ci: "running", comments: [{ body }] });
+    expect(again.up.seen).toEqual([]);
+    expect(again.posted).toEqual([]);
+  });
+
+  it("merges a green branch with the commit of a person, with no push", async () => {
+    const merged = await run([byPerson("bbbbbbb2")], { ci: "green" });
+    expect(merged.up.seen).toEqual([]);
+    expect(merged.r.results[0]).toMatchObject({ state: "merged", ci: "green" });
+    expect(merged.calls.find((c) => c.method === "PUT")?.body).toEqual({ merge_method: "merge", sha: "sha7" });
+  });
+
+  it("pushes to a branch with only commits of the train, and reads no comments", async () => {
+    const pushed = await run([byTrain("aaaaaaa1"), byTrain("ccccccc3")], { ci: "running" });
+    expect(pushed.up.seen).toHaveLength(1);
+    expect(pushed.r.results[0]?.state).toBe("updated");
+    expect(pushed.calls.some((c) => c.path.startsWith(`${base}/secret-repo/issues/7/comments`))).toBe(false);
+  });
+
+  it("does not push when GitHub does not list the commits, and writes no comment", async () => {
+    const unread = await run(null, { ci: "running" });
+    expect(unread.up.seen).toEqual([]);
+    expect(unread.r.results[0]?.detail).toMatch(/GitHub did not list the commits of the branch after main/);
+    expect(unread.posted).toEqual([]);
+  });
+
+  it("writes nothing in a dry run", async () => {
+    const dry = await run([byPerson("bbbbbbb2")], { ci: "green", dryRun: true });
+    expect(dry.up.seen).toEqual([]);
+    expect(dry.r.results[0]).toMatchObject({ state: "waiting" });
+    expect(dry.calls.every((c) => c.method === "GET")).toBe(true);
   });
 });

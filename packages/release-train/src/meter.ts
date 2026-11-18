@@ -220,11 +220,50 @@ const WINDOW_SLACK_S = 60;
 /** The largest count of jumps in the record. */
 export const JUMP_COUNT = 5;
 
-/** One read of the headers of an answer: the time in ms, the used count and the reset in s. */
+/** One read of the headers of an answer: the time in ms, the used count, the reset in s and the token of the request. */
 interface UsedSample {
   at: number;
   used: number;
   reset: number;
+  /** The value of `x-ratelimit-remaining`, or null when the answer does not have it. Absent: not known. */
+  remaining?: number | null;
+  /** The number of the token of the request (`RateTracker.token`). Absent: the token 0. */
+  token?: number;
+}
+
+/** The key of the window of a read: the number of the token, the reset in s, and the limit or null. */
+interface WindowKey {
+  token: number;
+  reset: number;
+  /** The sum of the used count and the remaining count, or null when the read has no remaining count. */
+  limit: number | null;
+}
+
+/**
+ * This function tells if two reads are of one window of the rate limit. A window holds the reads of one token, with one
+ * limit, whose resets are in one minute. A read with no limit fits each limit. Each token has a rate limit of its own. The
+ * first requests of a run start the hour of each token, so the resets of two tokens can be some seconds apart. On
+ * 2026-11-18 the reads of two tokens had resets in 3 s, and one window of all reads gave 1,666 requests left. No window of
+ * one limit had fewer than 4,900 left (Train 44205603365).
+ */
+function sameWindow(a: WindowKey, b: WindowKey): boolean {
+  return a.token === b.token && Math.abs(a.reset - b.reset) <= WINDOW_SLACK_S && (a.limit === null || b.limit === null || a.limit === b.limit);
+}
+
+/** This function gives the key of the window of a sample. */
+const keyOf = (s: UsedSample): WindowKey => ({ token: s.token ?? 0, reset: s.reset, limit: s.remaining == null ? null : s.used + s.remaining });
+
+/**
+ * This function gives the credential of a request: the value of its header `authorization`, or "" when it has none. The
+ * tracker keeps the windows of each credential apart, because each token has a rate limit of its own.
+ */
+export function credentialOf(init?: RequestInit): string {
+  if (init?.headers === undefined) return "";
+  try {
+    return new Headers(init.headers).get("authorization") ?? "";
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -238,6 +277,8 @@ export interface MeterSample extends UsedSample {
   status: number;
   /** The route template of the request. It holds no name. */
   route: string;
+  /** The number of the token of the request (`RateTracker.token`). It holds no part of the token. */
+  token: number;
 }
 
 /** The largest count of samples that a meter keeps. A run that has more keeps the first ones and counts the others. */
@@ -280,7 +321,7 @@ export function outsideUse(samples: readonly UsedSample[]): OutsideUse {
   const sorted = [...samples].sort((a, b) => a.at - b.at || a.used - b.used);
   const windows: UsedSample[][] = [];
   for (const sample of sorted) {
-    const open = windows.find((w) => Math.abs(sample.reset - (w[0]?.reset ?? sample.reset)) <= WINDOW_SLACK_S);
+    const open = windows.find((w) => w[0] !== undefined && sameWindow(keyOf(sample), keyOf(w[0])));
     if (open) open.push(sample);
     else windows.push([sample]);
   }
@@ -301,14 +342,14 @@ export function outsideUse(samples: readonly UsedSample[]): OutsideUse {
 }
 
 /** This function gives the sample of an answer, or null when the answer has no header of the rate limit of `core`. */
-function sampleOf(res: Response, at: number, route: string): MeterSample | null {
+function sampleOf(res: Response, at: number, route: string, token: number): MeterSample | null {
   const resource = res.headers.get("x-ratelimit-resource");
   if (resource !== null && resource !== "core") return null;
   const used = res.headers.get("x-ratelimit-used");
   const reset = res.headers.get("x-ratelimit-reset");
   if (used === null || reset === null || !/^\d+$/.test(used.trim()) || !/^\d+$/.test(reset.trim())) return null;
   const left = res.headers.get("x-ratelimit-remaining")?.trim() ?? "";
-  return { at, used: Number(used), reset: Number(reset), remaining: /^\d+$/.test(left) ? Number(left) : null, status: res.status, route };
+  return { at, used: Number(used), reset: Number(reset), remaining: /^\d+$/.test(left) ? Number(left) : null, status: res.status, route, token };
 }
 
 /** This function gives the message of a refusal from a copy of the answer, so the caller can still read the body. */
@@ -323,9 +364,11 @@ async function refusalMessage(res: Response): Promise<string> {
 
 /** One window of the rate limit in the live budget. */
 export interface RateWindow {
+  /** The number of the token of the window (`RateTracker.token`). */
+  token: number;
   /** The reset of the window, in seconds after the epoch. It is the reset of the first read of the window. */
   reset: number;
-  /** The limit of the window: the lowest sum of the used count and the remaining count of its reads. */
+  /** The limit of the window: the sum of the used count and the remaining count of its first read. */
   limit: number;
   /** The highest used count of the reads of the window. */
   used: number;
@@ -343,9 +386,10 @@ export interface RateRead {
  * The live budget of the rate limit of `core`. It takes the used count, the remaining count and the reset of each answer
  * and of each read of `GET /rate_limit`.
  *
- * - A window holds the reads whose reset is in one minute of its reset, as `outsideUse` groups them. It keeps the highest
- *   used count, so a stale read cannot raise the budget of its window again.
- * - The live budget is the window with the fewest requests left, of the windows that have not reset.
+ * - A window holds the reads of one token with one limit, whose reset is in one minute of its reset, as `outsideUse` groups
+ *   them. It keeps the highest used count, so a stale read cannot raise the budget of its window again.
+ * - The live budget of a token is the window of the token with the fewest requests left, of the windows that have not
+ *   reset. The guard of a request decides on the live budget of the token of the request (budget.ts).
  *
  * On 2026-11-16, the first read of a new token gave 276 used, with the reset 18:14:29Z. The first 8 answers gave 277 to
  * 284 used, with the reset 18:14:28Z. From answer 9, the answers gave the true window: 9,246 to 10,250 used, with the reset
@@ -353,47 +397,65 @@ export interface RateRead {
  * read cannot raise the budget while the true window is live.
  */
 export interface RateTracker {
-  /** This function adds the read of an answer. */
-  observe(read: RateRead): void;
-  /** This function adds a read of `GET /rate_limit`. */
-  seed(read: RateLimitRead): void;
-  /** This function gives the live budget at a time in milliseconds after the epoch, or null when no window is live. */
-  live(now: number): RateLimitRead | null;
+  /** This function adds the read of an answer to a request with a credential (`credentialOf`). The default is "": no token. */
+  observe(read: RateRead, credential?: string): void;
+  /** This function adds a read of `GET /rate_limit` with a credential. The default is "": no token. */
+  seed(read: RateLimitRead, credential?: string): void;
+  /**
+   * This function gives the live budget at a time in milliseconds after the epoch, or null when no window is live. With a
+   * credential, it is the live budget of the token of the credential. With no credential, it is the window of all tokens
+   * with the fewest requests left.
+   */
+  live(now: number, credential?: string): RateLimitRead | null;
   /** This function gives a copy of the windows, with the earliest reset first. */
   windows(): RateWindow[];
+  /**
+   * This function gives the number of the token of a credential. The first credential of the tracker has 0, and the next
+   * one has 1. The number holds no part of the credential, so a report can show it.
+   */
+  token(credential: string): number;
 }
 
 /** This function makes an empty tracker of the live budget. */
 export function rateTracker(): RateTracker {
   const windows: RateWindow[] = [];
-  const observe = (read: RateRead): void => {
-    const known = windows.find((w) => Math.abs(read.reset - w.reset) <= WINDOW_SLACK_S);
-    const limit = read.remaining === null ? (known?.limit ?? null) : read.used + read.remaining;
+  const tokens = new Map<string, number>();
+  const token = (credential: string): number => {
+    const known = tokens.get(credential);
+    if (known !== undefined) return known;
+    tokens.set(credential, tokens.size);
+    return tokens.size - 1;
+  };
+  const observe = (read: RateRead, credential = ""): void => {
+    const key: WindowKey = { token: token(credential), reset: read.reset, limit: read.remaining === null ? null : read.used + read.remaining };
+    const known = windows.find((w) => sameWindow(key, w));
+    const limit = key.limit ?? known?.limit ?? null;
     if (limit === null) return;
     if (known === undefined) {
-      windows.push({ reset: read.reset, limit, used: read.used });
+      windows.push({ token: key.token, reset: read.reset, limit, used: read.used });
       return;
     }
     known.used = Math.max(known.used, read.used);
-    known.limit = Math.min(known.limit, limit);
   };
   return {
     observe,
-    seed: (read) => {
+    seed: (read, credential) => {
       const reset = Date.parse(read.reset);
-      if (Number.isFinite(reset)) observe({ used: read.used, remaining: read.remaining, reset: Math.floor(reset / 1000) });
+      if (Number.isFinite(reset)) observe({ used: read.used, remaining: read.remaining, reset: Math.floor(reset / 1000) }, credential);
     },
-    live: (now) => {
+    live: (now, credential) => {
+      const only = credential === undefined ? null : (tokens.get(credential) ?? -1);
       let low: RateWindow | null = null;
       for (const w of windows) {
-        if (w.reset * 1000 <= now) continue;
+        if (w.reset * 1000 <= now || (only !== null && w.token !== only)) continue;
         const left = w.limit - w.used;
         if (low === null || left < low.limit - low.used || (left === low.limit - low.used && w.reset < low.reset)) low = w;
       }
       if (low === null) return null;
       return { limit: low.limit, used: low.used, remaining: Math.max(0, low.limit - low.used), reset: new Date(low.reset * 1000).toISOString() };
     },
-    windows: () => windows.map((w) => ({ ...w })).sort((a, b) => a.reset - b.reset),
+    windows: () => windows.map((w) => ({ ...w })).sort((a, b) => a.reset - b.reset || a.token - b.token),
+    token,
   };
 }
 
@@ -462,8 +524,9 @@ export function requestMeter(inner?: FetchFn, apiBase: string = GITHUB_API, now:
       }
       add(route, res.status);
       const at = now();
-      const sample = sampleOf(res, at, route);
-      if (sample) rate.observe(sample);
+      const credential = credentialOf(init);
+      const sample = sampleOf(res, at, route, rate.token(credential));
+      if (sample) rate.observe(sample, credential);
       if (sample && samples.length < SAMPLE_MAX) samples.push(sample);
       if (res.status === 403 || res.status === 429) {
         const kind = refusalKind(res.status, res.headers, await refusalMessage(res));
