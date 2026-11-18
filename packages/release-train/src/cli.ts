@@ -4,7 +4,7 @@ import { extensionFaults, holdsOfFile, readHolds } from "./holds.ts";
 import type { HoldReading, LagHold } from "./holds.ts";
 import { applyHolds, lagOver, lagReport, lagSummary } from "./lag.ts";
 import type { LagReport } from "./lag.ts";
-import { accountOfRepos, parseTokens, runAccounts, type Accounts } from "./accounts.ts";
+import { accountOfRepos, authorizationOf, needShares, parseTokens, runAccounts, type Accounts } from "./accounts.ts";
 import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pendingVersions, publicReport } from "./apply.ts";
 import type { ApplyReport } from "./apply.ts";
 import { budgetGate, DEFAULT_NEED, DEFAULT_WAIT_MINUTES, goOnUrgent, rateGuard } from "./budget.ts";
@@ -516,6 +516,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       maxWaitMs: o.rateWait * 60_000,
       read: () => readRateLimit(gh0),
       tracker: meter.rate,
+      credential: authorizationOf(tok),
       ...(deps.now ? { now: deps.now } : {}),
       ...(deps.sleep ? { sleep: deps.sleep } : {}),
     });
@@ -539,11 +540,16 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       gateRecord = goOnUrgent(gateRecord);
       log(gateRecord.note);
     }
-    // The guard checks each request after the gate on the live budget. An urgent run needs no budget, only a window
-    // that is not spent. A run that waited at the gate does not wait again (budget.ts).
+    // The share of the need of each token. Before the lists of the repositories, the home token has the full need, as at the
+    // gate, and each other token needs only a window that is not spent. The lists give the share of each account.
+    const home = authorizationOf(tok);
+    let shareOf = (credential: string): number => (credential === home ? 1 : 0);
+    // The guard checks each request after the gate on the live budget of its token. An urgent run needs no budget, only a
+    // window that is not spent. A run that waited at the gate does not wait again (budget.ts).
     const guard = rateGuard(meter.fetch, {
       tracker: meter.rate,
       need: gateRecord.outcome === "urgent" ? 0 : o.rateNeed,
+      share: (credential) => shareOf(credential),
       maxWaitMs: o.rateWait * 60_000,
       waited: gateRecord.outcome === "waited",
       log,
@@ -577,7 +583,10 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       accounts,
       fetch: guard.fetch,
       log,
-      onRepos: (repos) => hide(repos.filter((r) => r.private).map((r) => r.name)),
+      onRepos: (repos) => {
+        hide(repos.filter((r) => r.private).map((r) => r.name));
+        shareOf = needShares(accounts, repos);
+      },
       ...(read ? { npmTimes: read.state.npm } : {}),
     });
     // The collection turns a failed read of a repository into a warning, so a stop of the guard can end it without a throw.

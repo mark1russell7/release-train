@@ -6,6 +6,7 @@ import { gitHub, readRateLimit } from "./github.ts";
 import type { RateLimitRead } from "./github.ts";
 import {
   countedRequest,
+  credentialOf,
   DISAGREE_MIN,
   JUMP_MIN,
   outsideLine,
@@ -263,6 +264,17 @@ describe("the outside use of the rate limit", () => {
       }),
     );
   });
+
+  it("keeps the samples of each token, and of each limit, in windows of their own", () => {
+    const samples = [
+      { at: 1, used: 10, remaining: 10_290, reset: RESET, token: 0 },
+      { at: 2, used: 3000, remaining: 2000, reset: RESET + 2, token: 1 },
+      { at: 3, used: 11, remaining: 10_289, reset: RESET, token: 0 },
+      { at: 4, used: 3001, remaining: 1999, reset: RESET + 2, token: 1 },
+      { at: 5, used: 400, remaining: 4600, reset: RESET + 3, token: 0 },
+    ];
+    expect(outsideUse(samples)).toEqual({ requests: 0, answers: 5, windows: 3, jumps: [] });
+  });
 });
 
 describe("the evidence of the rate limit: samples, refusals and the two reads", () => {
@@ -286,10 +298,27 @@ describe("the evidence of the rate limit: samples, refusals and the two reads", 
     await meter.fetch(`${API}/repos/secret-owner/secret-repo/contents/a/b.json`);
     await meter.fetch(`${API}/graphql`, { method: "POST" });
     expect(meter.samples()).toEqual([
-      { at: Date.parse("2026-11-16T04:52:01Z"), used: 10, reset: RESET, remaining: 90, status: 200, route: "GET /repos/{owner}/{repo}/pulls/{number}" },
-      { at: Date.parse("2026-11-16T04:52:02Z"), used: 11, reset: RESET, remaining: 89, status: 404, route: "GET /repos/{owner}/{repo}/contents/{path}" },
+      { at: Date.parse("2026-11-16T04:52:01Z"), used: 10, reset: RESET, remaining: 90, status: 200, route: "GET /repos/{owner}/{repo}/pulls/{number}", token: 0 },
+      { at: Date.parse("2026-11-16T04:52:02Z"), used: 11, reset: RESET, remaining: 89, status: 404, route: "GET /repos/{owner}/{repo}/contents/{path}", token: 0 },
     ]);
     expect(JSON.stringify(meter.samples())).not.toMatch(/secret/);
+  });
+
+  it("gives each sample the number of its token, and keeps the live budget of each token apart", async () => {
+    const f: FetchFn = async (_url, init) =>
+      credentialOf(init) === "Bearer secret-home"
+        ? answer(200, { "x-ratelimit-used": "3348", "x-ratelimit-remaining": "6952", "x-ratelimit-reset": String(RESET) })
+        : answer(200, { "x-ratelimit-used": "72", "x-ratelimit-remaining": "4928", "x-ratelimit-reset": String(RESET + 3) });
+    const meter = requestMeter(f, API, ticks());
+    await meter.fetch(`${API}/repos/o/r`, { headers: { authorization: "Bearer secret-home" } });
+    await meter.fetch(`${API}/repos/p/q`, { headers: { authorization: "Bearer secret-other" } });
+    await meter.fetch(`${API}/repos/o/s`, { headers: { authorization: "Bearer secret-home" } });
+    expect(meter.samples().map((s) => s.token)).toEqual([0, 1, 0]);
+    const at = Date.parse("2026-11-16T05:00:00Z");
+    expect(meter.rate.live(at, "Bearer secret-home")?.remaining).toBe(6952);
+    expect(meter.rate.live(at, "Bearer secret-other")?.remaining).toBe(4928);
+    expect(meter.outside()).toMatchObject({ windows: 2, jumps: [] });
+    expect(JSON.stringify([meter.samples(), meter.rate.windows()])).not.toMatch(/secret/);
   });
 
   it("keeps at most SAMPLE_MAX samples", async () => {
@@ -429,18 +458,34 @@ describe("rateTracker", () => {
     rate.observe({ used: 480, remaining: 9770, reset: RESET });
     // An answer with no remaining count takes the limit of its window. Its reset is 30 s later, inside the same window.
     rate.observe({ used: 490, remaining: null, reset: RESET + 30 });
-    expect(rate.windows()).toEqual([{ reset: RESET, limit: 10_250, used: 500 }]);
+    expect(rate.windows()).toEqual([{ token: 0, reset: RESET, limit: 10_250, used: 500 }]);
     expect(rate.live(BEFORE)).toEqual({ limit: 10_250, used: 500, remaining: 9750, reset: new Date(RESET * 1000).toISOString() });
   });
 
-  it("keeps the lowest limit of a window, and skips an answer with no remaining count and no known window", () => {
+  it("keeps a window for each limit, and skips an answer with no remaining count and no known window", () => {
     const rate = rateTracker();
     rate.observe({ used: 7, remaining: null, reset: RESET });
     expect(rate.windows()).toEqual([]);
     expect(rate.live(BEFORE)).toBeNull();
     rate.observe({ used: 10, remaining: 4990, reset: RESET });
     rate.observe({ used: 11, remaining: 10_239, reset: RESET });
-    expect(rate.live(BEFORE)).toMatchObject({ limit: 5000, used: 11, remaining: 4989 });
+    // The lowest limit with the highest used count of the two windows gave 4989 left, and no window has that budget.
+    expect(rate.windows()).toEqual([
+      { token: 0, reset: RESET, limit: 5000, used: 10 },
+      { token: 0, reset: RESET, limit: 10_250, used: 11 },
+    ]);
+    expect(rate.live(BEFORE)).toMatchObject({ limit: 5000, used: 10, remaining: 4990 });
+  });
+
+  it("gives the live budget of one token, and no budget for a credential with no read", () => {
+    const rate = rateTracker();
+    rate.seed({ limit: 5000, used: 4990, remaining: 10, reset: new Date(RESET * 1000).toISOString() }, "Bearer a");
+    rate.observe({ used: 5, remaining: 9995, reset: RESET }, "Bearer b");
+    expect(rate.live(BEFORE, "Bearer a")?.remaining).toBe(10);
+    expect(rate.live(BEFORE, "Bearer b")?.remaining).toBe(9995);
+    expect(rate.live(BEFORE, "Bearer c")).toBeNull();
+    expect(rate.live(BEFORE)?.remaining).toBe(10);
+    expect([rate.token("Bearer a"), rate.token("Bearer b"), rate.token("Bearer c"), rate.token("Bearer a")]).toEqual([0, 1, 2, 0]);
   });
 
   it("skips a seed with a reset that is not a time", () => {
@@ -463,6 +508,51 @@ describe("rateTracker", () => {
     const rate = rateTracker();
     rate.observe({ used: 9000, remaining: 1250, reset: RESET });
     expect(rate.live(RESET * 1000)).toBeNull();
+  });
+});
+
+describe("credentialOf", () => {
+  it("gives the header authorization of each form of the headers, and an empty text with no header", () => {
+    expect(credentialOf({ headers: { Authorization: "Bearer a" } })).toBe("Bearer a");
+    expect(credentialOf({ headers: new Headers({ authorization: "Bearer b" }) })).toBe("Bearer b");
+    expect(credentialOf({ headers: [["authorization", "Bearer c"]] })).toBe("Bearer c");
+    expect(credentialOf({ headers: { accept: "application/json" } })).toBe("");
+    expect(credentialOf({ method: "GET" })).toBe("");
+    expect(credentialOf()).toBe("");
+  });
+});
+
+// The resets, the limits and the used counts of the answers of Train 44205603365 (2026-11-18 00:11Z), a run with two
+// tokens. The report does not tell the token of each answer, so these tests give the windows with the limit 5000 to the
+// second token. The false stops started with the second token of the run.
+describe("the live budget of the answers of Train 44205603365", () => {
+  const AT = Date.parse("2026-11-18T00:11:18Z");
+  const HOME = "Bearer home-token";
+  const OTHER = "Bearer other-token";
+  // The credential, the used count, the limit and the reset of each answer.
+  const answers: [string, number, number, number][] = [
+    [HOME, 60, 10_300, 1_794_963_181],
+    [HOME, 69, 10_300, 1_794_963_181],
+    [OTHER, 1, 5000, 1_794_964_276],
+    [OTHER, 10, 5000, 1_794_964_276],
+    [HOME, 3321, 10_300, 1_794_963_183],
+    [HOME, 3348, 10_300, 1_794_963_183],
+    [OTHER, 67, 5000, 1_794_963_184],
+    [OTHER, 72, 5000, 1_794_963_184],
+  ];
+
+  it("keeps the windows of each token apart, so a token does not take the limit of the other token", () => {
+    const rate = rateTracker();
+    for (const [credential, used, limit, reset] of answers) rate.observe({ used, remaining: limit - used, reset }, credential);
+    expect(rate.live(AT, HOME)).toEqual({ limit: 10_300, used: 3348, remaining: 6952, reset: "2026-11-18T00:53:01.000Z" });
+    expect(rate.live(AT, OTHER)).toEqual({ limit: 5000, used: 72, remaining: 4928, reset: "2026-11-18T00:53:04.000Z" });
+    // With one window for all answers, the budget was 5000 - 3348 = 1652, and the guard stopped the run.
+    expect(rate.live(AT)?.remaining).toBe(4928);
+    expect(rate.windows().map((w) => [w.token, w.limit, w.used])).toEqual([
+      [0, 10_300, 3348],
+      [1, 5000, 72],
+      [1, 5000, 10],
+    ]);
   });
 });
 
@@ -496,12 +586,12 @@ describe("the live budget of the answers of Train 43920794285", () => {
   it("(1) takes the start read and 8 stale answers as one window, and the true window from answer 9", async () => {
     const stale = await after(8);
     // The resets of the start read and the stale answers differ by 1 s, so they are one window.
-    expect(stale.rate.windows()).toEqual([{ reset: STALE + 1, limit: LIMIT, used: 284 }]);
+    expect(stale.rate.windows()).toEqual([{ token: 0, reset: STALE + 1, limit: LIMIT, used: 284 }]);
     expect(stale.rate.live(ANSWER_9)).toEqual(STALE_LIVE);
     const live = await after(9);
     expect(live.rate.windows()).toEqual([
-      { reset: TRUE, limit: LIMIT, used: 9246 },
-      { reset: STALE + 1, limit: LIMIT, used: 284 },
+      { token: 0, reset: TRUE, limit: LIMIT, used: 9246 },
+      { token: 0, reset: STALE + 1, limit: LIMIT, used: 284 },
     ]);
     // The true window has the fewest requests left, so it is the live budget.
     expect(live.rate.live(ANSWER_9)).toEqual(TRUE_LIVE);

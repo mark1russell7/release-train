@@ -1,4 +1,4 @@
-import { accountOfPath, repositoryIdOf, type Accounts } from "./accounts.ts";
+import { accountOfPath, authorizationOf, repositoryIdOf, type Accounts } from "./accounts.ts";
 import { nextLink } from "./collect.ts";
 import type { FetchFn, PageRead } from "./collect.ts";
 import type { GateRecord, GuardRecord } from "./budget.ts";
@@ -41,7 +41,8 @@ export function gitHub(opts: { token: string | null; fetch?: FetchFn; apiBase?: 
       "user-agent": "release-train",
       "content-type": "application/json",
     };
-    if (opts.token) h["authorization"] = `Bearer ${opts.token}`;
+    const authorization = authorizationOf(opts.token);
+    if (authorization) h["authorization"] = authorization;
     return h;
   };
   return {

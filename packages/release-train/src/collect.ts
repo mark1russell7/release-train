@@ -1,6 +1,6 @@
 import { retry, retryAfterDelay, type Clock } from "@mark1russell7/service";
 import type { Backoff } from "@mark1russell7/service/backoff";
-import { accountOfPath, repositoryIdOf, runAccounts, type Accounts } from "./accounts.ts";
+import { accountOfPath, authorizationOf, repositoryIdOf, runAccounts, type Accounts } from "./accounts.ts";
 import { attestationsUrl, workflowProvenance, type Attestations } from "./attest.ts";
 import { RateStop } from "./meter.ts";
 import { DEP_TYPES } from "./types.ts";
@@ -33,7 +33,7 @@ export interface CollectOptions {
   registryBase?: string;
   log?: (line: string) => void;
   /** The collector gives the list of repositories to this function before it reads them, for example to hide private names. */
-  onRepos?: (repos: readonly { name: string; private: boolean }[]) => void;
+  onRepos?: (repos: readonly { name: string; private: boolean; account: string }[]) => void;
   /** These options control the retries of the GitHub reads. */
   retry?: RetryOptions;
   /**
@@ -402,8 +402,8 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   const ids = new Map<number, string>();
   const ghHeaders = (accept: string, account: string): Record<string, string> => {
     const h: Record<string, string> = { accept, "x-github-api-version": "2022-11-28", "user-agent": "release-train" };
-    const token = tokenOf(account);
-    if (token) h["authorization"] = `Bearer ${token}`;
+    const authorization = authorizationOf(tokenOf(account));
+    if (authorization) h["authorization"] = authorization;
     return h;
   };
 
@@ -443,7 +443,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   const listed = await listAccounts(accounts, (account) => <T,>(url: string) => ghJson<T>(url, account), { publicOnly, log });
   const ghRepos = listed.repos;
   for (const r of ghRepos) accountOf.set(r.name, r.account);
-  opts.onRepos?.(ghRepos.map((r) => ({ name: r.name, private: r.private })));
+  opts.onRepos?.(ghRepos.map((r) => ({ name: r.name, private: r.private, account: r.account })));
   log(`repositories: ${ghRepos.length}${listed.noRead.length > 0 ? `, no read of the accounts ${listed.noRead.join(", ")}` : ""}`);
 
   // Phase 1: the manifests of each repository.

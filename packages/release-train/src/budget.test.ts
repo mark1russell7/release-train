@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { budgetGate, budgetStep, DEFAULT_NEED, goOnUrgent, guardLine, RESET_MARGIN_MS, RETRY_MARGIN_MS, rateGuard } from "./budget.ts";
 import type { FetchFn } from "./collect.ts";
 import type { RateLimitRead } from "./github.ts";
-import { RateStop, rateTracker, requestMeter } from "./meter.ts";
+import { credentialOf, RateStop, rateTracker, requestMeter } from "./meter.ts";
 import { UNSETTLED } from "./run-command.ts";
 
 const NOW = Date.parse("2026-11-15T12:00:00Z");
@@ -166,6 +166,17 @@ describe("budgetGate on a live budget", () => {
     expect(gate.record).toMatchObject({ outcome: "waited", left: 250, reset: "2026-11-15T12:10:00.000Z", waitedMs: 10 * MINUTE + RESET_MARGIN_MS });
     expect(time.sleeps).toEqual([10 * MINUTE + RESET_MARGIN_MS]);
     expect(tracker.windows()).toHaveLength(2);
+  });
+
+  it("decides on the windows of its credential only: a short window of another token does not hold the run", async () => {
+    const time = fakeTime();
+    const tracker = rateTracker();
+    tracker.observe({ used: 4990, remaining: 10, reset: (NOW + 10 * MINUTE) / 1000 }, "Bearer other-token");
+    const start = readOf(9000, 34, LIMIT);
+    const gate = await budgetGate({ need: 6000, maxWaitMs: MAX_WAIT, read: reads(start).read, tracker, credential: "Bearer home-token", now: time.now, sleep: time.sleep });
+    expect(gate.record).toMatchObject({ outcome: "go", left: 9000 });
+    expect(time.sleeps).toEqual([]);
+    expect(tracker.live(NOW, "Bearer home-token")?.remaining).toBe(9000);
   });
 });
 
@@ -388,5 +399,57 @@ describe("rateGuard on the answers of Train 43920794285", () => {
     const error = await rejection(guard.fetch(PULL(3)));
     expect((error as RateStop).reset).toBe("2026-11-16T18:14:29.000Z");
     expect(api.count()).toBe(2);
+  });
+});
+
+// The windows of Train 44205603365, a run with two tokens: the home token has 6952 requests left, and the other token has
+// 4928. With one window for the answers of both tokens, the guard saw 1652 and stopped the run.
+describe("rateGuard on the answers of Train 44205603365", () => {
+  const AT = Date.parse("2026-11-18T00:11:18Z");
+  const HOME = { authorization: "Bearer home-token" };
+  const OTHER = { authorization: "Bearer other-token" };
+  const pull = (owner: string, n: number): string => `${API}/repos/${owner}/example-repo/pulls/${n}`;
+  const answerOf2 = async (_url: string, init?: RequestInit): Promise<Response> => {
+    const [used, limit, reset] = credentialOf(init) === HOME.authorization ? [3348, 10_300, 1_794_963_183] : [72, 5000, 1_794_963_184];
+    return new Response("{}", { status: 200, headers: { "x-ratelimit-used": String(used), "x-ratelimit-remaining": String(limit - used), "x-ratelimit-reset": String(reset) } });
+  };
+  const run = (share?: (credential: string) => number) => {
+    const lines: string[] = [];
+    const meter = requestMeter(answerOf2, API, () => AT);
+    const guard = rateGuard(meter.fetch, {
+      tracker: meter.rate,
+      need: DEFAULT_NEED,
+      maxWaitMs: MAX_WAIT,
+      now: () => AT,
+      sleep: async () => {},
+      log: (line) => lines.push(line),
+      ...(share ? { share } : {}),
+    });
+    return { guard, lines };
+  };
+
+  it("goes on when each token covers its share of the need", async () => {
+    const { guard, lines } = run((credential) => (credential === HOME.authorization ? 126 / 129 : 3 / 129));
+    for (let i = 1; i <= 3; i++) {
+      await guard.fetch(pull("home-owner", i), { headers: HOME });
+      await guard.fetch(pull("other-owner", i), { headers: OTHER });
+    }
+    expect(guard.stopped()).toBeNull();
+    expect(lines).toEqual([]);
+    expect(guard.record()).toMatchObject({ sent: 6, waitedMs: 0, stop: null });
+  });
+
+  it("decides on the window of the token of the request, and names the token in a stop", async () => {
+    // Each token has the full need: the other token cannot cover it with its limit of 5000.
+    const { guard } = run();
+    await guard.fetch(pull("home-owner", 1), { headers: HOME });
+    await guard.fetch(pull("other-owner", 1), { headers: OTHER });
+    await guard.fetch(pull("home-owner", 2), { headers: HOME });
+    const error = await rejection(guard.fetch(pull("other-owner", 2), { headers: OTHER }));
+    expect(error).toBeInstanceOf(RateStop);
+    expect((error as RateStop).message).toBe(
+      "Rate guard: 4928 requests of token 1 are left until 2026-11-18T00:53:04.000Z, and its share of the run needs 4999 more. The reset at 2026-11-18T00:53:04.000Z is 41.8 minutes away, after the longest wait of 20.0 minutes. The run stops at once, and a later run does the work.",
+    );
+    expect(guard.record().sent).toBe(3);
   });
 });
