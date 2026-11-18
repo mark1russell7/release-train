@@ -1024,6 +1024,8 @@ describe("the pace of the update pushes", () => {
     // The merge of main starts CI as a push does, so it also waits for the limit of pushes.
     expect(behind.calls.some((c) => c.method === "PUT" && c.path.endsWith("/pulls/7/update-branch"))).toBe(false);
     expect(behind.x?.detail).toContain("The merge of main into the branch waits");
+    // The detail tells the limit of the run once, not again after the text of the merge.
+    expect(behind.x?.detail.split("This run pushed 0 branches")).toHaveLength(2);
   });
 
   it("counts only a real push: a clone that pushes nothing leaves the limit free, and a branch that has its changes can still push", async () => {
