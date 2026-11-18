@@ -1,12 +1,13 @@
 // All names in these tests are made up. No test uses the network.
 import { describe, expect, it } from "vitest";
-import { accountOfPath, accountOfRepos, parseTokens, repositoryIdOf, runAccounts } from "./accounts.ts";
+import { accountOfPath, accountOfRepos, authorizationOf, needShares, parseTokens, repositoryIdOf, runAccounts } from "./accounts.ts";
 import { apply, applySummary, noReadLine } from "./apply.ts";
 import type { ApplyReport, Updater } from "./apply.ts";
 import { accountsOf, parseArgs } from "./cli.ts";
 import { listAccounts } from "./collect.ts";
 import type { FetchFn, GhRepo, PageRead } from "./collect.ts";
 import { accountsGitHub, gitHub, pageRead, routedGitHub } from "./github.ts";
+import { credentialOf } from "./meter.ts";
 import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import { moveSiteConfig } from "./site-config.ts";
@@ -122,6 +123,43 @@ describe("the tokens of the accounts", () => {
     expect(a.others).toEqual([OTHER, "third-org", "fourth-org"]);
     expect(a.token(OTHER)).toBe("other-token");
     expect(a.token("third-org")).toBeNull();
+  });
+});
+
+describe("the share of the need of each token", () => {
+  const accounts = runAccounts(HOME, "home-token", [OTHER, "third-org"], { [OTHER]: "other-token" });
+
+  it("gives each credential the share of the repositories of its accounts", () => {
+    const share = needShares(accounts, [{ account: HOME }, { account: HOME }, {}, { account: OTHER }, { account: "third-org" }]);
+    // The account third-org has no token, so its client is the home client, and its repository is in the home share.
+    expect(share(authorizationOf("home-token"))).toBe(4 / 5);
+    expect(share(authorizationOf("other-token"))).toBe(1 / 5);
+    expect(share("Bearer unknown-token")).toBe(0);
+    expect(share("")).toBe(0);
+  });
+
+  it("gives each credential the full need for an empty list", () => {
+    expect(needShares(accounts, [])(authorizationOf("other-token"))).toBe(1);
+  });
+
+  it("gives the header of a token, and an empty text for no token", () => {
+    expect(authorizationOf("t")).toBe("Bearer t");
+    expect(authorizationOf(null)).toBe("");
+    expect(authorizationOf(undefined)).toBe("");
+    expect(authorizationOf("")).toBe("");
+  });
+
+  it("gives the same credential as the header of each client, so the guard finds the share of each request", async () => {
+    const seen: string[] = [];
+    const f: FetchFn = async (_url, init) => {
+      seen.push(credentialOf(init));
+      return new Response("{}", { status: 200 });
+    };
+    const clients = accountsGitHub(accounts, { fetch: f });
+    await clients.of(HOME).request("GET", "/rate_limit");
+    await clients.of(OTHER).request("GET", "/rate_limit");
+    const share = needShares(accounts, [{ account: HOME }, { account: OTHER }, { account: OTHER }, { account: OTHER }]);
+    expect(seen.map(share)).toEqual([1 / 4, 3 / 4]);
   });
 });
 

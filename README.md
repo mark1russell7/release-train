@@ -229,6 +229,8 @@ The job of `train.yml` stops after 60 minutes. The longest of 60 runs before 202
 
 The meter (`src/meter.ts`) counts each GitHub request of the run by its route. A route is the method and the path, and each segment that is not a word of the API becomes a placeholder, for example `GET /repos/{owner}/{repo}/pulls/{number}`. Thus a route has no name of a repository, a branch or a file. The meter counts the answers 304 and the failures, and each try of a retry. It does not count `GET /rate_limit` and the requests to npm. The report (`rateLimit.routes`) and the summary give the routes, with the largest count first.
 
+After the gate, the guard does the same step before each request, on the headers of the answers. Each token has a rate limit of its own, so the guard keeps the windows of each token apart. A window holds the answers of one token with one limit whose resets are in one minute. Each token needs only its share of `--rate-need`: the share of the repositories of its accounts. The gate reads only the home token. Each sample of the report (`rateLimit.samples`) has the number of its token, and the number holds no part of the token.
+
 Some steps still use the strict rule in each mode. They are the open update pull request of a repository that waits for a release, the pull requests with the label `train-merge` and the releases.
 
 ### The state of the train
