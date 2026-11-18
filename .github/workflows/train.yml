@@ -116,6 +116,16 @@ jobs:
           path: train-state.json
           key: train-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: train-state-
+      # The kept answers of the GitHub API (packages/release-train/src/kept.ts): a GET with the validators of its kept answer gets
+      # a 304, and GitHub does not count a 304 against the rate limit. The file is sealed, because the cache of this public
+      # repository can be read by others and a kept answer of a private repository holds its body. As for the state, each run
+      # saves a new cache, and the next run restores the newest one.
+      - name: Restore the kept answers
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: train-kept.sealed
+          key: train-kept-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: train-kept-
       - name: Plan and apply
         id: apply
         env:
@@ -123,6 +133,8 @@ jobs:
           # A JSON object with the token of each other account. An empty token is no token.
           GH_TOKENS: ${{ format('{{"{0}":"{1}"}}', env.ALSO_OWNER, steps.app_also.outputs.token) }}
           RELEASE_TRAIN_HASH_KEY: ${{ secrets.RELEASE_TRAIN_HASH_KEY }}
+          # The seal takes its own key from this secret by HKDF with its own label, so the two uses do not share a key.
+          RELEASE_TRAIN_KEPT_KEY: ${{ secrets.RELEASE_TRAIN_HASH_KEY }}
           EVENT: ${{ github.event_name }}
           INPUT_DRY: ${{ inputs.dry-run }}
           ONLY: ${{ inputs.only }}
@@ -133,7 +145,7 @@ jobs:
           WORKFLOWS: ${{ steps.wf.outcome == 'success' && 'yes' || 'no' }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then dry="$INPUT_DRY"; elif [ "$LIVE" = "true" ]; then dry=false; else dry=true; fi
-          args=(apply --owner "$OWNER" --also-owner "$ALSO_OWNER" --report apply.json --author "$AUTHOR" --holds lag-holds.json --state train-state.json)
+          args=(apply --owner "$OWNER" --also-owner "$ALSO_OWNER" --report apply.json --author "$AUTHOR" --holds lag-holds.json --state train-state.json --kept train-kept.sealed)
           if [ "$dry" != "false" ]; then args+=(--dry-run); else args+=(--take-replaced); fi
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
           if [ -n "$URGENT" ]; then args+=(--urgent "$URGENT"); fi
@@ -147,6 +159,12 @@ jobs:
         with:
           path: train-state.json
           key: train-state-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save the kept answers
+        if: always() && hashFiles('train-kept.sealed') != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: train-kept.sealed
+          key: train-kept-${{ github.run_id }}-${{ github.run_attempt }}
       # The version fix (packages/release-train/src/version-fix.ts): an automated dependency update can change the shipped
       # files and keep a version that npm has. Then the release check fails. This step adds the PATCH to such a pull request
       # of Renovate or of the train, with the token and the commit author of the App. The log gives each private repository
