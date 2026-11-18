@@ -624,6 +624,38 @@ describe("apply with the template sync", () => {
     expect(calls.some((c) => c.method === "DELETE" && c.path.endsWith(`/refs/heads/${SYNC_BRANCH}`))).toBe(true);
   });
 
+  it("does not push a new plan to a sync branch with a commit of a person, and merges the branch at green", async () => {
+    const author = { name: "train-app[bot]", email: "1+train-app[bot]@users.noreply.github.com" };
+    const pr = { number: 6, html_url: "u6", node_id: "PR_6", title: "t", body: "x <!-- release-train:fingerprint=0123456789ab -->", state: "open", auto_merge: null, head: { sha: "s6", ref: SYNC_BRANCH }, base: { ref: "main" }, labels: [{ name: TRAIN_LABEL }] };
+    const commits = [
+      { sha: "aaaaaaa1", commit: { author: { name: author.name, email: author.email } }, author: { login: author.name } },
+      { sha: "bbbbbbb2", commit: { author: { name: "A Person", email: "a.person@example.com" } }, author: { login: "a-person" } },
+    ];
+    const { gh, calls } = server(
+      repoRoutes("demo-repo", {
+        [`GET ${base}/demo-repo/pulls`]: (_b, u) => [200, u.searchParams.get("head")?.endsWith(SYNC_BRANCH) && u.searchParams.get("state") === "open" ? [pr] : []],
+        [`GET ${base}/demo-repo/pulls/6`]: () => [200, { ...pr, mergeable: true }],
+        [`GET ${base}/demo-repo/commits/s6/check-runs`]: () => [200, { check_runs: [{ status: "completed", conclusion: "success" }] }],
+        [`GET ${base}/demo-repo/commits/s6/status`]: () => [200, { state: "pending", total_count: 0 }],
+        [`POST /graphql`]: () => [200, { errors: [{ message: "Auto merge is not allowed for this repository" }] }],
+        [`GET ${base}/demo-repo/compare/main...s6`]: () => [200, { behind_by: 0, ahead_by: 2, commits }],
+        [`GET ${base}/demo-repo/issues/6/comments`]: () => [200, []],
+        [`POST ${base}/demo-repo/issues/6/comments`]: () => [201, {}],
+        [`PATCH ${base}/demo-repo`]: () => [403, { message: "no" }],
+        [`PUT ${base}/demo-repo/pulls/6/merge`]: () => [200, { merged: true }],
+        [`DELETE ${base}/demo-repo/git/refs/heads/${SYNC_BRANCH}`]: () => [204, null],
+      }),
+    );
+    const up = syncer([]);
+    const r = await apply({ owner: OWNER, plan: onePlan("demo-repo"), gh, updater: noUpdates, dryRun: false, author, sync: { updater: up, facts: runFacts(), workflows: "no" } });
+    expect(up.jobs).toEqual([]);
+    expect(r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "merged", ci: "green" });
+    expect(r.results[0]?.detail).toContain("bbbbbbb by a-person");
+    const posted = calls.filter((c) => c.method === "POST" && c.path === `${base}/demo-repo/issues/6/comments`);
+    expect(String(posted[0]?.body?.["body"])).toContain("<!-- release-train:other-commits s6 -->");
+    expect(posted).toHaveLength(1);
+  });
+
   it("compares the candidate rules on the sync branch in the mode shadow, and merges a candidate that is behind in the mode one-candidate", async () => {
     const files = mem({ ".github/workflows/ci.yml": ci(OLD), "package.json": rootPkg({ package: CLI_COPY_SCRIPT }), "packages/cli/package.json": JSON.stringify({ name: "@demo/cli", private: true }) });
     const fp = (await syncRepo(files, facts(), undefined, false)).fingerprint;
