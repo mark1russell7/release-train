@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { budgetGate, budgetStep, DEFAULT_NEED, goOnUrgent, guardLine, RESET_MARGIN_MS, RETRY_MARGIN_MS, rateGuard } from "./budget.ts";
+import { addCost, budgetGate, budgetStep, COST_RUNS, DEFAULT_NEED, goOnUrgent, guardLine, MIN_COST_RUNS, needOfRuns, RESET_MARGIN_MS, RETRY_MARGIN_MS, rateGuard } from "./budget.ts";
 import type { FetchFn } from "./collect.ts";
 import type { RateLimitRead } from "./github.ts";
 import { credentialOf, RateStop, rateTracker, requestMeter } from "./meter.ts";
@@ -65,6 +65,43 @@ describe("budgetStep", () => {
     expect(budgetStep(readOf(5000, 50, 5000), DEFAULT_NEED, NOW, MAX_WAIT)).toEqual({ action: "go" });
     expect(budgetStep(readOf(4999, 50, 5000), DEFAULT_NEED, NOW, MAX_WAIT)).toEqual({ action: "stop", ms: 50 * MINUTE });
     expect(budgetStep(readOf(0, 50), 0, NOW, MAX_WAIT)).toEqual({ action: "go" });
+  });
+});
+
+describe("the need of a run from the runs before it", () => {
+  it("is the default with fewer than the fewest runs", () => {
+    expect(needOfRuns([]).need).toBe(DEFAULT_NEED);
+    expect(needOfRuns(Array.from({ length: MIN_COST_RUNS - 1 }, () => 2600))).toEqual({
+      need: DEFAULT_NEED,
+      note: `Rate need: ${DEFAULT_NEED}, the default. The state has ${MIN_COST_RUNS - 1} of the ${MIN_COST_RUNS} full applies that a need from the runs needs.`,
+    });
+  });
+
+  it("is the worst run plus the spread, up to the next 100", () => {
+    // The full applies of 2026-11-17: the worst used 2,986 requests, and the best 2,406.
+    expect(needOfRuns([2406, 2608, 2986, 2733, 2923])).toEqual({
+      need: 3600,
+      note: "Rate need: 3600, from the last 5 full applies: the worst used 2986 requests, and the spread is 580.",
+    });
+    expect(needOfRuns([2000, 2000, 2000, 2000, 2000]).need).toBe(2000);
+    expect(needOfRuns([2000, 2000, 2000, 2000, 2001]).need).toBe(2100);
+  });
+
+  it("follows a train that grows, and forgets the runs before the last ones", () => {
+    const old = Array.from({ length: COST_RUNS }, () => 9000);
+    const grown = Array.from({ length: COST_RUNS }, () => 4000);
+    expect(needOfRuns([...old, ...grown]).need).toBe(4000);
+    expect(needOfRuns([...grown, 7000]).need).toBe(10_000);
+  });
+
+  it("keeps the last runs in the state", () => {
+    expect(addCost([], 2600)).toEqual([2600]);
+    const full = Array.from({ length: COST_RUNS }, (_, i) => 1000 + i);
+    const next = addCost(full, 5000);
+    expect(next).toHaveLength(COST_RUNS);
+    expect(next[0]).toBe(1001);
+    expect(next.at(-1)).toBe(5000);
+    expect(full).toHaveLength(COST_RUNS);
   });
 });
 

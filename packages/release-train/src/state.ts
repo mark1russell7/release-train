@@ -20,11 +20,21 @@ export interface TrainState {
   npm: Record<string, NpmTimes>;
   /** The first time that the train saw each need with no publish time, by the hash of the need. */
   seen: Record<string, string>;
+  /**
+   * The GitHub requests of each of the last full applies, oldest first. A full apply is a live run of all repositories
+   * that the rate guard did not stop. The need of a run comes from these counts (`needOfRuns` in `budget.ts`).
+   */
+  costs: number[];
 }
 
 /** This function gives a state with no data. */
 export function emptyState(): TrainState {
-  return { version: 1, npm: {}, seen: {} };
+  return { version: 1, npm: {}, seen: {}, costs: [] };
+}
+
+/** This function gives the valid counts of a field `costs`: whole numbers above 0. A state before this field has none. */
+function costsOf(value: unknown): number[] {
+  return Array.isArray(value) ? value.filter((n): n is number => Number.isInteger(n) && n > 0) : [];
 }
 
 /**
@@ -43,7 +53,7 @@ export function readState(file: string): { state: TrainState; note: string | nul
     if (data.version !== 1 || typeof data.npm !== "object" || data.npm === null || typeof data.seen !== "object" || data.seen === null) {
       return { state: emptyState(), note: `The state file ${file} has an unknown format: this run starts the state again.` };
     }
-    return { state: { version: 1, npm: data.npm, seen: data.seen }, note: null };
+    return { state: { version: 1, npm: data.npm, seen: data.seen, costs: costsOf(data.costs) }, note: null };
   } catch {
     return { state: emptyState(), note: `The state file ${file} is not JSON: this run starts the state again.` };
   }

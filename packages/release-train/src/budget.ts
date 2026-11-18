@@ -9,9 +9,45 @@ import { countedRequest, credentialOf, GITHUB_API, RateStop, type RateTracker } 
 /**
  * The GitHub requests that one run of `apply` needs at its start. On 2026-11-15, 31 runs used 73 to 9,768 requests each.
  * The median was approximately 2,600, and this value is approximately the 90th percentile. Three runs used the full limit
- * of 10,200, and the run after each one failed. The option `--rate-need` sets a different value, and 0 turns off the gate.
+ * of 10,200, and the run after each one failed. A run with the costs of enough full applies in its state uses
+ * `needOfRuns` in place of this value. The option `--rate-need` sets a fixed value, and 0 turns off the gate.
  */
 export const DEFAULT_NEED = 6000;
+
+/** The count of the last full applies that the state keeps for the need of a run. */
+export const COST_RUNS = 20;
+
+/** The fewest full applies for a need from the runs. With fewer, a run needs `DEFAULT_NEED`. */
+export const MIN_COST_RUNS = 5;
+
+/** The need of a run and the line of the log that tells its source. */
+export interface RunNeed {
+  need: number;
+  note: string;
+}
+
+/**
+ * This function gives the need of a run from the GitHub requests of the last full applies, oldest first. The need is the
+ * worst run plus the spread of the runs, up to the next 100. Thus the need follows the growth of the train.
+ *
+ * With fewer than `MIN_COST_RUNS` runs, the need is `DEFAULT_NEED`. On 2026-11-17, 51 full applies used 2,406 to 2,986
+ * requests each. The fixed need of 6,000 then stopped the third run of each hour at once.
+ */
+export function needOfRuns(costs: readonly number[]): RunNeed {
+  const last = costs.slice(-COST_RUNS);
+  if (last.length < MIN_COST_RUNS) {
+    return { need: DEFAULT_NEED, note: `Rate need: ${DEFAULT_NEED}, the default. The state has ${last.length} of the ${MIN_COST_RUNS} full applies that a need from the runs needs.` };
+  }
+  const worst = Math.max(...last);
+  const spread = worst - Math.min(...last);
+  const need = Math.ceil((worst + spread) / 100) * 100;
+  return { need, note: `Rate need: ${need}, from the last ${last.length} full applies: the worst used ${worst} requests, and the spread is ${spread}.` };
+}
+
+/** This function adds the GitHub requests of one full apply to the costs, and keeps the last `COST_RUNS`. */
+export function addCost(costs: readonly number[], requests: number): number[] {
+  return [...costs, requests].slice(-COST_RUNS);
+}
 
 /**
  * The longest wait for the reset of the rate limit, in minutes. The job of `train.yml` stops after 60 minutes. The

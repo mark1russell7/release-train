@@ -143,9 +143,9 @@ describe("the key of the private-name hashes", () => {
 });
 
 describe("the options of the rate budget", () => {
-  it("has the default need and the default longest wait", () => {
+  it("takes the need from the runs and the default longest wait", () => {
     const o = parseArgs(["apply"]);
-    expect(o.rateNeed).toBe(DEFAULT_NEED);
+    expect(o.rateNeed).toBeNull();
     expect(o.rateWait).toBe(DEFAULT_WAIT_MINUTES);
   });
 
