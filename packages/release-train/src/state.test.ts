@@ -26,8 +26,13 @@ const tool: NpmInfo = {
 
 describe("the state of the train", () => {
   it("reads a good file, and starts again from a missing, broken or unknown file with a note", () => {
-    const state = { version: 1, npm: { "@ex/tool": { modified: "m", times: { "1.0.0": "t" } } }, seen: { h: "2026-11-09T00:00:00Z" } };
+    const state = { version: 1, npm: { "@ex/tool": { modified: "m", times: { "1.0.0": "t" } } }, seen: { h: "2026-11-09T00:00:00Z" }, costs: [2600, 2986] };
     expect(readState(file(JSON.stringify(state)))).toEqual({ state, note: null });
+    // A state before the field costs has no costs. A bad count is not a count.
+    const { costs: _, ...before } = state;
+    expect(readState(file(JSON.stringify(before))).state.costs).toEqual([]);
+    expect(readState(file(JSON.stringify({ ...state, costs: [2600, -1, 2.5, "9", 0, 3000] }))).state.costs).toEqual([2600, 3000]);
+    expect(readState(file(JSON.stringify({ ...state, costs: "many" }))).state.costs).toEqual([]);
     for (const [text, part] of [
       [null, "No state file"],
       ["{", "is not JSON"],

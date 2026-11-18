@@ -7,7 +7,7 @@ import type { LagReport } from "./lag.ts";
 import { accountOfRepos, authorizationOf, needShares, parseTokens, runAccounts, type Accounts } from "./accounts.ts";
 import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pendingVersions, publicReport } from "./apply.ts";
 import type { ApplyReport } from "./apply.ts";
-import { budgetGate, DEFAULT_NEED, DEFAULT_WAIT_MINUTES, goOnUrgent, rateGuard } from "./budget.ts";
+import { addCost, budgetGate, DEFAULT_WAIT_MINUTES, goOnUrgent, needOfRuns, rateGuard } from "./budget.ts";
 import { collect, listAccounts, pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { writeDb } from "./db.ts";
@@ -65,8 +65,11 @@ export interface CliOptions {
   workflows: WorkflowsMode;
   /** `apply`: the most branches that one run pushes, for the update pushes and the sync pushes together. */
   maxPushes: number;
-  /** `apply`: the GitHub requests that a run needs at its start. With fewer requests, the run waits for the reset or stops. 0 turns off the gate. */
-  rateNeed: number;
+  /**
+   * `apply`: the GitHub requests that a run needs at its start. With fewer requests, the run waits for the reset or stops.
+   * 0 turns off the gate. Null: the need comes from the last full applies in the state file (`needOfRuns`).
+   */
+  rateNeed: number | null;
   /** `apply`: the longest wait for the reset of the rate limit, in minutes. */
   rateWait: number;
   /** `apply`: the public packages with a security fix. Their updates go first and pass the limit of pushes. */
@@ -125,7 +128,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     sync: true,
     workflows: "auto",
     maxPushes: MAX_PUSHES,
-    rateNeed: DEFAULT_NEED,
+    rateNeed: null,
     rateWait: DEFAULT_WAIT_MINUTES,
     urgent: null,
     takeReplaced: false,
@@ -504,6 +507,9 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     const accounts = accountsOf(o, tok);
     const read = o.state === undefined ? null : readState(o.state);
     if (read?.note) log(read.note);
+    // A fixed --rate-need wins. Else the need comes from the costs of the last full applies in the state.
+    const runNeed = o.rateNeed !== null ? { need: o.rateNeed, note: null } : needOfRuns(read?.state.costs ?? []);
+    if (runNeed.note !== null) log(runNeed.note);
     // The meter counts each GitHub request of the run by its route. Each part of the run that takes a fetch gets its fetch.
     const meter = requestMeter(deps.fetch);
     // This client has no guard. The gate, the urgent names at a stop of the gate and the reads of the rate limit use it.
@@ -512,7 +518,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     // reset on a timer that keeps Node alive, or it gives a stop. Its last read is the read at the start of the run.
     // The read is only the first value of the live budget: the meter adds the headers of each answer to the tracker.
     const gate = await budgetGate({
-      need: o.rateNeed,
+      need: runNeed.need,
       maxWaitMs: o.rateWait * 60_000,
       read: () => readRateLimit(gh0),
       tracker: meter.rate,
@@ -548,7 +554,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     // window that is not spent. A run that waited at the gate does not wait again (budget.ts).
     const guard = rateGuard(meter.fetch, {
       tracker: meter.rate,
-      need: gateRecord.outcome === "urgent" ? 0 : o.rateNeed,
+      need: gateRecord.outcome === "urgent" ? 0 : runNeed.need,
       share: (credential) => shareOf(credential),
       maxWaitMs: o.rateWait * 60_000,
       waited: gateRecord.outcome === "waited",
@@ -633,7 +639,11 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     const applied = guard.stopped();
     if (applied && inActions) process.stdout.write(`::notice::${applied.message}\n`);
     if (o.state !== undefined && starts) {
-      writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen() })}\n`);
+      // A full apply is a live run of all repositories that the guard did not stop. Only its count goes into the need.
+      const requests = meter.routes().reduce((sum, r) => sum + r.count, 0);
+      const prior = read?.state.costs ?? [];
+      const costs = !o.dryRun && o.only === null && !applied ? addCost(prior, requests) : prior;
+      writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen(), costs })}\n`);
       const c = starts.counts();
       log(`need starts: ${c.npm} from npm, ${c.state} from the state, ${c.sync} sync waits from the state`);
     }

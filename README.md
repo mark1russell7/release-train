@@ -110,7 +110,7 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 - `--release-dispatch` starts the release workflows that start only by hand. Refer to "Releases".
 - `--max-pushes <n>` is the most branches that one run pushes (default 5). The update branches and the sync branches share this limit. The other repositories get `waiting`, and a later run pushes them.
 - `--urgent <packages>` names public packages with a security fix (comma-separated). Refer to "An urgent update".
-- `--rate-need <n>` is the count of GitHub requests that a run needs at its start (default 6000). `0` turns off the gate. Refer to "The rate budget".
+- `--rate-need <n>` is a fixed count of GitHub requests that a run needs at its start. With no value, the need comes from the last full applies. `0` turns off the gate. Refer to "The rate budget".
 - `--rate-wait <minutes>` is the longest wait for the reset of the rate limit (default 20). Refer to "The rate budget".
 
 ### A partial update
@@ -220,10 +220,19 @@ The token of the GitHub App has 10,200 requests in one hour. On 2026-11-15, one 
 
 The gate (`src/budget.ts`) reads the rate limit before the first read of a repository. GitHub does not count this read.
 
-- When the count left is the need or more, the run goes on. The need is `--rate-need` (default 6000, approximately the 90th percentile of the runs), but not more than the limit of the token.
+- When the count left is the need or more, the run goes on. The need is not more than the limit of the token. The next section tells the need.
 - When fewer requests are left and the reset comes in `--rate-wait` minutes or less (default 20), the run waits until the reset plus 15 seconds. Then it reads the limit again and goes on. The timer of the wait keeps the Node process alive, so the run does not end during the wait.
 - When the reset comes later, the run stops with a note and the exit code 0. It writes the report with no result, so the next steps of the workflow can read it. A run with urgent names does not stop, because only the title of a run holds them.
 - When the read fails, the run goes on.
+
+The need of a run follows the runs before it:
+
+- The state file (`--state`) keeps the GitHub requests of the last 20 full applies. A full apply is a live run of all repositories that the guard did not stop.
+- With 5 or more such runs, the need is the worst run plus the spread of the runs, up to the next 100. Thus the need follows the growth of the train.
+- With fewer runs, the need is 6000. That value was approximately the 90th percentile of the runs of 2026-11-15.
+- `--rate-need` sets a fixed need.
+
+On 2026-11-17, 51 full applies used 2,406 to 2,986 requests. The fixed need of 6000 then stopped the third run of each hour at once.
 
 The job of `train.yml` stops after 60 minutes. The longest of 60 runs before 2026-11-15 took 31 minutes, with the wait for a release. Thus the default wait of 20 minutes and such a run stay below 60 minutes.
 
