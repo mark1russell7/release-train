@@ -743,6 +743,16 @@ interface RepoMeta {
   allow_rebase_merge?: boolean;
 }
 
+/**
+ * The outcome of a merge of the default branch into a branch. `note` is the text for the detail. `pushed` is true when
+ * the merge happened in this call. `limited` is true when the note tells the limit of pushes of the run.
+ */
+interface CaughtUp {
+  note: string;
+  pushed: boolean;
+  limited: boolean;
+}
+
 /** This function gives the merge method of a repository: a merge commit when the repository permits it. */
 export function mergeMethod(meta: { allow_merge_commit?: boolean; allow_squash_merge?: boolean } | null): "merge" | "squash" | "rebase" {
   if (!meta || meta.allow_merge_commit !== false) return "merge";
@@ -1409,9 +1419,10 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
    *
    * The merge starts CI, so it counts as a push in the limit of the run. The queue of the run gives it its place (see
    * `catchUps`). The function gives the text to add to the detail, and `pushed` is true when it merged in this call.
+   * `limited` is true when the text tells the limit of the run, so the caller does not tell it a second time.
    */
-  const catchUp = async (repo: string, pr: Pull, main: string): Promise<{ note: string; pushed: boolean }> => {
-    const no = (note: string) => ({ note, pushed: false });
+  const catchUp = async (repo: string, pr: Pull, main: string): Promise<CaughtUp> => {
+    const no = (note: string): CaughtUp => ({ note, pushed: false, limited: false });
     if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX)) return no("");
     if (pr.head.repo === null || (pr.head.repo !== undefined && pr.head.repo.full_name !== `${accountOf(repo)}/${repo}`)) return no("");
     const conflict = ` The branch has a conflict with ${main}: its author must merge ${main} into it.`;
@@ -1419,13 +1430,13 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     if (full?.mergeable === false || full?.mergeable_state === "dirty") return no(conflict);
     // The merge starts CI as a push does, so it counts in the limit of pushes of the run.
     const done = caught.get(`${repo}#${pr.number}`);
-    if (done !== undefined) return no(done);
+    if (done !== undefined) return { ...done, pushed: false };
     const wait = limitWait();
-    if (wait !== null) return no(` The merge of ${main} into the branch waits: ${wait}`);
+    if (wait !== null) return { note: ` The merge of ${main} into the branch waits: ${wait}`, pushed: false, limited: true };
     const r = await gh.request("PUT", `${at(repo)}/pulls/${pr.number}/update-branch`, { expected_head_sha: pr.head.sha });
     if (r.ok) {
       pushes += 1;
-      return { note: ` The train merged ${main} into the branch, so CI runs again.`, pushed: true };
+      return { note: ` The train merged ${main} into the branch, so CI runs again.`, pushed: true, limited: false };
     }
     return no(r.status === 422 ? conflict : ` The update of the branch failed (HTTP ${r.status}).`);
   };
@@ -1433,8 +1444,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   /**
    * This function merges a green pull request, or labels a red one. It gives the new state. It merges only a branch that
    * has each commit of the default branch, so CI ran on the current base. A branch that is behind waits for a new build.
+   *
    * `caughtUp` is true when it merged the default branch into the branch: that is a push. `held` names a cause outside
-   * the candidate rules that stopped the merge.
+   * the candidate rules that stopped the merge. `limited` is true when the detail tells the limit of the run.
    */
   const settle = async (
     repo: string,
@@ -1442,7 +1454,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     meta: RepoMeta | null,
     branch: string = TRAIN_BRANCH,
     deleteBranch = true,
-  ): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number; caughtUp?: boolean; held?: HeldCause; mergedBehind?: number }> => {
+  ): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number; caughtUp?: boolean; limited?: boolean; held?: HeldCause; mergedBehind?: number }> => {
     const { ci, release } = await checksOf(repo, pr.head.sha);
     if (ci === "failed") {
       if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${at(repo)}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
@@ -1465,6 +1477,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
           behind: cmp.behind,
           detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.${caught.note}`,
           ...(caught.pushed ? { caughtUp: true } : {}),
+          ...(caught.limited ? { limited: true } : {}),
         };
       }
       // A release run tags the commit of its version. When a merge changes a workflow file before the tag, GitHub refuses the
@@ -1910,9 +1923,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     o.maxPushes !== undefined && pushes >= o.maxPushes ? `This run pushed ${pushes} branches, the most of one run, because the runners are shared. A later run pushes this one.` : null;
   /**
    * This map holds the merges of the default branch into labeled pull requests in the queue of this run. The key is
-   * `repo#number`, and the value is the text for the detail. The function catchUp gives this text later, with no second merge.
+   * `repo#number`, and the value is the outcome of the merge. The function catchUp gives its text later, with no second merge.
    */
-  const caught = new Map<string, string>();
+  const caught = new Map<string, CaughtUp>();
   let startFallbacks = 0;
   /** This function gives the reason why a sync push waits for the busy runners, or null when it can push. */
   const busyWait = async (repo: string): Promise<string | null> => {
@@ -2019,7 +2032,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       items.push({
         at: inherit(waitMs(await pushTime(repo, pr)), releases),
         tie: tie0 + items.length,
-        run: async () => void caught.set(key, (await catchUp(repo, pr, main)).note),
+        run: async () => void caught.set(key, await catchUp(repo, pr, main)),
       });
     }
     return items;
@@ -2171,7 +2184,8 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         const state: RepoState = !s || (due && s.state === "unchanged") ? "waiting" : s.state;
         record.cause = state === "waiting" ? "limit" : (s?.held ?? null);
         record.caughtUp = s?.caughtUp === true;
-        const detail = state === "waiting" ? `${s ? `${s.detail} ` : ""}${wait}` : (s?.detail ?? wait);
+        // The detail of settle tells the limit when the limit held its merge of the default branch: the text comes once.
+        const detail = state === "waiting" ? (s?.limited ? s.detail : `${s ? `${s.detail} ` : ""}${wait}`) : (s?.detail ?? wait);
         result({ ...common, state, ...(state === "waiting" ? { paced: true } : {}), pr: prRef(existing), autoMerge: s ? "train" : null, ci: s?.ci ?? null, detail, ...(s ? mergedOf(s) : {}) });
         return;
       }
