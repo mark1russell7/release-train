@@ -168,10 +168,10 @@ importers:
     devDependencies:
       '@mark1russell7/api-report':
         specifier: ^0.5.3
-        version: 0.5.8
+        version: 0.5.12
       '@mark1russell7/conventions':
-        specifier: ^0.42.2
-        version: 0.42.2
+        specifier: ^0.46.1
+        version: 0.46.1
       '@mark1russell7/cue':
         specifier: github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8
         version: https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8
@@ -194,14 +194,14 @@ importers:
   packages/release-train:
     dependencies:
       '@mark1russell7/conventions':
-        specifier: ^0.42.2
-        version: 0.42.2
+        specifier: ^0.46.1
+        version: 0.46.1
       '@mark1russell7/service':
         specifier: ^0.9.0
         version: 0.9.0(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
       '@mark1russell7/site-pages':
         specifier: ^0.7.0
-        version: 0.7.0
+        version: 0.7.3
       '@mark1russell7/text':
         specifier: ^0.0.13
         version: 0.0.13
@@ -477,8 +477,8 @@ packages:
       zod:
         optional: true
 
-  '@mark1russell7/api-report@0.5.8':
-    resolution: {integrity: sha512-HS395EG0QBs2uA4EZ8gLak2m6YMqkC8XqPagNuE36uY8F6YZmb9Xz5SEr52Gv/6fb6J8JTXpw/zfkZeDAXcdHQ==}
+  '@mark1russell7/api-report@0.5.12':
+    resolution: {integrity: sha512-LEZ3UVUouiHT9Llv4aK/hFJmC+pMP0GeRhJPW/fArRJHIbpY5dH9P+bo0572z5Xs607hFJJlRNtRZNImjVuQMA==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -493,8 +493,8 @@ packages:
     resolution: {integrity: sha512-s2DyC8i8JhP0Ue6oG+dLUHrjwvUjz+UQrrSIViLkDdU0t+LhLChLrkRpcwr/eof62ffOSPXifLVYuzM7alEEPw==}
     engines: {node: '>=22.12'}
 
-  '@mark1russell7/conventions@0.42.2':
-    resolution: {integrity: sha512-eBY4JGYEqALMfORcQIHr//VFM3W4H+4qYzYJkWkoG+VPEy0nObFU+jYf9OOv48wAou4ZSFBrxl+vOw1ciDEtxA==}
+  '@mark1russell7/conventions@0.46.1':
+    resolution: {integrity: sha512-zlU7Oxm2EKW+PzUktInbScMKU1rnQNuPLJMibwC1fEvz2oMjgPv4WQ/7jNf2aUbFpS+XUQNUaTlsmcwBbK8ggw==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -601,8 +601,8 @@ packages:
       zod:
         optional: true
 
-  '@mark1russell7/site-pages@0.7.0':
-    resolution: {integrity: sha512-nFiaxs1D/IAxj54KUow0AkU35fxWj6iCHAcQ2GG2ISv0yD+YwnOoDHNmO1mV1g+roRV7G5czJNZlzv+3lcT2vg==}
+  '@mark1russell7/site-pages@0.7.3':
+    resolution: {integrity: sha512-VCh+TkcmwyUbygViLOUutjX+THZmx6r/BmemSbhhE1MmG50PPqtvJG//6DTigoYBkuGnHdTK1OPHVf/0eMUMCA==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -1387,9 +1387,9 @@ snapshots:
     optionalDependencies:
       zod: 4.6.7
 
-  '@mark1russell7/api-report@0.5.8':
+  '@mark1russell7/api-report@0.5.12':
     dependencies:
-      '@mark1russell7/conventions': 0.42.2
+      '@mark1russell7/conventions': 0.46.1
 
   '@mark1russell7/coeval@0.34.0(zod@4.6.7)':
     dependencies:
@@ -1414,8 +1414,9 @@ snapshots:
     transitivePeerDependencies:
       - zod
 
-  '@mark1russell7/conventions@0.42.2':
+  '@mark1russell7/conventions@0.46.1':
     dependencies:
+      '@mark1russell7/text': 0.0.13
       yaml: 2.9.1
 
   '@mark1russell7/cue@https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8': {}
@@ -1472,7 +1473,7 @@ snapshots:
       ws: 8.22.1
       zod: 4.6.7
 
-  '@mark1russell7/site-pages@0.7.0':
+  '@mark1russell7/site-pages@0.7.3':
     dependencies:
       '@mark1russell7/rigor-statistics': 0.2.9
 
