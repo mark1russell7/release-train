@@ -600,7 +600,9 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     // The sync need of each listed repository stays in the state, also in a run with no sync or with --only.
     starts?.keepSync(data.repos.map((r) => r.name));
     const accountOf = accountOfRepos(o.owner, data.repos);
-    const updater = gitUpdater({ owner: o.owner, token: tok, accounts, accountOf, author: parseAuthor(o.author), fetch: guard.fetch });
+    // The updater writes the commits with this author, and apply reads it to find a commit of another author on a branch.
+    const author = parseAuthor(o.author);
+    const updater = gitUpdater({ owner: o.owner, token: tok, accounts, accountOf, author, fetch: guard.fetch });
     const facts = o.sync ? await syncFacts({ gh, owner: o.owner, fetch: guard.fetch }) : null;
     const urgentList = urgent !== undefined ? urgent : await urgentNames(o, gh, log);
     const planned = guard.stopped();
@@ -623,6 +625,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       log,
       label: (repo, priv) => (priv && !o.showPrivate ? hashName(repo, key) : repo),
       ...(starts ? { needSince: (u) => starts.since(u.repo, u.items) } : {}),
+      author,
     });
     report.rateLimit = await rateReport();
     if ((data.noRead ?? []).length > 0) report.noRead = data.noRead ?? [];

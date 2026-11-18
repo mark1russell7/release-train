@@ -447,8 +447,9 @@ export interface CandidatePair {
  * runs. `skip`: the update or the sync changes no file. `error`: the work in the clone failed.
  * `release-check`: the repository publishes, and no release check passed on the head commit (see `releaseCheckLets`).
  * `merge-failed`: GitHub refused the merge of a candidate, and no push follows. Only the mode `one-candidate` gives it.
+ * `other-commits`: the branch of the open pull request has a commit that the train did not write, or GitHub did not list its commits. Refer to `otherCommits`.
  */
-export type HeldCause = "limit" | "busy" | "young" | "release-run" | "release-check" | "skip" | "error" | "merge-failed";
+export type HeldCause = "limit" | "busy" | "young" | "release-run" | "release-check" | "skip" | "error" | "merge-failed" | "other-commits";
 
 /**
  * A decision of the candidate rules in a count. `not read`: the run read no fact for the branch. In a held pair, the branch
@@ -571,6 +572,12 @@ export interface ApplyOptions {
   needSince?: (u: RepoUpdate) => string | undefined;
   /** The policy of the candidate rules. The default is `CANDIDATE_POLICY`. */
   candidatePolicy?: CandidatePolicy;
+  /**
+   * The author of the commits of the train, the same as the author of the updater. With this author, the train does not push
+   * to a branch that has a commit of another author. A new build from the default branch drops that commit.
+   * Absent or null: the train does not read the commits of a branch.
+   */
+  author?: { name: string; email: string } | null;
 }
 
 /** The options of the template sync of `apply`. */
@@ -1014,6 +1021,42 @@ export function ciState(runs: readonly CheckRun[], status: { state: string; tota
 /** This function gives the name of a private repository as a short hash. Only the holder of the key can match it. */
 export function hashName(name: string, key = ""): string {
   return `private-${createHmac("sha256", key).update(name).digest("hex").slice(0, 8)}`;
+}
+
+/** One commit of a compare of GitHub: its sha, the author of the git commit, and the GitHub user of that author. */
+export interface CompareCommit {
+  sha: string;
+  commit?: { author?: { name?: string; email?: string } | null } | null;
+  author?: { login?: string } | null;
+}
+
+/** The mark of the comment of the train on a pull request whose branch has commits of other authors. The head sha follows it. */
+export const OTHERS_MARK = "<!-- release-train:other-commits";
+
+/**
+ * This function gives the commits of a compare after the default branch that the train did not write, each as `sha by author`.
+ * A commit is of the train when its git email or its GitHub user is that of the train. The App merges the default branch into
+ * a branch with its own user, so such a merge is of the train. The function gives null when the compare does not list each
+ * commit after the default branch.
+ */
+export function otherCommits(compare: { ahead_by?: number; commits?: readonly CompareCommit[] }, author: { name: string; email: string }): string[] | null {
+  const listed = compare.commits ?? [];
+  if (typeof compare.ahead_by !== "number" || compare.ahead_by > listed.length) return null;
+  const email = author.email.toLowerCase();
+  return listed
+    .filter((c) => c.author?.login !== author.name && (c.commit?.author?.email ?? "").toLowerCase() !== email)
+    .map((c) => `${c.sha.slice(0, 7)} by ${c.author?.login ?? c.commit?.author?.name ?? "an unknown author"}`);
+}
+
+/**
+ * This function gives the text of a branch that the train keeps. `others` is the list of `otherCommits`, or null when GitHub
+ * did not list the commits. `retryLabel` is the label that gives a new build, or null when the mode has no such label.
+ */
+export function othersText(others: readonly string[] | null, main: string, retryLabel: string | null): string {
+  if (others === null) return `GitHub did not list the commits of the branch after ${main}, so the train does not know if a new build drops a commit of another author. The train does not push now.`;
+  const lever = retryLabel ? `, or add the label \`${retryLabel}\`` : "";
+  const n = others.length === 1 ? "1 commit" : `${others.length} commits`;
+  return `The branch has ${n} that the train did not write (${others.join(", ")}). A new build from ${main} drops them, so the train does not push. It merges the pull request at green CI with them. To let the train build the branch again, remove them from the branch${lever}.`;
 }
 
 /** This function removes the names, the links and the details of each private repository from a report. */
@@ -1536,6 +1579,51 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     if (mode === "strict") return null;
     return { lines: markLines(items ? { attempt, items } : { attempt }), ...(mode === "one-candidate" ? { retryLabel: policy.retryLabel } : {}) };
   };
+
+  /**
+   * This function reads the commits of the branch of an open pull request after the default branch. It gives a hold when a
+   * commit is of another author, or when GitHub does not list the commits. It gives null when the train can push.
+   * A new build from the default branch drops each commit of another author (codeatlas, 11-17), so such a branch waits.
+   * A branch with no open pull request gets no read: its commits were in a pull request that a person merged or closed.
+   */
+  const othersHold = async (repo: string, pr: Pull, defaultBranch: string, mode: CandidateMode): Promise<{ text: string; comment: boolean } | null> => {
+    if (!o.author) return null;
+    const res = await gh.request<{ ahead_by?: number; commits?: CompareCommit[] }>("GET", `${at(repo)}/compare/${encodeURIComponent(defaultBranch)}...${pr.head.sha}`);
+    const others = res.ok && res.data ? otherCommits(res.data, o.author) : null;
+    if (others !== null && others.length === 0) return null;
+    return { text: othersText(others, defaultBranch, mode === "one-candidate" ? policy.retryLabel : null), comment: others !== null };
+  };
+
+  /**
+   * This function keeps the branch of an open pull request with no push, for a hold of `othersHold`. It writes one comment
+   * for each head of the branch, and it merges the pull request at green CI. It gives the parts of the result. A dry run writes nothing.
+   */
+  const keepBranch = async (
+    repo: string,
+    pr: Pull,
+    meta: RepoMeta,
+    branch: string,
+    hold: { text: string; comment: boolean },
+    record: DecisionRecord,
+  ): Promise<Pick<RepoResult, "state" | "autoMerge" | "ci" | "detail" | "mergedBehind">> => {
+    record.cause = "other-commits";
+    if (o.dryRun) return { state: "waiting", autoMerge: null, ci: null, detail: hold.text };
+    if (hold.comment) {
+      const mark = `${OTHERS_MARK} ${pr.head.sha} -->`;
+      const seen = await gh.request<{ body?: string }[]>("GET", `${at(repo)}/issues/${pr.number}/comments?per_page=100`);
+      // A failed read writes no comment, so a later run does not write a second one.
+      if (seen.ok && !(seen.data ?? []).some((c) => (c.body ?? "").includes(mark))) {
+        await gh.request("POST", `${at(repo)}/issues/${pr.number}/comments`, { body: `${hold.text}\n\n${mark}\n\n${CLAUDE_LINE}` });
+      }
+    }
+    const autoMerge = await disableAutoMerge(pr, repo);
+    const s = await settle(repo, pr, meta, branch);
+    record.caughtUp = s.caughtUp === true;
+    const state: RepoState = s.state === "unchanged" ? "waiting" : s.state;
+    if (state === "merged") record.cause = null;
+    return { state, autoMerge, ci: s.ci, detail: `${hold.text} ${s.detail}`, ...mergedOf(s) };
+  };
+
   /**
    * This function gives the `attempt` number for the body after the work of a run. The value `red` is true when the CI of
    * the head before the push failed: only then a push of the same plan counts up.
@@ -2025,6 +2113,12 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       // A branch with these changes on the current default branch needs no push.
       const due = act !== null || !existing || rebuild || bodyFingerprint(existing.body) !== u.fingerprint;
       const wait = urgent ? null : limitWait();
+      // A commit of another author on the branch: the push waits, so it does not drop that commit. The retry label lets a person ask for a new build.
+      const others = existing && due && wait === null && !act?.removeLabel ? await othersHold(u.repo, existing, meta.default_branch, mode) : null;
+      if (existing && others !== null) {
+        result({ ...common, pr: prRef(existing), ...(await keepBranch(u.repo, existing, meta, TRAIN_BRANCH, others, record)) });
+        return;
+      }
       if (o.dryRun && (wait === null || !due)) {
         const what = !existing ? "The run opens a pull request" : due ? `The run updates PR #${existing.number}` : `The run keeps PR #${existing.number}`;
         if (due && !urgent) pushes += 1;
@@ -2203,6 +2297,12 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         if (wait !== null) {
           record.cause = held.cause;
           result({ ...commonOf(planned), state: "waiting", paced: true, pr: prRef(existing), autoMerge: null, ci: null, detail: act ? `${act.reason}. ${wait}` : wait });
+          return;
+        }
+        // A commit of another author on the branch: the push waits, as for an update branch.
+        const others = existing && !same && !act?.removeLabel ? await othersHold(repo, existing, meta.default_branch, mode) : null;
+        if (existing && others !== null) {
+          result({ ...commonOf(planned), pr: prRef(existing), ...(await keepBranch(repo, existing, meta, SYNC_BRANCH, others, record)) });
           return;
         }
         if (o.dryRun) {
