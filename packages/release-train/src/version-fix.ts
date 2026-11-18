@@ -231,7 +231,8 @@ export function pullScope(pr: PullInfo, trainLogin: string | null): FixDecision 
 
 /** The CI facts of the head of a pull request. */
 export interface CiFacts {
-  state: "none" | "running" | "failed" | "green";
+  /** `unread`: a read of the check runs or of the commit status failed (refer to `ciState`). */
+  state: "none" | "running" | "failed" | "green" | "unread";
   /** True when a commit status (not a check run) failed. */
   statusFailed: boolean;
   failed: readonly FailedCheck[];
@@ -246,6 +247,7 @@ export function decideFix(source: "renovate" | "train", ci: CiFacts, marks: read
   if (ci.state === "running") return skip("CI runs");
   if (ci.state === "none") return skip("the head has no CI result");
   if (ci.state === "green") return skip("CI is green");
+  if (ci.state === "unread") return skip("no read of the CI state");
   if (ci.statusFailed) return skip("a commit status failed");
   const needs = new Map<string, FixNeed>();
   for (const c of ci.failed) {
@@ -429,7 +431,7 @@ export async function versionFixRun(o: FixRunOptions): Promise<FixRow[]> {
     const latest = latestRuns(runs.data?.check_runs ?? [], workflows.data?.workflow_runs ?? []) as CheckRunData[];
     if (!runs.ok) return { state: "none", statusFailed: false, failed: [] };
     // A check that runs can still fail with another error, so the fix waits for each check.
-    const state = latest.some((r) => r.status !== "completed") ? "running" : ciState(latest, status.data);
+    const state = latest.some((r) => r.status !== "completed") ? "running" : ciState(latest, status.data, !status.ok);
     const statusFailed = (status.data?.total_count ?? 0) > 0 && (status.data?.state === "failure" || status.data?.state === "error");
     if (state !== "failed") return { state, statusFailed, failed: [] };
     const failed: FailedCheck[] = [];

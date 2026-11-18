@@ -62,11 +62,12 @@ const HOUR_MS = 3_600_000;
 
 /**
  * This function gives the CI state of a candidate and tells if the state is stuck. Stuck: the state is `running` only
- * because of workflow jobs that are queued or in progress for more than `stuckHours`.
+ * because of workflow jobs that are queued or in progress for more than `stuckHours`. `unread`: a read of the check runs
+ * or of the commit status failed (refer to `ciState`).
  */
-export function stuckCi(runs: readonly CheckRun[], status: { state: string; total_count: number } | null, workflowRuns: readonly WorkflowRun[], now: number, stuckHours: number): CandidateCi {
+export function stuckCi(runs: readonly CheckRun[], status: { state: string; total_count: number } | null, workflowRuns: readonly WorkflowRun[], now: number, stuckHours: number, unread = false): CandidateCi {
   const latest = latestRuns(runs, workflowRuns);
-  const state = ciState(latest, status);
+  const state = ciState(latest, status, unread);
   if (state !== "running") return { state, stuck: false };
   const old = new Set(workflowRuns.filter((w) => w.status !== "completed" && now - Date.parse(w.created_at) > stuckHours * HOUR_MS).map((w) => w.check_suite_id));
   if (old.size === 0) return { state, stuck: false };
@@ -127,7 +128,7 @@ export function candidateReader(gh: GitHub, owner: string | AccountOf, policy: C
       const sha = t.pr.head.sha;
       const runs = await get<{ check_runs?: CheckRun[] }>(`${at(t.repo)}/commits/${sha}/check-runs?per_page=100`);
       const status = await get<{ state: string; total_count: number }>(`${at(t.repo)}/commits/${sha}/status`);
-      return { ci: stuckCi(runs.data?.check_runs ?? [], status.data, (await runsOf(t.repo, sha)) ?? [], now, policy.stuckCiHours) };
+      return { ci: stuckCi(runs.data?.check_runs ?? [], status.data, (await runsOf(t.repo, sha)) ?? [], now, policy.stuckCiHours, !runs.ok || !status.ok) };
     },
     async mergeable(t) {
       if (!t.pr) return { mergeable: null };

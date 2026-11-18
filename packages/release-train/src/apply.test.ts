@@ -306,6 +306,10 @@ describe("apply", () => {
       [`GET ${base}/secret-repo`]: meta,
       [`POST ${base}/lib-repo/pulls`]: (b) => [201, { ...pull(9, "lib-repo"), ...b, labels: [] }],
       [`POST ${base}/lib-repo/labels`]: () => [201, {}],
+      [`GET ${base}/secret-repo/labels`]: () => [200, [{ name: "release-train" }, { name: "Release-Train:Blocked" }]],
+      // The pull request has no CI yet: the reads succeed and show no check.
+      [`GET ${base}/secret-repo/commits/sha7/check-runs`]: () => [200, { check_runs: [] }],
+      [`GET ${base}/secret-repo/commits/sha7/status`]: () => [200, { state: "pending", total_count: 0 }],
       [`POST ${base}/secret-repo/labels`]: () => [422, { message: "exists" }],
       [`POST ${base}/lib-repo/issues/9/labels`]: () => [200, []],
       [`PATCH ${base}/stale-repo/pulls/3`]: () => [200, {}],
@@ -331,6 +335,34 @@ describe("apply", () => {
     expect(calls.some((c) => c.method === "POST" && c.path === `${base}/lib-repo/issues/9/labels`)).toBe(true);
     // The PR of secret-repo already has the label of the train.
     expect(calls.some((c) => c.path === `${base}/secret-repo/issues/7/labels`)).toBe(false);
+    // The train reads the labels of a repository one time, and makes only the labels that it does not have (any case).
+    // lib-repo gives no list (404), so the train makes each label there, as before.
+    expect(calls.filter((c) => c.method === "GET" && c.path.startsWith(`${base}/secret-repo/labels`))).toHaveLength(1);
+    const made = calls.filter((c) => c.method === "POST" && c.path === `${base}/secret-repo/labels`).map((c) => c.body?.["name"]);
+    expect(made).not.toContain("release-train");
+    expect(made).not.toContain("release-train:blocked");
+    expect(calls.filter((c) => c.method === "POST" && c.path === `${base}/lib-repo/labels`).map((c) => c.body?.["name"])).toContain("release-train");
+  });
+
+  it("holds a green pull request whose commit status cannot be read, and shows no read", async () => {
+    const fp = selectUpdates(fixture(), ["secret-repo"]).ready[0]?.fingerprint;
+    const body = `x <!-- release-train:fingerprint=${fp} -->`;
+    const { gh, calls } = server({
+      ...green,
+      // An App with no permission for commit statuses, in a private repository.
+      [`GET ${base}/secret-repo/commits/sha7/status`]: () => [403, { message: "Resource not accessible by integration" }],
+      [`GET ${base}/secret-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo", { body })] : []],
+      [`GET ${base}/secret-repo/pulls/7`]: () => [200, pull(7, "secret-repo", { body })],
+      [`GET ${base}/secret-repo`]: meta,
+      [`PUT ${base}/secret-repo/pulls/7/merge`]: () => [200, { merged: true }],
+      [`DELETE ${base}/secret-repo/git/refs/heads/${TRAIN_BRANCH}`]: () => [204, null],
+    });
+    const up = updater();
+    const r = await apply({ owner: OWNER, plan: fixture(), gh, updater: up, dryRun: false, only: ["secret-repo"], maxPushes: 0, now: slot(0) });
+    expect(up.seen).toEqual([]);
+    expect(r.results[0]).toMatchObject({ state: "unchanged", ci: "unread" });
+    expect(r.results[0]?.detail).toContain("no read of the CI state");
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
   });
 
   it("labels a pull request with a failed CI as blocked", async () => {
@@ -1289,6 +1321,16 @@ describe("helpers", () => {
     expect(ciState([{ status: "completed", conclusion: "success" }, { status: "completed", conclusion: "skipped" }], null)).toBe("green");
     expect(ciState([{ status: "completed", conclusion: "success" }], { state: "failure", total_count: 1 })).toBe("failed");
     expect(ciState([{ status: "completed", conclusion: "cancelled" }], null)).toBe("failed");
+  });
+
+  it("gives no read, never green or none, when a read of the CI failed", () => {
+    // The check runs pass, but the commit status gave the answer 403 (an App with no permission for commit statuses).
+    expect(ciState([{ status: "completed", conclusion: "success" }], null, true)).toBe("unread");
+    expect(ciState([], null, true)).toBe("unread");
+    expect(ciState([{ status: "in_progress", conclusion: null }], null, true)).toBe("unread");
+    // A failure that a read shows still decides.
+    expect(ciState([{ status: "completed", conclusion: "failure" }], null, true)).toBe("failed");
+    expect(ciState([], { state: "error", total_count: 1 }, true)).toBe("failed");
   });
 
   it("counts only the newest run of each workflow, so a cancelled older run of the same commit does not fail it", () => {
