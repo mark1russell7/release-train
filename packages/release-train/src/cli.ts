@@ -5,7 +5,9 @@ import type { HoldReading, LagHold } from "./holds.ts";
 import { applyHolds, lagOver, lagReport, lagSummary } from "./lag.ts";
 import type { LagReport } from "./lag.ts";
 import { accountOfRepos, authorizationOf, needShares, parseTokens, runAccounts, type Accounts } from "./accounts.ts";
-import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pendingVersions, publicReport } from "./apply.ts";
+import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pendingVersions, publicReport, redactName } from "./apply.ts";
+
+export { redactName };
 import type { ApplyReport } from "./apply.ts";
 import { addCost, budgetGate, DEFAULT_WAIT_MINUTES, goOnUrgent, needOfRuns, rateGuard } from "./budget.ts";
 import { collect, listAccounts, pool } from "./collect.ts";
@@ -332,12 +334,6 @@ export function parseAuthor(text: string | null): { name: string; email: string 
   const name = text && lt > 0 ? text.slice(0, lt).trim() : "";
   const email = text && gt > lt + 1 ? text.slice(lt + 1, gt).trim() : "";
   return name && email ? { name, email } : { name: "release-train", email: "release-train@users.noreply.github.com" };
-}
-
-/** This function replaces each whole occurrence of a name in a text. A longer word that holds the name does not change. */
-export function redactName(text: string, name: string, by: string): string {
-  const esc = name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
-  return text.replace(new RegExp(`(?<![\\w-])${esc}(?![\\w-])`, "g"), by);
 }
 
 /** This function replaces each given name in a text with its hash. A longer name goes first. */
