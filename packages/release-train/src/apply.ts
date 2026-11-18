@@ -1100,6 +1100,28 @@ export function othersText(others: readonly string[] | null, main: string, retry
   return `The branch has ${n} that the train did not write (${others.join(", ")}). A new build from ${main} drops them, so the train does not push. It merges the pull request at green CI with them. To let the train build the branch again, remove them from the branch${lever}.`;
 }
 
+/** This function replaces each whole occurrence of a name in a text. A longer word that holds the name does not change. */
+export function redactName(text: string, name: string, by: string): string {
+  const esc = name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+  return text.replace(new RegExp(`(?<![\\w-])${esc}(?![\\w-])`, "g"), by);
+}
+
+/** The mark of the error note of the train on a pull request. The hash of the reasons follows it: `<!-- release-train:error <hash> -->`. */
+export const ERROR_MARK = "<!-- release-train:error";
+
+/**
+ * This function gives the body and the mark of the error note on a pull request. The public report hides the detail of a
+ * private repository (publicReport). Thus the note is the place where its reason is readable, and only by the readers of
+ * the repository. The mark holds a hash of the reasons. A later run with the same reasons writes nothing. Thus the day in
+ * the note stays the day of the first run with them.
+ */
+export function errorNote(reasons: readonly string[], day: string): { body: string; mark: string } {
+  const mark = `${ERROR_MARK} ${createHash("sha256").update(reasons.join("\n")).digest("hex").slice(0, 16)} -->`;
+  const list = reasons.map((r) => `- ${r}`).join("\n");
+  const body = `The release train could not act on this pull request in its run of ${day}:\n\n${list}\n\nThe train tries again in each later run. It edits this note when the reason changes. The note stays when the error ends.\n\n${mark}\n\n${CLAUDE_LINE}`;
+  return { body, mark };
+}
+
 /** This function removes the names, the links and the details of each private repository from a report. */
 export function publicReport(r: ApplyReport, key = ""): ApplyReport {
   return {
@@ -1283,6 +1305,47 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     const detail = full.private ? "" : ` ${full.detail}`;
     log(`${label(full.repo, full.private)}: ${full.state}${full.pr && !full.private ? ` ${full.pr.url}` : ""}.${detail}`);
     return full;
+  };
+
+  /**
+   * This function writes the error note of each pull request with an error in this run. The note is one comment, and the
+   * train edits it when the reasons change. The names of the other private repositories in a reason become their hashes.
+   * A failed read writes nothing, so a later run does not write a second note. The note stays when the error ends. The
+   * train reads the comments only of a pull request with an error, so a run spends no request on the others.
+   */
+  const errorNotes = async (): Promise<void> => {
+    const day = (o.now ?? new Date()).toISOString().slice(0, 10);
+    const hidden = [...privateOf].filter(([, p]) => p).map(([n]) => n).sort((a, b) => b.length - a.length);
+    const notes = new Map<string, { repo: string; number: number; reasons: string[] }>();
+    for (const r of results) {
+      if (r.state !== "error" || r.pr === null) continue;
+      // A run that shows the private names (--show-private) has no hash, so a note still gives no other private name.
+      const reason = hidden.filter((n) => n !== r.repo).reduce((t, n) => redactName(t, n, label(n, true) === n ? "(a private repository)" : label(n, true)), r.detail);
+      const key = `${r.repo}#${r.pr.number}`;
+      const note = notes.get(key) ?? { repo: r.repo, number: r.pr.number, reasons: [] };
+      if (!note.reasons.includes(reason)) note.reasons.push(reason);
+      notes.set(key, note);
+    }
+    for (const n of notes.values()) {
+      const name = label(n.repo, privateOf.get(n.repo) ?? true);
+      try {
+        const note = errorNote(n.reasons, day);
+        const seen = await gh.request<{ id: number; body?: string }[]>("GET", `${at(n.repo)}/issues/${n.number}/comments?per_page=100`);
+        if (!seen.ok) {
+          log(`${name}: no error note, because GitHub did not list the comments of the pull request (HTTP ${seen.status}).`);
+          continue;
+        }
+        const old = (seen.data ?? []).find((c) => (c.body ?? "").includes(ERROR_MARK));
+        if (old && (old.body ?? "").includes(note.mark)) continue;
+        const w = old
+          ? await gh.request("PATCH", `${at(n.repo)}/issues/comments/${old.id}`, { body: note.body })
+          : await gh.request("POST", `${at(n.repo)}/issues/${n.number}/comments`, { body: note.body });
+        log(w.ok ? `${name}: the error note on the pull request tells the reason.` : `${name}: the write of the error note failed (HTTP ${w.status}).`);
+      } catch (e) {
+        stopOn(e);
+        log(`${name}: the error note failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
   };
 
   /** This function reads the open pull request of a branch of the train, in each repository of the plan. */
@@ -2490,6 +2553,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   // A merge by Renovate or by the auto-merge of GitHub has no hold for a release run, so GitHub can refuse a tag. The train
   // merges them with the holds of settle. This step comes after the releases, so a release run that this run started holds too.
   await mergeLabeled();
+
+  // 7. The error notes: the reason of each error of this run, on the open pull request of the repository (errorNote).
+  if (!o.dryRun) await errorNotes();
 
   const changed = new Set(sel.ready.flatMap((u) => u.items.map((i) => i.dep)));
   const urgentUnused = [...new Set(o.urgent ?? [])].filter((n) => !urgentNames.has(n) || !changed.has(n)).length;
