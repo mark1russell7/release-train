@@ -185,9 +185,11 @@ A commit with no CI result is "no read" in the log, and it does not count as gre
 
 The field `redMainBound` sets a bound on the red train merges of the last 30 days. At the bound or more, the strict rule comes back for a candidate that is behind. The count uses the same workflows of the candidate. The bound is null, so the rule has no bound, and the train does not read the count.
 
-A change of the plan on a green update candidate merges first when the change is monotone. Monotone: each item of the candidate is in the plan with the same version or a newer version. Else the new plan replaces the candidate, so a held item or a removed item does not merge. A missing or empty items mark is "no read", and "no read" is not monotone. A change of the plan on a green sync candidate replaces it.
+A change of the plan on a green update candidate merges first when the change is monotone. Monotone: each item of the candidate is in the plan with the same version or a newer version. Else the new plan replaces the candidate, so a held item or a removed item does not merge. A missing or empty items mark is "no read", and "no read" is not monotone.
 
-The body of each pull request has the mark `<!-- release-train:attempt=N -->`, after the fingerprint mark. The body of an update also has a mark with its items. The number in the mark counts the builds of the same plan that follow a red result. A new plan, or a build after a green result or a result that is not known, starts at 1. A missing or damaged `attempt` mark counts as 1.
+A change of the plan on a green sync candidate also merges first when the change is monotone. Monotone for a sync: each file change of the candidate is in the plan with the same kind (write, remove or install). The content of a written file can differ, because the next sync writes the newer content. So a sync whose pins move at each commit of the template merges, and a file that the plan stops changing does not merge. A missing or empty files mark is "no read".
+
+The body of each pull request has the mark `<!-- release-train:attempt=N -->`, after the fingerprint mark. The body of an update also has a mark with its items. The body of a sync has the mark `<!-- release-train:files=... -->` with its file changes. The number in the mark counts the builds of the same plan that follow a red result. A new plan, or a build after a green result or a result that is not known, starts at 1. A missing or damaged `attempt` mark counts as 1.
 
 The field `mode` of the policy has three values. The default is `one-candidate` with the share 0.25:
 

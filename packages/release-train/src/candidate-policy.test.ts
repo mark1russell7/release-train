@@ -6,6 +6,7 @@ import {
   CANDIDATE_POLICY,
   backoffHours,
   bodyAttempt,
+  bodyFiles,
   bodyItems,
   candidateItems,
   commitHealth,
@@ -15,10 +16,13 @@ import {
   markLines,
   modeFor,
   monotone,
+  monotoneFor,
   nextAttempt,
   paceHours,
   shareOf,
   surfaceChanged,
+  syncItems,
+  syncMonotone,
 } from "./candidate-policy.ts";
 import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateNeed, CandidatePolicy, PlanChangeChoice } from "./candidate-policy.ts";
 
@@ -82,7 +86,7 @@ describe("the policy data", () => {
       backoffCeilHours: 24,
       stuckCiHours: 6,
       costWhenNoReadMinutes: 10,
-      planChangeOnGreen: { update: "merge-first-when-monotone", sync: "replace" },
+      planChangeOnGreen: { update: "merge-first-when-monotone", sync: "merge-first-when-monotone" },
       redMainWindowDays: 30,
       retryLabel: "release-train:retry",
     });
@@ -427,8 +431,32 @@ describe("the decision table", () => {
     expect(decision(facts({ plan: { fingerprint: "fp2", items: null } }))).toMatchObject({ action: "push" });
   });
 
-  it("row 4b: a sync replaces the candidate by default", () => {
-    expect(decision(facts({ kind: "sync", plan: { fingerprint: "fp2", items: null }, open: { ...facts().open!, items: null } }))).toMatchObject({ action: "push", rule: "R3" });
+  it("row 4b: a sync merges the green candidate first when each of its file changes is in the plan", () => {
+    const files = [{ dep: ".github/site.json", to: "write" }, { dep: ".github/workflows/ci.yml", to: "write" }];
+    const plan = { fingerprint: "fp2", items: [...files, { dep: ".github/workflows/pages.yml", to: "write" }] };
+    expect(decision(facts({ kind: "sync", plan, open: { ...facts().open!, items: files } }))).toMatchObject({ action: "merge", rule: "R2" });
+  });
+
+  it("row 4b: a sync replaces the candidate when the plan drops a file change or changes its kind", () => {
+    const files = [{ dep: ".github/site.json", to: "write" }, { dep: "old.yml", to: "remove" }];
+    const plans = [[{ dep: ".github/site.json", to: "write" }], [{ dep: ".github/site.json", to: "write" }, { dep: "old.yml", to: "write" }]];
+    for (const items of plans) {
+      expect(decision(facts({ kind: "sync", plan: { fingerprint: "fp2", items }, open: { ...facts().open!, items: files } }))).toMatchObject({ action: "push", rule: "R3", code: "plan-changed" });
+    }
+  });
+
+  it("row 4b: a sync candidate with no files mark is no read, and the reason names the files mark", () => {
+    for (const items of [null, []]) {
+      const d = decision(facts({ kind: "sync", plan: { fingerprint: "fp2", items: [{ dep: "ci.yml", to: "write" }] }, open: { ...facts().open!, items } }));
+      expect(d).toMatchObject({ action: "push", rule: "R3", code: "plan-changed-no-items" });
+      expect(d.reason).toBe("the plan changed, and the candidate has no files mark, so the monotone check has no read");
+    }
+  });
+
+  it("row 4b: the choice replace replaces a monotone sync candidate", () => {
+    const files = [{ dep: "ci.yml", to: "write" }];
+    const p: CandidatePolicy = { ...P, planChangeOnGreen: { ...P.planChangeOnGreen, sync: "replace" } };
+    expect(decision(facts({ kind: "sync", plan: { fingerprint: "fp2", items: files }, open: { ...facts().open!, items: files } }), p)).toMatchObject({ action: "push", code: "plan-changed" });
   });
 
   it("row 4c: the yield", () => {
@@ -527,6 +555,30 @@ describe("monotone", () => {
   });
 });
 
+describe("syncMonotone and monotoneFor", () => {
+  const c = [{ dep: ".github/site.json", to: "write" }, { dep: "lockfile", to: "install" }];
+
+  it("gives true when each file change is in the plan with the same kind, also with more changes", () => {
+    expect(syncMonotone(c, c)).toBe(true);
+    expect(syncMonotone(c, [...c, { dep: "old.yml", to: "remove" }])).toBe(true);
+    expect(syncMonotone([], c)).toBe(true);
+  });
+
+  it("gives false for a file change that the plan does not have, or has with another kind", () => {
+    expect(syncMonotone(c, [{ dep: ".github/site.json", to: "write" }])).toBe(false);
+    expect(syncMonotone(c, [{ dep: ".github/site.json", to: "remove" }, { dep: "lockfile", to: "install" }])).toBe(false);
+  });
+
+  it("compares the versions of an update and the kinds of a sync", () => {
+    const u = [{ dep: "a", to: "1.0.0" }];
+    expect(monotoneFor("update", u, [{ dep: "a", to: "1.1.0" }])).toBe(true);
+    expect(monotoneFor("sync", u, [{ dep: "a", to: "1.1.0" }])).toBe(false);
+    expect(monotoneFor("sync", c, c)).toBe(true);
+    // A kind of a file change is not a version.
+    expect(monotoneFor("update", c, c)).toBe(false);
+  });
+});
+
 describe("the share", () => {
   it("gives the same number from 0 to 1 for the same label", () => {
     expect(shareOf("acme/data-repo")).toBe(shareOf("acme/data-repo"));
@@ -569,6 +621,30 @@ describe("the marks", () => {
   it("gives attempt 1 and no items for a damaged mark", () => {
     for (const b of ["<!-- release-train:attempt=x -->", "<!-- release-train:attempt=0 -->", "<!-- release-train:attempt=4", "<!-- release-train:attempt=-2 -->"]) expect(bodyAttempt(b)).toBe(1);
     for (const b of ["<!-- release-train:items=core -->", "<!-- release-train:items=@1.0.0 -->", "<!-- release-train:items=a@x -->", "<!-- release-train:items=a@1.0.0"]) expect(bodyItems(b)).toBeNull();
+  });
+
+  it("writes and reads the file changes of a sync", () => {
+    const files = syncItems([".github/workflows/ci.yml", ".github/site.json", ".github/site.json"], ["scripts/old"], true);
+    expect(files).toEqual([
+      { dep: "lockfile", to: "install" },
+      { dep: "scripts/old", to: "remove" },
+      { dep: ".github/site.json", to: "write" },
+      { dep: ".github/workflows/ci.yml", to: "write" },
+    ]);
+    const body = ["text", ...markLines({ attempt: 1, files: files ?? [] })].join("\n");
+    expect(body).toContain("<!-- release-train:files=install:lockfile,remove:scripts/old,write:.github/site.json,write:.github/workflows/ci.yml -->");
+    expect(bodyFiles(body)).toEqual(files);
+    expect(bodyItems(body)).toBeNull();
+    expect(bodyFiles(["text", ...markLines({ attempt: 1, items: ITEMS })].join("\n"))).toBeNull();
+  });
+
+  it("gives no file changes for a path that the mark cannot hold, no mark or a damaged mark", () => {
+    for (const p of ["a b.yml", "a,b.yml", "x-->y", ""]) expect(syncItems([p], [], false)).toBeNull();
+    expect(syncItems([], [], false)).toEqual([]);
+    expect(bodyFiles("no marks")).toBeNull();
+    const damaged = ["ci.yml", "move:ci.yml", "write:", "write:a,,write:b", "write:a b"].map((t) => `<!-- release-train:files=${t} -->`);
+    for (const b of [...damaged, "<!-- release-train:files=write:ci.yml"]) expect(bodyFiles(b)).toBeNull();
+    expect(bodyFiles("<!-- release-train:files= -->")).toEqual([]);
   });
 
   it("gives an empty list for an empty items mark", () => {
@@ -645,7 +721,7 @@ describe("commitHealth", () => {
  * minutes with newer versions of the same package. CI takes 30 minutes and costs 20 runner minutes, so the pace is 4 h.
  * The train runs every 15 minutes for 2 days.
  */
-function replay(choice: PlanChangeChoice): { pushes: number; kept: number; minutes: number; merges: number } {
+function replay(choice: PlanChangeChoice, kind: CandidateFacts["kind"] = "update"): { pushes: number; kept: number; minutes: number; merges: number } {
   const p: CandidatePolicy = { ...P, planChangeOnGreen: { update: choice, sync: choice } };
   const cost = 20;
   type Open = { fingerprint: string; items: CandidateItem[]; createdAt: number; doneAt: number; attempt: number };
@@ -658,10 +734,11 @@ function replay(choice: PlanChangeChoice): { pushes: number; kept: number; minut
   const start = NOW;
   for (let t = start; t < start + 48 * H; t += 15 * 60_000) {
     const version = Math.floor((t - start) / (25 * 60_000));
-    const items = [{ dep: "@acme/core", to: `1.${version}.0` }];
+    // A sync changes the same file at each new plan: the pins of the template move to its newest commit.
+    const items = kind === "sync" ? [{ dep: ".github/workflows/ci.yml", to: "write" }] : [{ dep: "@acme/core", to: `1.${version}.0` }];
     const plan = version > mergedVersion ? { fingerprint: `fp${version}`, items } : null;
     const f: CandidateFacts = {
-      kind: "update",
+      kind,
       private: false,
       now: t,
       urgent: false,
@@ -703,5 +780,10 @@ describe("the replay of planChangeOnGreen", () => {
     // arrives while the replacement waits for the pace.
     expect(first).toEqual({ pushes: 12, kept: 12, minutes: 240, merges: 12 });
     expect(replace).toEqual({ pushes: 12, kept: 0, minutes: 240, merges: 0 });
+  });
+
+  it("gives a sync the same result: its pins change at each commit of the template", () => {
+    expect(replay("merge-first-when-monotone", "sync")).toEqual({ pushes: 12, kept: 12, minutes: 240, merges: 12 });
+    expect(replay("replace", "sync")).toEqual({ pushes: 12, kept: 0, minutes: 240, merges: 0 });
   });
 });

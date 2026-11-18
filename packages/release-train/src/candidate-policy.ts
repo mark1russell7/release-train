@@ -63,13 +63,16 @@ export const CANDIDATE_POLICY: CandidatePolicy = {
   backoffCeilHours: 24,
   stuckCiHours: 6,
   costWhenNoReadMinutes: 10,
-  planChangeOnGreen: { update: "merge-first-when-monotone", sync: "replace" },
+  planChangeOnGreen: { update: "merge-first-when-monotone", sync: "merge-first-when-monotone" },
   redMainBound: null,
   redMainWindowDays: 30,
   retryLabel: "release-train:retry",
 };
 
-/** One item of a candidate: a package and its target version. */
+/**
+ * One item of a candidate. For an update, `dep` is a package and `to` is its target version. For a sync, `dep` is a path
+ * and `to` is the kind of its change: `write`, `remove` or `install` (refer to `syncItems`).
+ */
 export interface CandidateItem {
   dep: string;
   to: string;
@@ -274,6 +277,21 @@ export function monotone(candidate: readonly CandidateItem[], plan: readonly Can
 }
 
 /**
+ * This function tells if a change of the plan of a sync is monotone. Monotone: each file change of the candidate is in the
+ * plan with the same kind. The content of a written file can differ, because the next sync writes the newer content. A
+ * file that the plan does not change, or a change of another kind, gives false. So a file that a repository keeps as its
+ * own, or a removal that the template stopped, does not merge.
+ */
+export function syncMonotone(candidate: readonly CandidateItem[], plan: readonly CandidateItem[]): boolean {
+  return candidate.every((c) => plan.some((x) => x.dep === c.dep && x.to === c.to));
+}
+
+/** This function tells if a change of the plan is monotone, by the kind of the branch. */
+export function monotoneFor(kind: CandidateKind, candidate: readonly CandidateItem[], plan: readonly CandidateItem[]): boolean {
+  return kind === "sync" ? syncMonotone(candidate, plan) : monotone(candidate, plan);
+}
+
+/**
  * This function gives the decision of the candidate rules for one branch, or the fact that it needs first. It has no I/O
  * and no clock: the time is the fact `now`. The steps follow the decision table of the policy.
  */
@@ -330,13 +348,14 @@ function green(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChan
     if (f.surfaceChanged && f.surfaceCut) return stale("surface-list-cut", "GitHub cut a list of files of the surface check at 300 files, so the check has no read and counts a change");
     if (f.surfaceChanged) return stale("surface-changed", "the default branch changed a file of the surface of the candidate");
   }
-  // 4b: a change of the plan. A missing or empty items mark gives no read, and no read is not monotone.
+  // 4b: a change of the plan. A missing or empty mark gives no read, and no read is not monotone. The mark of an update
+  // is the items mark, and the mark of a sync is the files mark.
   if (planChanged && f.plan) {
     const choice = p.planChangeOnGreen[f.kind];
     if (choice === "merge-first-when-monotone" && (o.items === null || o.items.length === 0)) {
-      return paced(p, f, { action: "push", rule: "R3", code: "plan-changed-no-items", reason: "the plan changed, and the candidate has no items mark, so the monotone check has no read", attempt: 1, rebuild: false });
+      return paced(p, f, { action: "push", rule: "R3", code: "plan-changed-no-items", reason: `the plan changed, and the candidate has no ${f.kind === "sync" ? "files" : "items"} mark, so the monotone check has no read`, attempt: 1, rebuild: false });
     }
-    const first = choice === "merge-first-when-monotone" && o.items !== null && f.plan.items !== null && monotone(o.items, f.plan.items);
+    const first = choice === "merge-first-when-monotone" && o.items !== null && f.plan.items !== null && monotoneFor(f.kind, o.items, f.plan.items);
     if (!first) return paced(p, f, { action: "push", rule: "R3", code: "plan-changed", reason: "the plan changed, and the candidate goes out of date", attempt: 1, rebuild: false });
   }
   // 4c: R0, the yield.
@@ -451,6 +470,9 @@ export function modeFor(p: CandidatePolicy, label: string): CandidateMode {
 
 const ATTEMPT_MARK = "<!-- release-train:attempt=";
 const ITEMS_MARK = "<!-- release-train:items=";
+const FILES_MARK = "<!-- release-train:files=";
+/** The text of one item of the files mark: the kind of the change and a path. The path has no comma and no space. */
+const FILES_ITEM = /^(write|remove|install):([\w.@/+-]+)$/;
 const END = " -->";
 
 /** The marks of a candidate in the body of its pull request. */
@@ -458,6 +480,24 @@ export interface CandidateMarks {
   attempt: number;
   /** The items of an update candidate. Absent: the body gets no items mark. */
   items?: readonly CandidateItem[];
+  /** The file changes of a sync candidate, from `syncItems`. Absent: the body gets no files mark. */
+  files?: readonly CandidateItem[];
+}
+
+/**
+ * This function gives the file changes of a sync as a sorted list with no duplicates. Each written file gives
+ * `{ dep: path, to: "write" }`, and each removed path gives `{ dep: path, to: "remove" }`. An install of the package manager
+ * gives `{ dep: "lockfile", to: "install" }`. A path that the files mark cannot hold gives null. Then the body gets no files
+ * mark, and the monotone check of the candidate has no read.
+ */
+export function syncItems(writes: readonly string[], removes: readonly string[], install: boolean): CandidateItem[] | null {
+  const items = [...writes.map((dep) => ({ dep, to: "write" })), ...removes.map((dep) => ({ dep, to: "remove" })), ...(install ? [{ dep: "lockfile", to: "install" }] : [])];
+  const keys = [...new Set(items.map((i) => `${i.to}:${i.dep}`))].sort();
+  if (keys.some((k) => !FILES_ITEM.test(k))) return null;
+  return keys.map((k) => {
+    const cut = k.indexOf(":");
+    return { dep: k.slice(cut + 1), to: k.slice(0, cut) };
+  });
 }
 
 /** This function gives the items of an update as a sorted list with no duplicates. */
@@ -473,6 +513,7 @@ export function candidateItems(items: readonly { dep: string; to: string }[]): C
 export function markLines(m: CandidateMarks): string[] {
   const lines = [`${ATTEMPT_MARK}${Math.max(1, Math.floor(m.attempt))}${END}`];
   if (m.items) lines.push(`${ITEMS_MARK}${candidateItems(m.items).map((i) => `${i.dep}@${i.to}`).join(",")}${END}`);
+  if (m.files) lines.push(`${FILES_MARK}${m.files.map((i) => `${i.to}:${i.dep}`).join(",")}${END}`);
   return lines;
 }
 
@@ -504,6 +545,20 @@ export function bodyItems(body: string | null | undefined): CandidateItem[] | nu
     const to = part.slice(cut + 1);
     if (cut <= 0 || !/^(@[\w.-]+\/)?[\w.-]+$/.test(dep) || semver.valid(to) === null) return null;
     items.push({ dep, to });
+  }
+  return items;
+}
+
+/** This function gives the file changes in the body of a sync pull request. No mark, or a damaged mark, gives null. */
+export function bodyFiles(body: string | null | undefined): CandidateItem[] | null {
+  const text = markText(body, FILES_MARK);
+  if (text === null) return null;
+  if (text === "") return [];
+  const items: CandidateItem[] = [];
+  for (const part of text.split(",")) {
+    const m = FILES_ITEM.exec(part);
+    if (m === null || m[1] === undefined || m[2] === undefined) return null;
+    items.push({ dep: m[2], to: m[1] });
   }
   return items;
 }
