@@ -91,6 +91,7 @@ The site at <https://mark1russell7.github.io/release-train/> is a plan explorer.
 - A repository publishes when its default branch has `.github/workflows/release.yml`. In such a repository, a merge needs a passed release check on the head commit. The check is a check run `release-check`, or `<job> / release-check` of a caller of `reusable-ci.yml` of the template. The check starts the release build on the commit of the pull request. Thus a merge cannot stop the release of the default branch. An example: an update changes a shipped file, and its version is already on npm. A skipped check passes only in a private repository, where `reusable-ci.yml` runs it only with the input `release-check-private`. When GitHub does not tell if the repository publishes, the merge waits. The held cause is `release-check`.
 - When CI fails, the pull request stays open with the label `release-train:blocked`. In the mode `one-candidate`, the label `release-train:retry` gives one new build.
 - A commit of another author on the branch of an open pull request holds the push. A new build from the default branch drops that commit, so the train keeps the branch. It writes one comment for each head of the branch, and it merges the pull request at green CI with the commit. To get a new build, remove the commit from the branch, or add the label `release-train:retry` in the mode `one-candidate`. A commit of the train has the git email or the GitHub user of `--author`. When GitHub does not list each commit of the branch, the push waits too.
+- When the train cannot act on an open pull request, it writes the reason in one comment on that pull request. It edits the comment when the reason changes. The public report of a private repository gives only the state. Thus this comment is the place where the reason is readable, and only by the readers of the repository. The names of the other private repositories in the reason become their hashes. The comment stays when the error ends.
 - A pull request of another author with the label `train-merge` (for example a Renovate pin of a workflow action) merges by the same rules. A merge by Renovate or by the auto-merge of GitHub does not wait for a release run, so the train merges these pull requests. It takes only a branch of the same repository into the default branch, and it does not delete the branch. A Renovate branch that is behind gets a tick in its rebase box, so Renovate rebases it and CI runs again. This step comes after the releases of the run.
 - A green branch of the same repository can be behind, with no conflict and no rebase box. The train merges the default branch into it (the update-branch API), and CI starts again. That merge counts as a push in the limit of the run. It takes its turn by the time of the last push of the head, in one order with the pushes. Only a conflict gets a line for the author.
 - The train closes its pull request when the plan has no update for the repository.
@@ -110,7 +111,7 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 - `--release-dispatch` starts the release workflows that start only by hand. Refer to "Releases".
 - `--max-pushes <n>` is the most branches that one run pushes (default 5). The update branches and the sync branches share this limit. The other repositories get `waiting`, and a later run pushes them.
 - `--urgent <packages>` names public packages with a security fix (comma-separated). Refer to "An urgent update".
-- `--rate-need <n>` is the count of GitHub requests that a run needs at its start (default 6000). `0` turns off the gate. Refer to "The rate budget".
+- `--rate-need <n>` is a fixed count of GitHub requests that a run needs at its start. With no value, the need comes from the last full applies. `0` turns off the gate. Refer to "The rate budget".
 - `--rate-wait <minutes>` is the longest wait for the reset of the rate limit (default 20). Refer to "The rate budget".
 
 ### A partial update
@@ -185,9 +186,11 @@ A commit with no CI result is "no read" in the log, and it does not count as gre
 
 The field `redMainBound` sets a bound on the red train merges of the last 30 days. At the bound or more, the strict rule comes back for a candidate that is behind. The count uses the same workflows of the candidate. The bound is null, so the rule has no bound, and the train does not read the count.
 
-A change of the plan on a green update candidate merges first when the change is monotone. Monotone: each item of the candidate is in the plan with the same version or a newer version. Else the new plan replaces the candidate, so a held item or a removed item does not merge. A missing or empty items mark is "no read", and "no read" is not monotone. A change of the plan on a green sync candidate replaces it.
+A change of the plan on a green update candidate merges first when the change is monotone. Monotone: each item of the candidate is in the plan with the same version or a newer version. Else the new plan replaces the candidate, so a held item or a removed item does not merge. A missing or empty items mark is "no read", and "no read" is not monotone.
 
-The body of each pull request has the mark `<!-- release-train:attempt=N -->`, after the fingerprint mark. The body of an update also has a mark with its items. The number in the mark counts the builds of the same plan that follow a red result. A new plan, or a build after a green result or a result that is not known, starts at 1. A missing or damaged `attempt` mark counts as 1.
+A change of the plan on a green sync candidate also merges first when the change is monotone. Monotone for a sync: each file change of the candidate is in the plan with the same kind (write, remove or install). The content of a written file can differ, because the next sync writes the newer content. So a sync whose pins move at each commit of the template merges, and a file that the plan stops changing does not merge. A missing or empty files mark is "no read".
+
+The body of each pull request has the mark `<!-- release-train:attempt=N -->`, after the fingerprint mark. The body of an update also has a mark with its items. The body of a sync has the mark `<!-- release-train:files=... -->` with its file changes. The number in the mark counts the builds of the same plan that follow a red result. A new plan, or a build after a green result or a result that is not known, starts at 1. A missing or damaged `attempt` mark counts as 1.
 
 The field `mode` of the policy has three values. The default is `one-candidate` with the share 0.25:
 
@@ -220,10 +223,19 @@ The token of the GitHub App has 10,200 requests in one hour. On 2026-11-15, one 
 
 The gate (`src/budget.ts`) reads the rate limit before the first read of a repository. GitHub does not count this read.
 
-- When the count left is the need or more, the run goes on. The need is `--rate-need` (default 6000, approximately the 90th percentile of the runs), but not more than the limit of the token.
+- When the count left is the need or more, the run goes on. The need is not more than the limit of the token. The next section tells the need.
 - When fewer requests are left and the reset comes in `--rate-wait` minutes or less (default 20), the run waits until the reset plus 15 seconds. Then it reads the limit again and goes on. The timer of the wait keeps the Node process alive, so the run does not end during the wait.
 - When the reset comes later, the run stops with a note and the exit code 0. It writes the report with no result, so the next steps of the workflow can read it. A run with urgent names does not stop, because only the title of a run holds them.
 - When the read fails, the run goes on.
+
+The need of a run follows the runs before it:
+
+- The state file (`--state`) keeps the GitHub requests of the last 20 full applies. A full apply is a live run of all repositories that the guard did not stop.
+- With 5 or more such runs, the need is the worst run plus the spread of the runs, up to the next 100. Thus the need follows the growth of the train.
+- With fewer runs, the need is 6000. That value was approximately the 90th percentile of the runs of 2026-11-15.
+- `--rate-need` sets a fixed need.
+
+On 2026-11-17, 51 full applies used 2,406 to 2,986 requests. The fixed need of 6000 then stopped the third run of each hour at once.
 
 The job of `train.yml` stops after 60 minutes. The longest of 60 runs before 2026-11-15 took 31 minutes, with the wait for a release. Thus the default wait of 20 minutes and such a run stay below 60 minutes.
 
@@ -416,12 +428,24 @@ The template sync keeps the files from the repository `template` current in each
 
 A rule writes a JSON file in the layout of Prettier, so the check `prettier --check` of the repository passes on it (`formatJson`). It keeps the indent and the line ends of the file. `package.json`, `package-lock.json` and `composer.json` get the layout of `JSON.stringify`, as with the parser `json-stringify` of Prettier. In another JSON file, an array goes on one line when it has no object and fits in the `printWidth`. The `printWidth` comes from the Prettier config of the repository, and it is 80 when no config sets it.
 
+### The kept answers
+
+The workflow also keeps the answers of the GitHub API from one run to the next in the Actions cache (`--kept train-kept.sealed`, `src/kept.ts`). Most GET requests of a run read files and lists that did not change since the run before.
+
+- A GET of the API sends the validators of its kept answer (`If-None-Match`, `If-Modified-Since`). When the resource did not change, GitHub answers 304, and the run reads the kept body. GitHub does not count a 304 against the rate limit.
+- The store and the conditional fetch come from `polite-crawler/api` (`keptFetch`, `keptStore`, `sealKept`, `openKept`). The kept fetch is between the guard and the meter, so the meter counts each real 304 (`notModified` of each route).
+- The need of a run does not count the answers 304, because GitHub does not count them.
+- The cache of this public repository can be read by others, and a kept answer of a private repository holds its body. So the file is sealed with AES-256-GCM. The key comes from the secret `RELEASE_TRAIN_KEPT_KEY` by HKDF with the label `release-train-kept/1`. The workflow gives it the value of `RELEASE_TRAIN_HASH_KEY`: the label gives the seal a key of its own.
+- After a complete run, the store has only the answers that the run used. A run that stopped early (a stop of the gate or the guard, `--only`, an error) also keeps the answers of the run before.
+- A missing file, a file that does not open, or a secret with fewer than 16 bytes does not stop a run. The run writes a note in the log and reads each answer in full.
+
 The rules do not change the repository `template`. Each repository gets one branch `release-train/template` and one pull request with the label `release-train`, apart from the update pull request. The body tells each change and its reason, the changes that wait, and the problems that need a hand. The fingerprint in the body stops a push when the changes are the same. It covers the text of each change, the content of each written file and each removed path. Thus a new content, for example from a fix of the train, gives a new build of the open pull request. CI, the label `release-train:blocked`, the merge on green and the close follow the rules of the update pull request.
 
 GitHub refuses a change to a workflow file from an App without the permission Workflows: write. Until the App has this permission, the rules `pins` and `release-scripts` wait, and the pull request and the summary tell "The change waits for the Workflows permission of the App." The other rules work. The run does not fail.
 
 - `--no-sync` turns off the template sync.
 - `--state <file>` reads the state of the train at the start of the run and writes it at the end.
+- `--kept <file>` opens the sealed kept answers at the start of the run and seals them at the end. The secret is `RELEASE_TRAIN_KEPT_KEY`.
 - `--workflows auto|yes|no` tells if the App can change workflow files. With `auto` (the default), the train tries, and when GitHub refuses the push, it pushes again without the workflow changes.
 - `plan` lists the sync actions of each repository and the count for each rule.
 

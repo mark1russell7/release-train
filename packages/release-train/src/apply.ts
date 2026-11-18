@@ -3,7 +3,7 @@ import semver from "semver";
 import { accountFn, accountOfRepos, type AccountOf } from "./accounts.ts";
 import { candidateReader } from "./candidate-facts.ts";
 import type { CandidateTarget } from "./candidate-facts.ts";
-import { CANDIDATE_POLICY, bodyAttempt, bodyItems, candidateItems, decide, decideWith, markLines, modeFor, nextAttempt } from "./candidate-policy.ts";
+import { CANDIDATE_POLICY, bodyAttempt, bodyFiles, bodyItems, candidateItems, decide, decideWith, markLines, modeFor, nextAttempt, syncItems } from "./candidate-policy.ts";
 import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateKind, CandidateMode, CandidatePolicy, CandidateRule, DecideResult } from "./candidate-policy.ts";
 import { guardLine } from "./budget.ts";
 import { pool } from "./collect.ts";
@@ -743,6 +743,16 @@ interface RepoMeta {
   allow_rebase_merge?: boolean;
 }
 
+/**
+ * The outcome of a merge of the default branch into a branch. `note` is the text for the detail. `pushed` is true when
+ * the merge happened in this call. `limited` is true when the note tells the limit of pushes of the run.
+ */
+interface CaughtUp {
+  note: string;
+  pushed: boolean;
+  limited: boolean;
+}
+
 /** This function gives the merge method of a repository: a merge commit when the repository permits it. */
 export function mergeMethod(meta: { allow_merge_commit?: boolean; allow_squash_merge?: boolean } | null): "merge" | "squash" | "rebase" {
   if (!meta || meta.allow_merge_commit !== false) return "merge";
@@ -1090,6 +1100,28 @@ export function othersText(others: readonly string[] | null, main: string, retry
   return `The branch has ${n} that the train did not write (${others.join(", ")}). A new build from ${main} drops them, so the train does not push. It merges the pull request at green CI with them. To let the train build the branch again, remove them from the branch${lever}.`;
 }
 
+/** This function replaces each whole occurrence of a name in a text. A longer word that holds the name does not change. */
+export function redactName(text: string, name: string, by: string): string {
+  const esc = name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+  return text.replace(new RegExp(`(?<![\\w-])${esc}(?![\\w-])`, "g"), by);
+}
+
+/** The mark of the error note of the train on a pull request. The hash of the reasons follows it: `<!-- release-train:error <hash> -->`. */
+export const ERROR_MARK = "<!-- release-train:error";
+
+/**
+ * This function gives the body and the mark of the error note on a pull request. The public report hides the detail of a
+ * private repository (publicReport). Thus the note is the place where its reason is readable, and only by the readers of
+ * the repository. The mark holds a hash of the reasons. A later run with the same reasons writes nothing. Thus the day in
+ * the note stays the day of the first run with them.
+ */
+export function errorNote(reasons: readonly string[], day: string): { body: string; mark: string } {
+  const mark = `${ERROR_MARK} ${createHash("sha256").update(reasons.join("\n")).digest("hex").slice(0, 16)} -->`;
+  const list = reasons.map((r) => `- ${r}`).join("\n");
+  const body = `The release train could not act on this pull request in its run of ${day}:\n\n${list}\n\nThe train tries again in each later run. It edits this note when the reason changes. The note stays when the error ends.\n\n${mark}\n\n${CLAUDE_LINE}`;
+  return { body, mark };
+}
+
 /** This function removes the names, the links and the details of each private repository from a report. */
 export function publicReport(r: ApplyReport, key = ""): ApplyReport {
   return {
@@ -1275,6 +1307,47 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     return full;
   };
 
+  /**
+   * This function writes the error note of each pull request with an error in this run. The note is one comment, and the
+   * train edits it when the reasons change. The names of the other private repositories in a reason become their hashes.
+   * A failed read writes nothing, so a later run does not write a second note. The note stays when the error ends. The
+   * train reads the comments only of a pull request with an error, so a run spends no request on the others.
+   */
+  const errorNotes = async (): Promise<void> => {
+    const day = (o.now ?? new Date()).toISOString().slice(0, 10);
+    const hidden = [...privateOf].filter(([, p]) => p).map(([n]) => n).sort((a, b) => b.length - a.length);
+    const notes = new Map<string, { repo: string; number: number; reasons: string[] }>();
+    for (const r of results) {
+      if (r.state !== "error" || r.pr === null) continue;
+      // A run that shows the private names (--show-private) has no hash, so a note still gives no other private name.
+      const reason = hidden.filter((n) => n !== r.repo).reduce((t, n) => redactName(t, n, label(n, true) === n ? "(a private repository)" : label(n, true)), r.detail);
+      const key = `${r.repo}#${r.pr.number}`;
+      const note = notes.get(key) ?? { repo: r.repo, number: r.pr.number, reasons: [] };
+      if (!note.reasons.includes(reason)) note.reasons.push(reason);
+      notes.set(key, note);
+    }
+    for (const n of notes.values()) {
+      const name = label(n.repo, privateOf.get(n.repo) ?? true);
+      try {
+        const note = errorNote(n.reasons, day);
+        const seen = await gh.request<{ id: number; body?: string }[]>("GET", `${at(n.repo)}/issues/${n.number}/comments?per_page=100`);
+        if (!seen.ok) {
+          log(`${name}: no error note, because GitHub did not list the comments of the pull request (HTTP ${seen.status}).`);
+          continue;
+        }
+        const old = (seen.data ?? []).find((c) => (c.body ?? "").includes(ERROR_MARK));
+        if (old && (old.body ?? "").includes(note.mark)) continue;
+        const w = old
+          ? await gh.request("PATCH", `${at(n.repo)}/issues/comments/${old.id}`, { body: note.body })
+          : await gh.request("POST", `${at(n.repo)}/issues/${n.number}/comments`, { body: note.body });
+        log(w.ok ? `${name}: the error note on the pull request tells the reason.` : `${name}: the write of the error note failed (HTTP ${w.status}).`);
+      } catch (e) {
+        stopOn(e);
+        log(`${name}: the error note failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  };
+
   /** This function reads the open pull request of a branch of the train, in each repository of the plan. */
   const openOf = async (branch: string): Promise<Map<string, Pull>> => {
     const found = new Map<string, Pull>();
@@ -1409,9 +1482,10 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
    *
    * The merge starts CI, so it counts as a push in the limit of the run. The queue of the run gives it its place (see
    * `catchUps`). The function gives the text to add to the detail, and `pushed` is true when it merged in this call.
+   * `limited` is true when the text tells the limit of the run, so the caller does not tell it a second time.
    */
-  const catchUp = async (repo: string, pr: Pull, main: string): Promise<{ note: string; pushed: boolean }> => {
-    const no = (note: string) => ({ note, pushed: false });
+  const catchUp = async (repo: string, pr: Pull, main: string): Promise<CaughtUp> => {
+    const no = (note: string): CaughtUp => ({ note, pushed: false, limited: false });
     if ((pr.body ?? "").includes(RENOVATE_REBASE_BOX)) return no("");
     if (pr.head.repo === null || (pr.head.repo !== undefined && pr.head.repo.full_name !== `${accountOf(repo)}/${repo}`)) return no("");
     const conflict = ` The branch has a conflict with ${main}: its author must merge ${main} into it.`;
@@ -1419,13 +1493,13 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     if (full?.mergeable === false || full?.mergeable_state === "dirty") return no(conflict);
     // The merge starts CI as a push does, so it counts in the limit of pushes of the run.
     const done = caught.get(`${repo}#${pr.number}`);
-    if (done !== undefined) return no(done);
+    if (done !== undefined) return { ...done, pushed: false };
     const wait = limitWait();
-    if (wait !== null) return no(` The merge of ${main} into the branch waits: ${wait}`);
+    if (wait !== null) return { note: ` The merge of ${main} into the branch waits: ${wait}`, pushed: false, limited: true };
     const r = await gh.request("PUT", `${at(repo)}/pulls/${pr.number}/update-branch`, { expected_head_sha: pr.head.sha });
     if (r.ok) {
       pushes += 1;
-      return { note: ` The train merged ${main} into the branch, so CI runs again.`, pushed: true };
+      return { note: ` The train merged ${main} into the branch, so CI runs again.`, pushed: true, limited: false };
     }
     return no(r.status === 422 ? conflict : ` The update of the branch failed (HTTP ${r.status}).`);
   };
@@ -1433,8 +1507,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   /**
    * This function merges a green pull request, or labels a red one. It gives the new state. It merges only a branch that
    * has each commit of the default branch, so CI ran on the current base. A branch that is behind waits for a new build.
+   *
    * `caughtUp` is true when it merged the default branch into the branch: that is a push. `held` names a cause outside
-   * the candidate rules that stopped the merge.
+   * the candidate rules that stopped the merge. `limited` is true when the detail tells the limit of the run.
    */
   const settle = async (
     repo: string,
@@ -1442,7 +1517,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     meta: RepoMeta | null,
     branch: string = TRAIN_BRANCH,
     deleteBranch = true,
-  ): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number; caughtUp?: boolean; held?: HeldCause; mergedBehind?: number }> => {
+  ): Promise<{ state: RepoState; ci: CiState; detail: string; behind?: number; caughtUp?: boolean; limited?: boolean; held?: HeldCause; mergedBehind?: number }> => {
     const { ci, release } = await checksOf(repo, pr.head.sha);
     if (ci === "failed") {
       if (!hasLabel(pr, BLOCKED_LABEL)) await gh.request("POST", `${at(repo)}/issues/${pr.number}/labels`, { labels: [BLOCKED_LABEL] });
@@ -1465,6 +1540,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
           behind: cmp.behind,
           detail: `CI is green, but the branch is ${cmp.behind} commit(s) behind ${main}. The train builds it again from ${main} before a merge.${caught.note}`,
           ...(caught.pushed ? { caughtUp: true } : {}),
+          ...(caught.limited ? { limited: true } : {}),
         };
       }
       // A release run tags the commit of its version. When a merge changes a workflow file before the tag, GitHub refuses the
@@ -1606,10 +1682,12 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   /** This function gives the mode of the candidate rules for a repository. The share uses the label of the log, so it reads no private name. */
   const modeOf = (repo: string, isPrivate: boolean): CandidateMode => modeFor(policy, label(repo, isPrivate));
   /** This function gives the marks of the candidate rules for the body of a pull request, or null in the mode `strict`. */
-  const marksOf = (mode: CandidateMode, attempt: number, items: readonly CandidateItem[] | null): TrailerMarks | null => {
+  const marksOf = (mode: CandidateMode, attempt: number, items: readonly CandidateItem[] | null, files: readonly CandidateItem[] | null = null): TrailerMarks | null => {
     if (mode === "strict") return null;
-    return { lines: markLines(items ? { attempt, items } : { attempt }), ...(mode === "one-candidate" ? { retryLabel: policy.retryLabel } : {}) };
+    return { lines: markLines({ attempt, ...(items ? { items } : {}), ...(files ? { files } : {}) }), ...(mode === "one-candidate" ? { retryLabel: policy.retryLabel } : {}) };
   };
+  /** This function gives the file changes of a sync result for the files mark and the plan of the candidate rules. */
+  const filesOfSync = (r: SyncResult): CandidateItem[] | null => syncItems(Object.keys(r.writes), r.removes, r.install);
 
   /**
    * This function reads the commits of the branch of an open pull request after the default branch. It gives a hold when a
@@ -1682,7 +1760,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       yieldMaxHours: YIELD_MAX_HOURS,
       plan,
       open: pr
-        ? { fingerprint: bodyFingerprint(pr.body), attempt: bodyAttempt(pr.body), items: bodyItems(pr.body), createdAt: pr.created_at ? Date.parse(pr.created_at) : null, retryLabel: hasLabel(pr, policy.retryLabel) }
+        ? { fingerprint: bodyFingerprint(pr.body), attempt: bodyAttempt(pr.body), items: kind === "sync" ? bodyFiles(pr.body) : bodyItems(pr.body), createdAt: pr.created_at ? Date.parse(pr.created_at) : null, retryLabel: hasLabel(pr, policy.retryLabel) }
         : null,
     };
     if (!read) {
@@ -1910,9 +1988,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     o.maxPushes !== undefined && pushes >= o.maxPushes ? `This run pushed ${pushes} branches, the most of one run, because the runners are shared. A later run pushes this one.` : null;
   /**
    * This map holds the merges of the default branch into labeled pull requests in the queue of this run. The key is
-   * `repo#number`, and the value is the text for the detail. The function catchUp gives this text later, with no second merge.
+   * `repo#number`, and the value is the outcome of the merge. The function catchUp gives its text later, with no second merge.
    */
-  const caught = new Map<string, string>();
+  const caught = new Map<string, CaughtUp>();
   let startFallbacks = 0;
   /** This function gives the reason why a sync push waits for the busy runners, or null when it can push. */
   const busyWait = async (repo: string): Promise<string | null> => {
@@ -2019,7 +2097,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       items.push({
         at: inherit(waitMs(await pushTime(repo, pr)), releases),
         tie: tie0 + items.length,
-        run: async () => void caught.set(key, (await catchUp(repo, pr, main)).note),
+        run: async () => void caught.set(key, await catchUp(repo, pr, main)),
       });
     }
     return items;
@@ -2171,7 +2249,8 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         const state: RepoState = !s || (due && s.state === "unchanged") ? "waiting" : s.state;
         record.cause = state === "waiting" ? "limit" : (s?.held ?? null);
         record.caughtUp = s?.caughtUp === true;
-        const detail = state === "waiting" ? `${s ? `${s.detail} ` : ""}${wait}` : (s?.detail ?? wait);
+        // The detail of settle tells the limit when the limit held its merge of the default branch: the text comes once.
+        const detail = state === "waiting" ? (s?.limited ? s.detail : `${s ? `${s.detail} ` : ""}${wait}`) : (s?.detail ?? wait);
         result({ ...common, state, ...(state === "waiting" ? { paced: true } : {}), pr: prRef(existing), autoMerge: s ? "train" : null, ci: s?.ci ?? null, detail, ...(s ? mergedOf(s) : {}) });
         return;
       }
@@ -2321,7 +2400,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
           return { wait: busy, cause: busy !== null ? "busy" : null };
         };
         const early = mode === "shadow" && !existing ? await waitOf() : null;
-        const step = await candidateStep(mode, "sync", commonOf(planned), target, meta, { fingerprint: planned.fingerprint, items: null }, false, record, early?.cause ?? null);
+        const step = await candidateStep(mode, "sync", commonOf(planned), target, meta, { fingerprint: planned.fingerprint, items: filesOfSync(planned) }, false, record, early?.cause ?? null);
         if (step.done) return;
         const act = step.act;
         const rebuild = act ? act.rebuild === true : await needsRebuild(repo, existing, meta.default_branch);
@@ -2380,7 +2459,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
           sha: r.sha,
           title: SYNC_TITLE,
           // Without a new clone, the body keeps the name of the tool that made the lockfile.
-          body: existing && r.status === "same" && r.tool === null && existing.body ? existing.body : syncPrBody(done, r.tool, rules, marksOf(mode, attemptOf(existing, done.fingerprint, pushed, act, record.facts?.ci?.state === "failed"), null)),
+          body: existing && r.status === "same" && r.tool === null && existing.body ? existing.body : syncPrBody(done, r.tool, rules, marksOf(mode, attemptOf(existing, done.fingerprint, pushed, act, record.facts?.ci?.state === "failed"), null, filesOfSync(done))),
           note: "",
           settle: act === null,
           ...(act?.removeLabel ? { removeLabel: policy.retryLabel } : {}),
@@ -2474,6 +2553,9 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   // A merge by Renovate or by the auto-merge of GitHub has no hold for a release run, so GitHub can refuse a tag. The train
   // merges them with the holds of settle. This step comes after the releases, so a release run that this run started holds too.
   await mergeLabeled();
+
+  // 7. The error notes: the reason of each error of this run, on the open pull request of the repository (errorNote).
+  if (!o.dryRun) await errorNotes();
 
   const changed = new Set(sel.ready.flatMap((u) => u.items.map((i) => i.dep)));
   const urgentUnused = [...new Set(o.urgent ?? [])].filter((n) => !urgentNames.has(n) || !changed.has(n)).length;

@@ -5,9 +5,11 @@ import type { HoldReading, LagHold } from "./holds.ts";
 import { applyHolds, lagOver, lagReport, lagSummary } from "./lag.ts";
 import type { LagReport } from "./lag.ts";
 import { accountOfRepos, authorizationOf, needShares, parseTokens, runAccounts, type Accounts } from "./accounts.ts";
-import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pendingVersions, publicReport } from "./apply.ts";
+import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pendingVersions, publicReport, redactName } from "./apply.ts";
+
+export { redactName };
 import type { ApplyReport } from "./apply.ts";
-import { budgetGate, DEFAULT_NEED, DEFAULT_WAIT_MINUTES, goOnUrgent, rateGuard } from "./budget.ts";
+import { addCost, budgetGate, DEFAULT_WAIT_MINUTES, goOnUrgent, needOfRuns, rateGuard } from "./budget.ts";
 import { collect, listAccounts, pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { writeDb } from "./db.ts";
@@ -27,6 +29,8 @@ import { backfillTags, checkWriteWindow, defaultSince, ghCommand, tagRepos, tags
 import { versionFixRun, versionFixSummary } from "./version-fix.ts";
 import { gitUpdater } from "./workspace.ts";
 import { RateStop, requestMeter } from "./meter.ts";
+import { keptGitHubFetch, keptSecretProblem, openTrainKept, sealTrainKept } from "./kept.ts";
+import type { KeptRun } from "./kept.ts";
 
 /** The options of the command line. */
 export interface CliOptions {
@@ -65,8 +69,11 @@ export interface CliOptions {
   workflows: WorkflowsMode;
   /** `apply`: the most branches that one run pushes, for the update pushes and the sync pushes together. */
   maxPushes: number;
-  /** `apply`: the GitHub requests that a run needs at its start. With fewer requests, the run waits for the reset or stops. 0 turns off the gate. */
-  rateNeed: number;
+  /**
+   * `apply`: the GitHub requests that a run needs at its start. With fewer requests, the run waits for the reset or stops.
+   * 0 turns off the gate. Null: the need comes from the last full applies in the state file (`needOfRuns`).
+   */
+  rateNeed: number | null;
   /** `apply`: the longest wait for the reset of the rate limit, in minutes. */
   rateWait: number;
   /** `apply`: the public packages with a security fix. Their updates go first and pass the limit of pushes. */
@@ -83,6 +90,11 @@ export interface CliOptions {
   holds?: string;
   /** `apply`: the state file of the train. The run reads it at the start and writes it at the end. */
   state?: string;
+  /**
+   * `apply`: the sealed file of the kept answers of the GitHub API. The run opens it at the start and seals it at the end. The
+   * secret of the seal is the environment variable RELEASE_TRAIN_KEPT_KEY. With no usable secret, the run keeps no answer.
+   */
+  kept?: string;
   /** `lag`: a saved report. The command then reads no repository. */
   fromReport?: string;
   /** `holds`: the earlier file of the holds. */
@@ -125,7 +137,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     sync: true,
     workflows: "auto",
     maxPushes: MAX_PUSHES,
-    rateNeed: DEFAULT_NEED,
+    rateNeed: null,
     rateWait: DEFAULT_WAIT_MINUTES,
     urgent: null,
     takeReplaced: false,
@@ -163,6 +175,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     else if (a === "--gate") o.gate = true;
     else if (a === "--holds") o.holds = value();
     else if (a === "--state") o.state = value();
+    else if (a === "--kept") o.kept = value();
     else if (a === "--from-report") o.fromReport = value();
     else if (a === "--before") o.before = value();
     else if (a === "--package") o.packageName = value();
@@ -321,12 +334,6 @@ export function parseAuthor(text: string | null): { name: string; email: string 
   const name = text && lt > 0 ? text.slice(0, lt).trim() : "";
   const email = text && gt > lt + 1 ? text.slice(lt + 1, gt).trim() : "";
   return name && email ? { name, email } : { name: "release-train", email: "release-train@users.noreply.github.com" };
-}
-
-/** This function replaces each whole occurrence of a name in a text. A longer word that holds the name does not change. */
-export function redactName(text: string, name: string, by: string): string {
-  const esc = name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
-  return text.replace(new RegExp(`(?<![\\w-])${esc}(?![\\w-])`, "g"), by);
 }
 
 /** This function replaces each given name in a text with its hash. A longer name goes first. */
@@ -500,19 +507,37 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
   };
   // The end of a run that the guard stopped. The `try` block sets it after the gate.
   let guardStop: ((stop: RateStop) => Promise<number>) | null = null;
+  // The kept answers of the run, and if the run was complete. The `finally` block seals them.
+  let kept: KeptRun | null = null;
+  let keptComplete = false;
+  const keptSecret = process.env["RELEASE_TRAIN_KEPT_KEY"] ?? "";
   try {
     const accounts = accountsOf(o, tok);
     const read = o.state === undefined ? null : readState(o.state);
     if (read?.note) log(read.note);
+    // A fixed --rate-need wins. Else the need comes from the costs of the last full applies in the state.
+    const runNeed = o.rateNeed !== null ? { need: o.rateNeed, note: null } : needOfRuns(read?.state.costs ?? []);
+    if (runNeed.note !== null) log(runNeed.note);
     // The meter counts each GitHub request of the run by its route. Each part of the run that takes a fetch gets its fetch.
     const meter = requestMeter(deps.fetch);
+    // The kept answers (kept.ts) sit between the guard and the meter: the meter counts each real 304, and GitHub does not
+    // count a 304 against the rate limit. A run with no usable secret goes on with no store.
+    if (o.kept !== undefined) {
+      const problem = keptSecretProblem(keptSecret);
+      if (problem !== null) log(`kept answers: off, because ${problem}`);
+      else {
+        kept = await openTrainKept(o.kept, keptSecret);
+        log(kept.note ?? `kept answers: ${kept.opened.length} from the run before`);
+      }
+    }
+    const keptOrMeter = kept === null ? meter.fetch : keptGitHubFetch(meter.fetch, kept.store);
     // This client has no guard. The gate, the urgent names at a stop of the gate and the reads of the rate limit use it.
     const gh0 = gitHub({ token: tok, fetch: meter.fetch });
     // The gate reads the rate limit (GitHub does not count GET /rate_limit). With too few requests left, it waits for the
     // reset on a timer that keeps Node alive, or it gives a stop. Its last read is the read at the start of the run.
     // The read is only the first value of the live budget: the meter adds the headers of each answer to the tracker.
     const gate = await budgetGate({
-      need: o.rateNeed,
+      need: runNeed.need,
       maxWaitMs: o.rateWait * 60_000,
       read: () => readRateLimit(gh0),
       tracker: meter.rate,
@@ -546,9 +571,9 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     let shareOf = (credential: string): number => (credential === home ? 1 : 0);
     // The guard checks each request after the gate on the live budget of its token. An urgent run needs no budget, only a
     // window that is not spent. A run that waited at the gate does not wait again (budget.ts).
-    const guard = rateGuard(meter.fetch, {
+    const guard = rateGuard(keptOrMeter, {
       tracker: meter.rate,
-      need: gateRecord.outcome === "urgent" ? 0 : o.rateNeed,
+      need: gateRecord.outcome === "urgent" ? 0 : runNeed.need,
       share: (credential) => shareOf(credential),
       maxWaitMs: o.rateWait * 60_000,
       waited: gateRecord.outcome === "waited",
@@ -633,15 +658,33 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     const applied = guard.stopped();
     if (applied && inActions) process.stdout.write(`::notice::${applied.message}\n`);
     if (o.state !== undefined && starts) {
-      writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen() })}\n`);
+      // A full apply is a live run of all repositories that the guard did not stop. Only its count goes into the need.
+      // GitHub does not count an answer 304 against the rate limit, so the need does not count it either.
+      const requests = meter.routes().reduce((sum, r) => sum + r.count - r.notModified, 0);
+      const prior = read?.state.costs ?? [];
+      const costs = !o.dryRun && o.only === null && !applied ? addCost(prior, requests) : prior;
+      writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen(), costs })}\n`);
       const c = starts.counts();
       log(`need starts: ${c.npm} from npm, ${c.state} from the state, ${c.sync} sync waits from the state`);
     }
+    // A complete run asked for each answer that it needs again, so the store keeps only the entries of this run.
+    keptComplete = o.only === null && !applied;
     return finish(report);
   } catch (e) {
     if (e instanceof RateStop && guardStop !== null) return await guardStop(e);
     process.stderr.write(`${redact(e instanceof Error ? e.message : String(e))}\n`);
     return 1;
+  } finally {
+    if (kept !== null && o.kept !== undefined) {
+      try {
+        const sealed = await sealTrainKept(o.kept, kept, keptSecret, keptComplete);
+        const merged = keptComplete ? "" : ", with the entries of the run before";
+        log(`kept answers: sealed ${sealed.entries} entries, ${Math.ceil(sealed.bytes / 1024)} KiB${merged}`);
+      } catch (error) {
+        // The next run then opens the file of the cache before, or none. A failed seal does not fail the run.
+        log(`kept answers: the seal failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 }
 

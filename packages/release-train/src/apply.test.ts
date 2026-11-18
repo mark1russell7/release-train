@@ -8,6 +8,7 @@ import {
   BUSY_LIMIT,
   CLAUDE_LINE,
   COMPARE_FILES_MAX,
+  ERROR_MARK,
   MERGE_LABEL,
   OTHERS_MARK,
   RENOVATE_REBASE_BOX,
@@ -17,6 +18,7 @@ import {
   apply,
   applySummary,
   bodyFingerprint,
+  errorNote,
   ciState,
   hashName,
   latestRuns,
@@ -1024,6 +1026,8 @@ describe("the pace of the update pushes", () => {
     // The merge of main starts CI as a push does, so it also waits for the limit of pushes.
     expect(behind.calls.some((c) => c.method === "PUT" && c.path.endsWith("/pulls/7/update-branch"))).toBe(false);
     expect(behind.x?.detail).toContain("The merge of main into the branch waits");
+    // The detail tells the limit of the run once, not again after the text of the merge.
+    expect(behind.x?.detail.split("This run pushed 0 branches")).toHaveLength(2);
   });
 
   it("counts only a real push: a clone that pushes nothing leaves the limit free, and a branch that has its changes can still push", async () => {
@@ -2438,6 +2442,67 @@ describe("a stop of the guard in a run of apply", () => {
       throw new Error("example failure");
     });
     await expect(r).rejects.toThrow("example failure");
+  });
+});
+
+describe("the error note on a pull request", () => {
+  const author = { name: "train-app[bot]", email: "1+train-app[bot]@users.noreply.github.com" };
+  const byTrain: CompareCommit = { sha: "aaaaaaa1", commit: { author: { name: author.name, email: author.email } }, author: { login: author.name } };
+
+  /** A run whose push to the open pull request 7 of the private repository secret-repo fails with `error`. */
+  const run = async (error: string, opts: { comments?: { id: number; body: string }[]; dryRun?: boolean; listed?: boolean } = {}) => {
+    const s = server({
+      ...green,
+      [`GET ${base}/secret-repo/commits/sha7/check-runs`]: () => [200, { check_runs: [{ status: "in_progress", conclusion: null }] }],
+      [`GET ${base}/secret-repo/compare/main...sha7`]: () => [200, { behind_by: 0, ahead_by: 1, commits: [byTrain] }],
+      [`GET ${base}/secret-repo/pulls`]: (_b, u) => [200, u.searchParams.get("state") === "open" ? [pull(7, "secret-repo")] : []],
+      [`GET ${base}/secret-repo/pulls/7`]: () => [200, { ...pull(7, "secret-repo"), mergeable: true }],
+      [`GET ${base}/secret-repo`]: meta,
+      [`POST ${base}/secret-repo/labels`]: () => [201, {}],
+      [`GET ${base}/secret-repo/issues/7/comments`]: () => (opts.listed === false ? [500, { message: "Server Error" }] : [200, opts.comments ?? []]),
+      [`POST ${base}/secret-repo/issues/7/comments`]: () => [201, {}],
+      [`PATCH ${base}/secret-repo/issues/comments/55`]: () => [200, {}],
+    });
+    // A second private repository: its name in a reason becomes its hash.
+    const p = fixture();
+    for (const r of p.repos) if (r.name === "stale-repo") r.private = true;
+    const r = await apply({ owner: OWNER, plan: p, gh: s.gh, updater: updater({ status: "failed", sha: null, error }), dryRun: opts.dryRun ?? false, only: ["secret-repo"], candidatePolicy: SHADOW, author });
+    const writes = s.calls.filter((c) => (c.method === "POST" || c.method === "PATCH") && c.path.includes("/comments"));
+    return { r, calls: s.calls, writes };
+  };
+
+  it("writes the reason of a private repository on its own pull request, with the other private names hidden", async () => {
+    const first = await run("pnpm install --lockfile-only failed (exit 1): ERR_PNPM_FETCH_404 stale-repo of secret-repo");
+    expect(first.r.results[0]).toMatchObject({ repo: "secret-repo", state: "error" });
+    expect(first.writes.map((c) => `${c.method} ${c.path}`)).toEqual([`POST ${base}/secret-repo/issues/7/comments`]);
+    const body = String(first.writes[0]?.body?.["body"]);
+    expect(body).toContain(`ERR_PNPM_FETCH_404 ${hashName("stale-repo")} of secret-repo`);
+    expect(body).not.toContain("stale-repo");
+    expect(body).toContain(ERROR_MARK);
+    expect(body).toContain(CLAUDE_LINE);
+    // The public report still hides the reason.
+    expect(publicReport(first.r).results[0]?.detail).toBe("A private repository: error.");
+    // The same reason in a later run writes nothing; a new reason edits the note.
+    const same = await run("pnpm install --lockfile-only failed (exit 1): ERR_PNPM_FETCH_404 stale-repo of secret-repo", { comments: [{ id: 55, body }] });
+    expect(same.writes).toEqual([]);
+    const next = await run("git push failed (exit 1): remote rejected", { comments: [{ id: 9, body: "a comment of a person" }, { id: 55, body }] });
+    expect(next.writes.map((c) => `${c.method} ${c.path}`)).toEqual([`PATCH ${base}/secret-repo/issues/comments/55`]);
+    expect(String(next.writes[0]?.body?.["body"])).toContain("git push failed (exit 1): remote rejected");
+  });
+
+  it("writes no note in a dry run, or when GitHub does not list the comments", async () => {
+    const dry = await run("example failure", { dryRun: true });
+    expect(dry.calls.some((c) => c.path.includes("/comments"))).toBe(false);
+    const unlisted = await run("example failure", { listed: false });
+    expect(unlisted.writes).toEqual([]);
+  });
+
+  it("keeps the day of the first run with the same reasons in the mark", () => {
+    const a = errorNote(["one", "two"], "2026-11-18");
+    expect(a.body).toContain("in its run of 2026-11-18:\n\n- one\n- two");
+    expect(errorNote(["one", "two"], "2026-11-19").mark).toBe(a.mark);
+    expect(errorNote(["one"], "2026-11-18").mark).not.toBe(a.mark);
+    expect(a.mark.startsWith(ERROR_MARK)).toBe(true);
   });
 });
 
