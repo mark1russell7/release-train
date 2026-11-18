@@ -382,6 +382,11 @@ describe("the decision table", () => {
     expect(decision(facts({ ci: { state: "running", stuck: false }, open: { ...facts().open!, retryLabel: true } }))).toMatchObject({ action: "wait", rule: "R1" });
   });
 
+  it("a CI state with no read waits, also with the retry label, and never merges", () => {
+    expect(decision(facts({ ci: { state: "unread", stuck: false } }))).toMatchObject({ action: "wait", rule: "R1", code: "ci-unread" });
+    expect(decision(facts({ ci: { state: "unread", stuck: false }, open: { ...facts().open!, retryLabel: true } }))).toMatchObject({ action: "wait", code: "ci-unread" });
+  });
+
   it("row 3: CI runs, so the train waits", () => {
     expect(decision(facts({ ci: { state: "running", stuck: false } }))).toMatchObject({ action: "wait", rule: "R1" });
   });
@@ -454,7 +459,7 @@ describe("the decision table", () => {
 });
 
 describe("the codes of the decisions", () => {
-  const ci = (state: "none" | "failed" | "running") => ({ ci: { state, stuck: false } });
+  const ci = (state: "none" | "failed" | "running" | "unread") => ({ ci: { state, stuck: false } });
   const plan2 = { plan: { fingerprint: "fp2", items: ITEMS } };
   /** One case for each code: the code, the facts and the policy. */
   const cases: [CandidateCode, CandidateFacts, CandidatePolicy?][] = [
@@ -462,6 +467,7 @@ describe("the codes of the decisions", () => {
     ["no-candidate", facts({ open: null, lastPushAt: null })],
     ["urgent-plan-changed", facts({ urgent: true, ...plan2 })],
     ["urgent-not-current", facts({ urgent: true, behind: 2 })],
+    ["ci-unread", facts(ci("unread"))],
     ["label-building", facts({ ...ci("running"), open: { ...facts().open!, retryLabel: true } })],
     ["label-retry", facts({ open: { ...facts().open!, retryLabel: true } })],
     ["building", facts(ci("running"))],

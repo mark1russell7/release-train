@@ -166,6 +166,7 @@ export const CANDIDATE_CODES = [
   "no-candidate",
   "urgent-plan-changed",
   "urgent-not-current",
+  "ci-unread",
   "label-building",
   "label-retry",
   "building",
@@ -291,6 +292,8 @@ export function decide(p: CandidatePolicy, f: CandidateFacts): CandidateStep {
     if (f.mergeable === false || (f.behind ?? 0) > 0) return done({ action: "push", rule: "urgent", code: "urgent-not-current", reason: "an urgent update that is not on the current default branch", attempt: buildAttempt(o, planChanged, f.ci), rebuild: true });
   }
   if (f.ci === undefined) return { need: "ci" };
+  // A CI state with no read waits, also for the retry label: the train does not know if the candidate builds or failed.
+  if (f.ci.state === "unread") return done({ action: "wait", rule: "R1", code: "ci-unread", reason: "no read of the CI state: a read of the check runs or of the commit status failed" });
   const building = f.ci.state === "running" && !f.ci.stuck;
   const next = buildAttempt(o, planChanged, f.ci);
   // Step 2: the retry label passes R3 and R5, but not R1.
