@@ -21,7 +21,7 @@
     "vitest": "^5.0.3"
   },
   "dependencies": {
-    "@mark1russell7/conventions": "^0.46.1",
+    "@mark1russell7/conventions": "^0.48.1",
     "@mark1russell7/service": "^0.9.0",
     "@mark1russell7/site-pages": "^0.8.0",
     "@mark1russell7/text": "^0.0.16",
