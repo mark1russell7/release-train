@@ -219,7 +219,7 @@ describe("treePathsChanged", () => {
     const reads: string[] = [];
     const read = async (t: string) => {
       reads.push(t);
-      return t in trees ? trees[t] : null;
+      return trees[t] ?? null;
     };
     return { read, reads };
   };
