@@ -6,6 +6,8 @@ import type { CandidateTarget } from "./candidate-facts.ts";
 import { CANDIDATE_POLICY, bodyAttempt, bodyFiles, bodyItems, candidateItems, decide, decideWith, markLines, modeFor, nextAttempt, syncItems } from "./candidate-policy.ts";
 import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateKind, CandidateMode, CandidatePolicy, CandidateRule, DecideResult } from "./candidate-policy.ts";
 import { guardLine } from "./budget.ts";
+import { gateReasons, gatesFor, readMergeGates } from "./merge-gates.ts";
+import type { CommitStatus, GateReading } from "./merge-gates.ts";
 import { pool } from "./collect.ts";
 import { rateLimitLine } from "./github.ts";
 import type { GitHub, RateLimitReport } from "./github.ts";
@@ -450,8 +452,9 @@ export interface CandidatePair {
  * `release-check`: the repository publishes, and no release check passed on the head commit (see `releaseCheckLets`).
  * `merge-failed`: GitHub refused the merge of a candidate, and no push follows. Only the mode `one-candidate` gives it.
  * `other-commits`: the branch of the open pull request has a commit that the train did not write, or GitHub did not list its commits. Refer to `otherCommits`.
+ * `merge-gate`: the change covers a merge gate of the repository, and its commit status is missing, not `success` or old (see `merge-gates.ts`).
  */
-export type HeldCause = "limit" | "busy" | "young" | "release-run" | "release-check" | "skip" | "error" | "merge-failed" | "other-commits";
+export type HeldCause = "limit" | "busy" | "young" | "release-run" | "release-check" | "skip" | "error" | "merge-failed" | "other-commits" | "merge-gate";
 
 /**
  * A decision of the candidate rules in a count. `not read`: the run read no fact for the branch. In a held pair, the branch
@@ -1399,12 +1402,13 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
    * This function gives the number of commits of the default branch that are not in `sha`, or null when GitHub does not
    * answer. A branch that is behind has CI on an old base. A merge then can give a lockfile with no entry for a version.
    */
-  const compareOf = async (repo: string, sha: string, defaultBranch: string): Promise<{ behind: number; workflows: boolean } | null> => {
+  const compareOf = async (repo: string, sha: string, defaultBranch: string): Promise<{ behind: number; workflows: boolean; files: string[]; cut: boolean } | null> => {
     const res = await gh.request<{ behind_by: number; files?: { filename: string }[] }>("GET", `${at(repo)}/compare/${encodeURIComponent(defaultBranch)}...${sha}`);
     if (typeof res.data?.behind_by !== "number") return null;
-    const files = res.data.files ?? [];
+    const files = (res.data.files ?? []).map((f) => f.filename);
     // GitHub gives at most COMPARE_FILES_MAX files. A longer list can hide a workflow file, so it counts as one.
-    return { behind: res.data.behind_by, workflows: files.length >= COMPARE_FILES_MAX || files.some((f) => f.filename.startsWith(WORKFLOWS_DIR)) };
+    const cut = files.length >= COMPARE_FILES_MAX;
+    return { behind: res.data.behind_by, workflows: cut || files.some((f) => f.startsWith(WORKFLOWS_DIR)), files, cut };
   };
   const behindBy = async (repo: string, sha: string, defaultBranch: string): Promise<number | null> => (await compareOf(repo, sha, defaultBranch))?.behind ?? null;
 
@@ -1454,6 +1458,48 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     const release = known ?? (await checksOf(repo, sha)).release;
     if (releaseCheckLets(release, privateOf.get(repo) ?? false)) return null;
     return `CI is green, but the repository publishes and the release check of this commit is ${release}. The release check starts the release build on a pull request (the job release-check of reusable-ci.yml, or the action release-check of the template). The train merges after it passes.`;
+  };
+
+  /**
+   * This function reads the merge gates of a repository from the root package.json of its default branch (merge-gates.ts).
+   * A repository with no root package.json has no gates. A read that fails gives null, and the merge waits: a gate that
+   * cannot read gives no pass. One read for each repository in a run.
+   */
+  const gatesOf = new Map<string, GateReading | null>();
+  const mergeGates = async (repo: string, defaultBranch: string): Promise<GateReading | null> => {
+    if (!gatesOf.has(repo)) {
+      const res = await gh.request<{ content?: string }>("GET", `${at(repo)}/contents/package.json?ref=${encodeURIComponent(defaultBranch)}`);
+      let reading: GateReading | null = null;
+      if (res.status === 404) reading = { gates: [], faults: [] };
+      else if (res.ok && typeof res.data?.content === "string") {
+        try {
+          reading = readMergeGates(JSON.parse(Buffer.from(res.data.content, "base64").toString("utf8")));
+        } catch {
+          reading = { gates: [], faults: ["the root package.json is not valid JSON"] };
+        }
+      }
+      gatesOf.set(repo, reading);
+    }
+    return gatesOf.get(repo) ?? null;
+  };
+
+  /**
+   * This function gives the reason why a green pull request waits for a merge gate, or null when the merge can go. A gate
+   * of the repository covers the change when one of its patterns matches a changed file. When the list of files is cut or
+   * not read (`cut`), each gate covers the change. Each gate that covers the change needs its commit status in the state `success`, at most
+   * `maxAgeMinutes` old. A wrong entry of the gates holds each merge of the repository.
+   */
+  const gateHold = async (repo: string, sha: string, defaultBranch: string, files: readonly string[], cut: boolean): Promise<string | null> => {
+    const reading = await mergeGates(repo, defaultBranch);
+    if (reading === null) return `CI is green, but GitHub did not give the root package.json of ${defaultBranch}, so the train cannot read the merge gates. The train does not merge it now.`;
+    if (reading.faults.length > 0) return `CI is green, but the merge gates of the root package.json are not valid: ${reading.faults.join("; ")}. The train does not merge until they are fixed.`;
+    const covered = gatesFor(reading.gates, files, cut);
+    if (covered.length === 0) return null;
+    const res = await gh.request<{ statuses?: CommitStatus[] }>("GET", `${at(repo)}/commits/${sha}/status?per_page=100`);
+    if (!res.ok || !res.data) return `CI is green, but GitHub did not give the commit statuses for the merge gates. The train does not merge it now.`;
+    const reasons = gateReasons(covered, res.data.statuses ?? [], (o.now ?? new Date()).getTime());
+    if (reasons.length === 0) return null;
+    return `CI is green, but a merge gate holds it: ${reasons.join("; ")}. The train merges when each status of a gate is success and fresh.`;
   };
 
   /**
@@ -1554,6 +1600,8 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
       }
       const hold = await releaseHold(repo, pr.head.sha, release);
       if (hold !== null) return { state: "unchanged", ci, held: "release-check", detail: hold };
+      const gate = await gateHold(repo, pr.head.sha, main, cmp.files, cmp.cut);
+      if (gate !== null) return { state: "unchanged", ci, held: "merge-gate", detail: gate };
       const m = await gh.request("PUT", `${at(repo)}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
       if (m.ok) {
         if (deleteBranch) await gh.request("DELETE", `${at(repo)}/git/refs/heads/${branch}`);
@@ -1885,6 +1933,13 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     if (hold !== null) {
       record.cause = "release-check";
       result({ ...common, state: "unchanged", pr: prRef(pr), autoMerge, ci, detail: hold });
+      return null;
+    }
+    // A list of files that GitHub did not give can hide a file of a gate, so each gate counts.
+    const gate = await gateHold(repo, pr.head.sha, main, cmp?.files ?? [], cmp === null || cmp.cut);
+    if (gate !== null) {
+      record.cause = "merge-gate";
+      result({ ...common, state: "unchanged", pr: prRef(pr), autoMerge, ci, detail: gate });
       return null;
     }
     const m = await gh.request("PUT", `${at(repo)}/pulls/${pr.number}/merge`, { merge_method: mergeMethod(meta), sha: pr.head.sha });
