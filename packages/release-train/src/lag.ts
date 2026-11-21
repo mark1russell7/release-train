@@ -24,9 +24,11 @@ const COMPARE_FILES = 300;
  * The reason that a package has no release of its change.
  *
  * - `kept-version`: the version on the default branch is the published version, so a release starts only after a new number.
+ * - `pending-changeset`: the version on the default branch is the published version, and a changeset on the default branch
+ *   raises it. So the release waits for the release workflow of the repository, not for a new number.
  * - `release-missing`: the default branch has a new version, and npm does not have it.
  */
-export type LagReason = "kept-version" | "release-missing";
+export type LagReason = "kept-version" | "pending-changeset" | "release-missing";
 
 /** One package whose source on the default branch differs from its latest published version. */
 export interface LagRow {
@@ -47,6 +49,8 @@ export interface LagRow {
   partial: boolean;
   ageDays: number;
   reason: LagReason;
+  /** The changeset files on the default branch that raise the version, when the reason is `pending-changeset`. */
+  changesets?: string[];
   /** True when the age is over the limit. A hold does not change this field. */
   over: boolean;
   /** The hold of a row over its limit. */
@@ -166,6 +170,43 @@ const USED_FIELDS: readonly string[] = [
   "type",
   "types",
 ];
+
+/**
+ * This function gives the names of the packages in the front matter of a changeset. An empty changeset (two `---` lines)
+ * gives no name. A text with no front matter gives no name.
+ */
+export function changesetNames(text: string): string[] {
+  const lines = text.split(/\r?\n/);
+  if (lines[0]?.trim() !== "---") return [];
+  const names: string[] = [];
+  for (const line of lines.slice(1)) {
+    if (line.trim() === "---") return names;
+    const m = /^\s*["']?([^"':\s]+)["']?\s*:\s*(major|minor|patch)\s*$/.exec(line);
+    if (m?.[1] !== undefined) names.push(m[1]);
+  }
+  return [];
+}
+
+/**
+ * This function tells if a changeset raises the version of a package: the changeset names the package, or names a package
+ * of a `fixed` group of the package. In a fixed group each package gets the new version. A `*` in a group item matches
+ * any text with no "/", as in Changesets. A `linked` group raises only the packages that a changeset names, so it does
+ * not count here.
+ */
+export function changesetRaises(name: string, named: readonly string[], fixed: readonly (readonly string[])[]): boolean {
+  if (named.includes(name)) return true;
+  const matcher = (item: string): RegExp => new RegExp(`^${item.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("[^/]*")}$`);
+  return fixed.some((group) => {
+    const tests = group.map(matcher);
+    return tests.some((t) => t.test(name)) && named.some((n) => tests.some((t) => t.test(n)));
+  });
+}
+
+/** The changesets on the default branch of a repository: each file with the names of its front matter, and the fixed groups. */
+export interface PendingChangesets {
+  files: { file: string; names: string[] }[];
+  fixed: string[][];
+}
 
 /** This function gives the text of the part of a `package.json` that a user of the package gets. */
 export function usedManifest(manifest: Readonly<Record<string, unknown>>): string {
@@ -316,6 +357,39 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     return c;
   };
 
+  // The changesets on the default branch, with one read of each repository, and only for a row with a kept version. A
+  // failed read gives no changeset, so the reason stays `kept-version`. The reason is text only: the gate does not read it.
+  const readPending = async (repo: string, branch: string): Promise<PendingChangesets> => {
+    const ref = encodeURIComponent(branch);
+    const list = await i.gh.request<{ name?: unknown; type?: unknown }[]>("GET", `${slug(repo)}/contents/.changeset?ref=${ref}`);
+    if (!Array.isArray(list.data)) return { files: [], fixed: [] };
+    const md = list.data
+      .map((e) => (e.type === "file" && typeof e.name === "string" ? e.name : ""))
+      .filter((name) => name.endsWith(".md") && name.toLowerCase() !== "readme.md");
+    const texts = await Promise.all(
+      md.map(async (name) => {
+        const r = await i.gh.request<{ content?: string }>("GET", `${slug(repo)}/contents/.changeset/${encodeURIComponent(name)}?ref=${ref}`);
+        return typeof r.data?.content === "string" ? Buffer.from(r.data.content, "base64").toString("utf8") : "";
+      }),
+    );
+    const files = md.map((file, at) => ({ file, names: changesetNames(texts[at] ?? "") })).filter((x) => x.names.length > 0);
+    if (files.length === 0) return { files, fixed: [] };
+    const config = await readManifest(repo, ".changeset/config.json", branch);
+    const fixedField = config?.["fixed"];
+    const groups: unknown[] = Array.isArray(fixedField) ? fixedField : [];
+    const fixed = groups.filter(Array.isArray).map((g) => (g as unknown[]).filter((x): x is string => typeof x === "string"));
+    return { files, fixed };
+  };
+  const pendings = new Map<string, Promise<PendingChangesets>>();
+  const pendingOf = (repo: string, branch: string): Promise<PendingChangesets> => {
+    let c = pendings.get(repo);
+    if (c === undefined) {
+      c = readPending(repo, branch).catch(() => ({ files: [], fixed: [] }));
+      pendings.set(repo, c);
+    }
+    return c;
+  };
+
   const unread: LagUnread[] = [];
   const miss = (p: PackageNode, detail: string): null => {
     unread.push({ repo: p.repo, private: p.repoPrivate, package: p.name, detail });
@@ -392,6 +466,13 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
     if (shown === undefined) return miss(p, "GitHub listed changed files with no commit.");
     const at = shown.commit.committer.date;
     const age = now - Date.parse(at);
+    let reason: LagReason = p.version === published ? "kept-version" : "release-missing";
+    let changesets: string[] = [];
+    if (reason === "kept-version") {
+      const pending = await pendingOf(p.repo, branch);
+      changesets = pending.files.filter((x) => changesetRaises(p.name, x.names, pending.fixed)).map((x) => x.file);
+      if (changesets.length > 0) reason = "pending-changeset";
+    }
     return {
       repo: p.repo,
       private: p.repoPrivate,
@@ -403,7 +484,8 @@ export async function lagReport(i: LagInput): Promise<LagReport> {
       firstChange: { sha: shown.sha, title: shown.commit.message.split("\n")[0] ?? "", at },
       partial,
       ageDays: days(age),
-      reason: p.version === published ? "kept-version" : "release-missing",
+      reason,
+      ...(changesets.length > 0 ? { changesets } : {}),
       over: age > LAG_LIMIT_MS,
     };
   };
@@ -527,8 +609,16 @@ function gateLine(r: LagReport): string {
 
 const WHY: Record<LagReason, string> = {
   "kept-version": "the version did not change, so no release starts",
+  "pending-changeset": "a changeset on the branch raises the version, so the release waits for the release workflow",
   "release-missing": "the new version is not on npm",
 };
+
+/** This function gives the reason of a row, with the changesets that raise its version (at most 3 names). */
+function whyOf(x: LagRow): string {
+  const files = x.changesets ?? [];
+  if (files.length === 0) return WHY[x.reason];
+  return `${WHY[x.reason]} (${files.slice(0, 3).join(", ")}${files.length > 3 ? `, ${files.length - 3} more` : ""})`;
+}
 
 /** This function gives the report as Markdown. */
 export function lagSummary(r: LagReport): string {
@@ -549,7 +639,7 @@ export function lagSummary(r: LagReport): string {
     for (const x of rows) {
       const age = `${x.partial ? "over " : ""}${x.ageDays}`;
       const title = x.firstChange.title.replaceAll("|", "\\|");
-      lines.push(`| ${x.package} | ${x.published} | ${x.onBranch ?? "?"} | ${age} | ${WHY[x.reason]} | ${x.firstChange.sha.slice(0, 7)} ${title} |`);
+      lines.push(`| ${x.package} | ${x.published} | ${x.onBranch ?? "?"} | ${age} | ${whyOf(x)} | ${x.firstChange.sha.slice(0, 7)} ${title} |`);
     }
   };
   const changeOf = (x: LagRow): string => `${x.firstChange.sha.slice(0, 7)} ${x.firstChange.title.replaceAll("|", "\\|")}`;

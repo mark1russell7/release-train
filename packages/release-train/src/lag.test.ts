@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { FetchFn } from "./collect.ts";
 import type { GhResponse, GitHub } from "./github.ts";
-import { LAG_LIMIT_MS, RED_LIMIT_MS, isReleased, lagOver, lagReport, lagSummary, publishedPaths, usedManifest } from "./lag.ts";
+import { LAG_LIMIT_MS, RED_LIMIT_MS, changesetNames, changesetRaises, isReleased, lagOver, lagReport, lagSummary, publishedPaths, usedManifest } from "./lag.ts";
 import type { PackageNode } from "./types.ts";
 
 const NOW = new Date("2026-11-04T12:00:00Z");
@@ -37,6 +37,33 @@ const commit = (sha: string, date: string, title = "feat: a change"): { sha: str
 
 const run = async (packages: PackageNode[], routes: Record<string, unknown>, gitHead: string | null = OLD) =>
   lagReport({ owner: "o", gh: ghOf({ "/search/issues": { items: [] }, ...routes }), packages, branches: new Map([["r", "main"]]), fetch: npmOf(gitHead), now: NOW });
+
+describe("changesetNames", () => {
+  it("reads the names of the front matter, with double quotes, single quotes or none", () => {
+    expect(changesetNames('---\n"@o/a": patch\n\'@o/b\': minor\nc: major\n---\n\nText: patch\n')).toEqual(["@o/a", "@o/b", "c"]);
+    expect(changesetNames('---\r\n"@o/a": patch\r\n---\r\n')).toEqual(["@o/a"]);
+  });
+
+  it("gives no name for an empty changeset, a text with no front matter, or a front matter with no end", () => {
+    expect(changesetNames("---\n---\n\nNo release.\n")).toEqual([]);
+    expect(changesetNames('"@o/a": patch\n')).toEqual([]);
+    expect(changesetNames('---\n"@o/a": patch\n')).toEqual([]);
+  });
+});
+
+describe("changesetRaises", () => {
+  it("raises a named package, and each package of a fixed group of a named package", () => {
+    expect(changesetRaises("@o/a", ["@o/a"], [])).toBe(true);
+    expect(changesetRaises("@o/b", ["@o/a"], [["@o/a", "@o/b"]])).toBe(true);
+    expect(changesetRaises("@o/b", ["@o/a"], [["@o/*"]])).toBe(true);
+  });
+
+  it("does not raise a package of another group, or match a * across a /", () => {
+    expect(changesetRaises("@o/b", ["@o/a"], [["@o/a"], ["@o/b"]])).toBe(false);
+    expect(changesetRaises("@p/b", ["@o/a"], [["@*", "@o/a"]])).toBe(false);
+    expect(changesetRaises("@o/b", [], [["@o/*"]])).toBe(false);
+  });
+});
 
 describe("isReleased", () => {
   it("counts the source and the manifest of the package", () => {
@@ -187,6 +214,54 @@ describe("lagReport", () => {
     expect(r.rows[0]).toMatchObject({ package: "@o/x", reason: "kept-version", over: true, ageDays: 3, files: 1, partial: false });
     expect(lagOver(r)).toBe(true);
     expect(lagSummary(r)).toContain("the version did not change");
+  });
+
+  describe("a kept version with a pending changeset", () => {
+    const source = {
+      [`/repos/o/r/compare/${OLD}...main`]: { status: "ahead", commits: [commit("b1", ago(3 * 24 * HOUR))], files: [{ filename: "packages/x/src/a.ts" }] },
+      "/repos/o/r/commits/b1": { files: [{ filename: "packages/x/src/a.ts" }] },
+    };
+    const text = (s: string): { content: string } => ({ content: Buffer.from(s).toString("base64") });
+    const list = (...names: string[]) => [{ name: "README.md", type: "file" }, { name: "config.json", type: "file" }, ...names.map((name) => ({ name, type: "file" }))];
+
+    it("names the changeset that names the package, and the gate still fails", async () => {
+      const r = await run([pkg("@o/x")], {
+        ...source,
+        "/repos/o/r/contents/.changeset?ref=main": list("a.md"),
+        "/repos/o/r/contents/.changeset/a.md?ref=main": text('---\n"@o/x": patch\n---\n\nA fix.\n'),
+      });
+      expect(r.rows[0]).toMatchObject({ reason: "pending-changeset", changesets: ["a.md"], over: true });
+      expect(lagOver(r)).toBe(true);
+      expect(lagSummary(r)).toContain("a changeset on the branch raises the version, so the release waits for the release workflow (a.md)");
+    });
+
+    it("counts a changeset of another package of the same fixed group, with a * in the group", async () => {
+      const r = await run([pkg("@o/x")], {
+        ...source,
+        "/repos/o/r/contents/.changeset?ref=main": list("other.md", "empty.md"),
+        "/repos/o/r/contents/.changeset/other.md?ref=main": text("---\n'@o/y': minor\n---\n"),
+        "/repos/o/r/contents/.changeset/empty.md?ref=main": text("---\n---\n\nNo release.\n"),
+        "/repos/o/r/contents/.changeset/config.json?ref=main": text(JSON.stringify({ fixed: [["@o/*"]], linked: [] })),
+      });
+      expect(r.rows[0]).toMatchObject({ reason: "pending-changeset", changesets: ["other.md"] });
+    });
+
+    it("keeps the reason kept-version for a changeset of a linked group, of another group, or an empty one", async () => {
+      const r = await run([pkg("@o/x")], {
+        ...source,
+        "/repos/o/r/contents/.changeset?ref=main": list("other.md", "empty.md"),
+        "/repos/o/r/contents/.changeset/other.md?ref=main": text('---\n"@o/y": patch\n---\n'),
+        "/repos/o/r/contents/.changeset/empty.md?ref=main": text("---\n---\n"),
+        "/repos/o/r/contents/.changeset/config.json?ref=main": text(JSON.stringify({ fixed: [["@o/y", "@o/z"]], linked: [["@o/x", "@o/y"]] })),
+      });
+      expect(r.rows[0]).toMatchObject({ reason: "kept-version" });
+      expect(r.rows[0]?.changesets).toBeUndefined();
+    });
+
+    it("keeps the reason kept-version when the folder of the changesets cannot be read", async () => {
+      const r = await run([pkg("@o/x")], source);
+      expect(r.rows[0]).toMatchObject({ reason: "kept-version", over: true });
+    });
   });
 
   it("reports a new version that npm does not have", async () => {
