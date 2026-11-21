@@ -16,7 +16,7 @@ export const DEFAULT_NEED = 6000;
 
 /**
  * The part of the hourly limit of each token that the train uses, from 0 to 1. The rest of each window stays for the
- * other users of the token: the runs that a release starts, and the one more read of a decision in the mode
+ * other users of the token. These are the runs that a release starts, and the one more read of a decision in the mode
  * one-candidate. The gate and the guard count the need of a run against this part. Thus a run goes only when the used
  * requests of the window and its need stay at or below this part of the limit.
  *
@@ -27,8 +27,8 @@ export const DEFAULT_NEED = 6000;
 export const DEFAULT_PART = 0.5;
 
 /**
- * This function gives the requests of a window that the train leaves to the other users of the token: the limit less
- * `part` of it, rounded down. A part that is not above 0 and at most 1 throws a RangeError.
+ * This function gives the reserve: the requests of a window that the train leaves to the other users of the token.
+ * The reserve is the limit less `part` of it, rounded down. A part that is not above 0 and at most 1 throws a RangeError.
  */
 export function reserveOf(limit: number, part: number): number {
   if (!(part > 0 && part <= 1)) throw new RangeError(`The part of the rate limit must be above 0 and at most 1, not ${part}.`);

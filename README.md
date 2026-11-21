@@ -224,7 +224,7 @@ The token of the GitHub App has 10,200 requests in one hour. On 2026-11-15, one 
 
 The gate (`src/budget.ts`) reads the rate limit before the first read of a repository. GitHub does not count this read.
 
-- The train uses only a part of the limit of each token (`--rate-part`, default 0.5). The rest of each window stays for the other users of the token: the runs that a release starts, and the one more read of a decision in the mode one-candidate. These requests are the reserve, and they do not count as left.
+- The train uses only a part of the limit of each token (`--rate-part`, default 0.5). The rest of each window stays for the other users of the token. These are the runs that a release starts, and the one more read of a decision in the mode one-candidate. These requests are the reserve, and they do not count as left.
 - When the count left above the reserve is the need or more, the run goes on. The need is not more than the part of the limit. The next section tells the need.
 - When fewer requests are left and the reset comes in `--rate-wait` minutes or less (default 20), the run waits until the reset plus 15 seconds. Then it reads the limit again and goes on. The timer of the wait keeps the Node process alive, so the run does not end during the wait.
 - When the reset comes later, the run stops with a note and the exit code 0. It writes the report with no result, so the next steps of the workflow can read it. A run with urgent names does not stop, because only the title of a run holds them.
