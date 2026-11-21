@@ -14,6 +14,27 @@ import { countedRequest, credentialOf, GITHUB_API, RateStop, type RateTracker } 
  */
 export const DEFAULT_NEED = 6000;
 
+/**
+ * The part of the hourly limit of each token that the train uses, from 0 to 1. The rest of each window stays for the
+ * other users of the token: the runs that a release starts, and the one more read of a decision in the mode
+ * one-candidate. The gate and the guard count the need of a run against this part. Thus a run goes only when the used
+ * requests of the window and its need stay at or below this part of the limit.
+ *
+ * On 2026-11-21, four runs in one hour used 8,053 of 10,750 requests (0.75). Each run passed the gate, because each one
+ * saw enough requests left for its own need. The option `--rate-part` sets a different value, and 1 gives the whole limit
+ * to the train.
+ */
+export const DEFAULT_PART = 0.5;
+
+/**
+ * This function gives the requests of a window that the train leaves to the other users of the token: the limit less
+ * `part` of it, rounded down. A part that is not above 0 and at most 1 throws a RangeError.
+ */
+export function reserveOf(limit: number, part: number): number {
+  if (!(part > 0 && part <= 1)) throw new RangeError(`The part of the rate limit must be above 0 and at most 1, not ${part}.`);
+  return limit - Math.floor(limit * part);
+}
+
 /** The count of the last full applies that the state keeps for the need of a run. */
 export const COST_RUNS = 20;
 
@@ -76,10 +97,15 @@ export type GateOutcome = "go" | "waited" | "stop" | "urgent" | "no read";
 /** The record of the gate in the report. It has no name, so the report stays public. */
 export interface GateRecord {
   outcome: GateOutcome;
-  /** The requests that the run needs: the setting, but not more than the limit of the token. */
+  /** The requests that the run needs: the setting, but not more than the part of the limit that the train uses. */
   need: number;
   /** The requests that are left at the first read. Null when the read failed. */
   left: number | null;
+  /**
+   * The requests of the window that the train leaves to the other users of the token ({@link reserveOf}). The gate counts
+   * only the requests left above this count. Absent in the reports of the versions before 0.5.0 and when the read failed.
+   */
+  reserve?: number;
   /** The reset time of the first read, as an ISO text. Null when the read failed. */
   reset: string | null;
   /** The time of the wait for the reset, in milliseconds. */
@@ -95,13 +121,18 @@ export type BudgetStep = { action: "go" } | { action: "wait"; ms: number } | { a
  * This function gives the step of the gate for one read of the rate limit.
  *
  * @param read - The read of the rate limit.
- * @param need - The requests that the run needs. A need above the limit of the token becomes the limit.
+ * @param need - The requests that the run needs. A need above the part of the limit becomes that part. A need of 0 turns
+ *   off the gate.
  * @param now - The current time, in milliseconds after the epoch.
  * @param maxWaitMs - The longest wait for the reset, in milliseconds.
  * @param marginMs - The time after the reset before the next read.
+ * @param part - The part of the limit that the train uses ({@link DEFAULT_PART}). The default 1 gives the whole limit to the
+ *   train. The requests of the reserve ({@link reserveOf}) do not count as left.
  */
-export function budgetStep(read: RateLimitRead, need: number, now: number, maxWaitMs: number, marginMs: number = RESET_MARGIN_MS): BudgetStep {
-  if (read.remaining >= Math.min(need, read.limit)) return { action: "go" };
+export function budgetStep(read: RateLimitRead, need: number, now: number, maxWaitMs: number, marginMs: number = RESET_MARGIN_MS, part: number = 1): BudgetStep {
+  if (need <= 0) return { action: "go" };
+  const reserve = reserveOf(read.limit, part);
+  if (read.remaining - reserve >= Math.min(need, read.limit - reserve)) return { action: "go" };
   const untilReset = Math.max(0, Date.parse(read.reset) - now);
   return untilReset <= maxWaitMs ? { action: "wait", ms: untilReset + marginMs } : { action: "stop", ms: untilReset };
 }
@@ -114,6 +145,11 @@ export interface GateOptions {
   maxWaitMs: number;
   /** The time after the reset before the next read. The default is {@link RESET_MARGIN_MS}. */
   marginMs?: number;
+  /**
+   * The part of the limit that the train uses ({@link DEFAULT_PART}), above 0 and at most 1. The default is 1: the whole
+   * limit. With a need of 0, the gate keeps no reserve.
+   */
+  part?: number;
   /** This function reads the rate limit. A failed read gives null. */
   read: () => Promise<RateLimitRead | null>;
   /**
@@ -182,10 +218,15 @@ export async function budgetGate(o: GateOptions): Promise<GateResult> {
   const credential = o.credential ?? "";
   o.tracker?.seed(first, credential);
   const basis = o.tracker?.live(now(), credential) ?? first;
-  const need = Math.min(o.need, basis.limit);
-  const step = budgetStep(basis, o.need, now(), o.maxWaitMs, o.marginMs);
-  const base = { need, left: basis.remaining, reset: basis.reset };
-  const short = `Rate budget: ${basis.remaining} requests are left, and a run needs ${need}.`;
+  const part = o.part ?? 1;
+  const reserve = o.need > 0 ? reserveOf(basis.limit, part) : 0;
+  const need = Math.min(o.need, basis.limit - reserve);
+  const step = budgetStep(basis, o.need, now(), o.maxWaitMs, o.marginMs, part);
+  const base = { need, left: basis.remaining, reserve, reset: basis.reset };
+  const short =
+    reserve > 0
+      ? `Rate budget: ${basis.remaining} requests are left, ${reserve} of them stay for the other users of the token (the train uses the part ${part} of the limit of ${basis.limit}), and a run needs ${need}.`
+      : `Rate budget: ${basis.remaining} requests are left, and a run needs ${need}.`;
   if (step.action === "go") return { read: first, record: { ...base, outcome: "go", waitedMs: 0, note: `${short} The run goes on.` } };
   if (step.action === "stop") {
     const note = `${short} The reset at ${basis.reset} is ${minutes(step.ms)} minutes away, after the longest wait of ${minutes(o.maxWaitMs)} minutes. The run stops, and a later run does the work.`;
@@ -218,6 +259,12 @@ export interface GuardOptions {
    * full need.
    */
   share?: (credential: string) => number;
+  /**
+   * The part of the limit that the train uses ({@link DEFAULT_PART}), above 0 and at most 1. The default is 1: the whole
+   * limit. A token with a share of the need keeps the reserve of its window ({@link reserveOf}), also after the run sent
+   * its share. Thus the part is a ceiling of the train in each window. A token with no share keeps no reserve.
+   */
+  part?: number;
   /** The longest wait for the reset, in milliseconds. */
   maxWaitMs: number;
   /** True when the run waited one time already, at the gate of its start. Then each shortage stops the run. */
@@ -335,12 +382,14 @@ export function rateGuard(inner: FetchFn, o: GuardOptions): RateGuard {
     if (live === null) return;
     const share = Math.min(1, Math.max(0, o.share?.(credential) ?? 1));
     const need = Math.ceil(o.need * share);
-    const want = Math.max(1, Math.min(need, live.limit) - (sentBy.get(credential) ?? 0));
-    if (live.remaining >= want) return;
+    const reserve = need > 0 ? reserveOf(live.limit, o.part ?? 1) : 0;
+    const want = Math.max(1, Math.min(need, live.limit - reserve) - (sentBy.get(credential) ?? 0));
+    if (live.remaining - reserve >= want) return;
     const many = new Set(o.tracker.windows().map((w) => w.token)).size > 1;
+    const kept = reserve > 0 ? `, ${reserve} of them stay for the other users of the token` : "";
     const cause = many
-      ? `Rate guard: ${live.remaining} requests of token ${o.tracker.token(credential)} are left until ${live.reset}, and its share of the run needs ${want} more.`
-      : `Rate guard: ${live.remaining} requests are left until ${live.reset}, and the run needs ${want} more.`;
+      ? `Rate guard: ${live.remaining} requests of token ${o.tracker.token(credential)} are left until ${live.reset}${kept}, and its share of the run needs ${want} more.`
+      : `Rate guard: ${live.remaining} requests are left until ${live.reset}${kept}, and the run needs ${want} more.`;
     await shortage(Date.parse(live.reset), cause);
   };
 

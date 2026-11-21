@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_NEED, DEFAULT_WAIT_MINUTES } from "./budget.ts";
+import { DEFAULT_NEED, DEFAULT_PART, DEFAULT_WAIT_MINUTES } from "./budget.ts";
 import { applyHolding, hashKey, paceOptions, parseArgs, runApply } from "./cli.ts";
 import type { FetchFn } from "./collect.ts";
 import { keptStore } from "polite-crawler/api";
@@ -150,6 +150,13 @@ describe("the options of the rate budget", () => {
     const o = parseArgs(["apply"]);
     expect(o.rateNeed).toBeNull();
     expect(o.rateWait).toBe(DEFAULT_WAIT_MINUTES);
+    expect(o.ratePart).toBe(DEFAULT_PART);
+  });
+
+  it("reads --rate-part, and refuses a part that is not above 0 and at most 1", () => {
+    expect(parseArgs(["apply", "--rate-part", "0.25"])).toMatchObject({ ratePart: 0.25 });
+    expect(parseArgs(["apply", "--rate-part", "1"])).toMatchObject({ ratePart: 1 });
+    for (const bad of ["0", "1.5", "-0.1", "half"]) expect(() => parseArgs(["apply", "--rate-part", bad])).toThrow("--rate-part needs a number above 0 and at most 1");
   });
 
   it("reads --rate-need and --rate-wait, and refuses a bad value", () => {

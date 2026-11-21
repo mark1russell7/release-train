@@ -112,6 +112,7 @@ node packages/release-train/src/bin.ts apply --only <repo> --report apply.json
 - `--max-pushes <n>` is the most branches that one run pushes (default 5). The update branches and the sync branches share this limit. The other repositories get `waiting`, and a later run pushes them.
 - `--urgent <packages>` names public packages with a security fix (comma-separated). Refer to "An urgent update".
 - `--rate-need <n>` is a fixed count of GitHub requests that a run needs at its start. With no value, the need comes from the last full applies. `0` turns off the gate. Refer to "The rate budget".
+- `--rate-part <part>` is the part of the hourly limit of each token that the train uses, above 0 and at most 1 (default 0.5). Refer to "The rate budget".
 - `--rate-wait <minutes>` is the longest wait for the reset of the rate limit (default 20). Refer to "The rate budget".
 
 ### A partial update
@@ -223,7 +224,8 @@ The token of the GitHub App has 10,200 requests in one hour. On 2026-11-15, one 
 
 The gate (`src/budget.ts`) reads the rate limit before the first read of a repository. GitHub does not count this read.
 
-- When the count left is the need or more, the run goes on. The need is not more than the limit of the token. The next section tells the need.
+- The train uses only a part of the limit of each token (`--rate-part`, default 0.5). The rest of each window stays for the other users of the token: the runs that a release starts, and the one more read of a decision in the mode one-candidate. These requests are the reserve, and they do not count as left.
+- When the count left above the reserve is the need or more, the run goes on. The need is not more than the part of the limit. The next section tells the need.
 - When fewer requests are left and the reset comes in `--rate-wait` minutes or less (default 20), the run waits until the reset plus 15 seconds. Then it reads the limit again and goes on. The timer of the wait keeps the Node process alive, so the run does not end during the wait.
 - When the reset comes later, the run stops with a note and the exit code 0. It writes the report with no result, so the next steps of the workflow can read it. A run with urgent names does not stop, because only the title of a run holds them.
 - When the read fails, the run goes on.
@@ -236,6 +238,8 @@ The need of a run follows the runs before it:
 - `--rate-need` sets a fixed need.
 
 On 2026-11-17, 51 full applies used 2,406 to 2,986 requests. The fixed need of 6000 then stopped the third run of each hour at once.
+
+On 2026-11-21, four runs in one hour used 8,053 of 10,750 requests (0.75), because each run saw enough requests left for its own need. Since version 0.5.0, a run goes only when the used requests of its window and its need stay at or below half of the limit. With a need of approximately 3,000 requests, this holds the run after the first one in a window. With a need of 0 (no gate, or a run with urgent names), the train keeps no reserve.
 
 The job of `train.yml` stops after 60 minutes. The longest of 60 runs before 2026-11-15 took 31 minutes, with the wait for a release. Thus the default wait of 20 minutes and such a run stay below 60 minutes.
 
