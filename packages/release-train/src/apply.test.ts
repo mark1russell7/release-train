@@ -2367,6 +2367,73 @@ describe("the candidate rules in a run of apply", () => {
         expect(passed.r.results[0]).toMatchObject({ state: "merged", ci: "green" });
       });
     });
+
+    describe("the merge gates of a repository", () => {
+      const GATES = [{ files: ["pnpm-lock.yaml"], status: "install-fits", maxAgeMinutes: 10 }];
+      /** The root package.json of the default branch, with the gates. */
+      const manifest = (gates: unknown, status = 200): Record<string, Handler> => ({
+        [`GET ${base}/${S}/contents/package.json`]: () => [status, status === 200 ? { content: Buffer.from(JSON.stringify({ name: "x", releaseTrain: { mergeGates: gates } })).toString("base64") } : { message: "Server Error" }],
+      });
+      /** The files that the candidate changes, and no commit behind. */
+      const changes = (files: string[]): Record<string, Handler> => ({
+        [`GET ${base}/${S}/compare/main...sha7`]: () => [200, { behind_by: 0, files: files.map((filename) => ({ filename })), merge_base_commit: { sha: "mb1" } }],
+      });
+      /** The status install-fits of the head commit, `minutesAgo` old, or no status. */
+      const fits = (minutesAgo: number | null): Record<string, Handler> => ({
+        [`GET ${base}/${S}/commits/sha7/status`]: () => [
+          200,
+          minutesAgo === null
+            ? { state: "pending", total_count: 0, statuses: [] }
+            : { state: "success", total_count: 1, statuses: [{ context: "install-fits", state: "success", updated_at: new Date(NOW.getTime() - minutesAgo * 60_000).toISOString() }] },
+        ],
+      });
+      const LOCK = ["pnpm-lock.yaml", "package.json"];
+
+      it("holds a merge that changes the lockfile until its status is success and fresh", async () => {
+        const none = await run({ ...routes({ behind: 0 }), ...changes(LOCK), ...manifest(GATES), ...fits(null) }, [S]);
+        expect(none.r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+        expect(none.r.results[0]?.detail).toContain("a merge gate holds it: the head commit has no status install-fits");
+        expect(none.calls.some((c) => c.method === "PUT")).toBe(false);
+        expect(none.r.candidates?.acted).toEqual([expect.objectContaining({ action: "merge", held: "merge-gate", state: "unchanged" })]);
+        const old = await run({ ...routes({ behind: 0 }), ...changes(LOCK), ...manifest(GATES), ...fits(30) }, [S]);
+        expect(old.r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+        expect(old.r.results[0]?.detail).toContain("the status install-fits is 30 minutes old, and the gate takes at most 10");
+        const fresh = await run({ ...routes({ behind: 0 }), ...changes(LOCK), ...manifest(GATES), ...fits(5) }, [S]);
+        expect(fresh.r.results[0]).toMatchObject({ state: "merged", ci: "green" });
+        // The train reads the gates of a repository once in a run, from its default branch.
+        expect(fresh.calls.filter((c) => c.path.startsWith(`${base}/${S}/contents/package.json`)).map((c) => c.path)).toEqual([`${base}/${S}/contents/package.json?ref=main`]);
+      });
+
+      it("merges a change that no gate covers, and holds each change when GitHub cut the list of files", async () => {
+        const other = await run({ ...routes({ behind: 0 }), ...changes(["package.json", "src/a.ts"]), ...manifest(GATES), ...fits(null) }, [S]);
+        expect(other.r.results[0]).toMatchObject({ state: "merged" });
+        const many = Array.from({ length: 300 }, (_, i) => `src/f${i}.ts`);
+        const cut = await run({ ...routes({ behind: 0 }), ...changes(many), ...manifest(GATES), ...fits(null) }, [S]);
+        expect(cut.r.results[0]).toMatchObject({ state: "unchanged" });
+        expect(cut.r.candidates?.acted).toEqual([expect.objectContaining({ held: "merge-gate" })]);
+      });
+
+      it("holds each merge when the gates cannot be read or are not valid, and needs no status with no root package.json", async () => {
+        const unread = await run({ ...routes({ behind: 0 }), ...changes(["src/a.ts"]), ...manifest(GATES, 502) }, [S]);
+        expect(unread.r.results[0]).toMatchObject({ state: "unchanged" });
+        expect(unread.r.results[0]?.detail).toContain("GitHub did not give the root package.json of main");
+        const wrong = await run({ ...routes({ behind: 0 }), ...changes(["src/a.ts"]), ...manifest([{ files: [], status: "install-fits", maxAgeMinutes: 10 }]) }, [S]);
+        expect(wrong.r.results[0]).toMatchObject({ state: "unchanged" });
+        expect(wrong.r.results[0]?.detail).toContain("the merge gates of the root package.json are not valid: mergeGates[0].files is not a list of one or more paths");
+        const absent = await run({ ...routes({ behind: 0 }), ...changes(LOCK), ...manifest(GATES, 404), ...fits(null) }, [S]);
+        expect(absent.r.results[0]).toMatchObject({ state: "merged" });
+      });
+
+      it("holds the merge of the strict rule in the mode shadow in the same way", async () => {
+        const extra = { candidatePolicy: SHADOW, updater: updater({ status: "same", sha: "sha7" }) };
+        const held = await run({ ...routes({ behind: 0 }), ...changes(LOCK), ...manifest(GATES), ...fits(null) }, [S], extra);
+        expect(held.r.results[0]).toMatchObject({ state: "unchanged", ci: "green" });
+        expect(held.r.results[0]?.detail).toContain("a merge gate holds it: the head commit has no status install-fits");
+        expect(held.calls.some((c) => c.method === "PUT")).toBe(false);
+        const fresh = await run({ ...routes({ behind: 0 }), ...changes(LOCK), ...manifest(GATES), ...fits(5) }, [S], extra);
+        expect(fresh.r.results[0]).toMatchObject({ state: "merged", ci: "green" });
+      });
+    });
   });
 });
 
