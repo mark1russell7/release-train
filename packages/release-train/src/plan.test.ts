@@ -144,6 +144,45 @@ describe("range logic", () => {
   });
 });
 
+describe("npm aliases", () => {
+  it("does not move a second copy of a package that the importer also has under its own name", () => {
+    const p = run(
+      [
+        repo(
+          "geo-repo",
+          {
+            "": { name: "@ex/geo", version: "0.5.3" },
+            "packages/bench": {
+              name: "@ex/geo-bench",
+              private: true,
+              devDependencies: { "@ex/geo": "workspace:*", "geo-base": "npm:@ex/geo@0.3.1" },
+            },
+          },
+          { resolved: { "packages/bench": { "@ex/geo": "link:../..", "geo-base": "0.3.1" } } },
+        ),
+      ],
+      { "@ex/geo": npm("0.5.3") },
+    );
+    const copy = p.edges.find((e) => e.spec === "npm:@ex/geo@0.3.1");
+    expect(copy?.status).toBe("current");
+    expect(copy?.why).toContain("second copy");
+    expect(p.actions.filter((a) => a.repo === "geo-repo").map((a) => a.kind)).toEqual([]);
+  });
+
+  it("still moves an alias that is the only dependency on its package", () => {
+    const p = run(
+      [
+        repo("core-repo", { "": { name: "@ex/core", version: "2.0.0" } }),
+        repo("app-repo", { "": { name: "@ex/app", version: "1.0.0", private: true, dependencies: { "core-alias": "npm:@ex/core@^1.0.0" } } }, {
+          resolved: { "": { "core-alias": "1.0.0" } },
+        }),
+      ],
+      { "@ex/core": npm("2.0.0") },
+    );
+    expect(p.edges.find((e) => e.spec === "npm:@ex/core@^1.0.0")?.status).toBe("breaking");
+  });
+});
+
 describe("0.x rules", () => {
   it("treats a new minor before 1.0.0 as breaking", () => {
     const p = run(
