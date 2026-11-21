@@ -15,6 +15,11 @@ export type EdgeStatus =
   | "flagged"
   | "unlocked";
 
+/** True for an npm alias: a dependency key that installs a package of another name ("geo-base": "npm:@ex/geo@0.3.1"). */
+function isAlias(e: Edge): boolean {
+  return e.spec.trim().startsWith("npm:");
+}
+
 /** The state of one node, from the most urgent to the least urgent. */
 export type NodeStatus = "blocked" | "new-package" | "release" | "breaking" | "adopt" | "up-to-date";
 
@@ -352,6 +357,12 @@ export function plan(g: Graph): Plan {
     }
   }
 
+  // 1c. A second copy: an npm alias of a package that the same importer also has under its own name, for example
+  // "geo-base": "npm:@ex/geo@0.3.1" next to "@ex/geo": "workspace:*". It holds an older version on purpose (the base
+  // arm of a bench), so the release train does not move it and it makes no cascade.
+  const ownName = new Set(g.edges.filter((e) => !isAlias(e)).map((e) => `${e.from}|${e.to}`));
+  const secondCopy = (e: Edge): boolean => isAlias(e) && ownName.has(`${e.from}|${e.to}`);
+
   // 2. The cascade: a breaking adoption in a runtime section of a published dependent makes it release.
   const cascade = new Map<string, Bump>();
   const behind = new Map<string, BehindRange>();
@@ -371,7 +382,7 @@ export function plan(g: Graph): Plan {
       publishBy.set(name, `release:${p.repo}`);
     }
     for (const e of g.edges) {
-      if ((e.kind !== "registry" && e.kind !== "workspace") || !isRuntime(e.type)) continue;
+      if ((e.kind !== "registry" && e.kind !== "workspace") || !isRuntime(e.type) || secondCopy(e)) continue;
       const dep = pkgOfImporter(importers.get(e.from));
       // A workspace range has its real range only on npm: pnpm wrote it at the last publish of the dependent.
       const range = e.kind === "workspace" ? (dep?.npm.latestDeps?.[e.type]?.[e.to] ?? null) : e.range;
@@ -409,6 +420,9 @@ export function plan(g: Graph): Plan {
         return st("blocked", `A ${label} specifier ("${e.spec}") in ${e.type} of a published package. npm users cannot install it, so it blocks the release.`);
       }
       return st("flagged", `A ${label} specifier ("${e.spec}") in ${e.type}. It does not block a release, but Renovate and the release train cannot move it.`);
+    }
+    if (secondCopy(e)) {
+      return st("current", `"${e.spec}" is a second copy of ${e.to}, which this package also has under its own name. It holds that version on purpose (for example the base of a bench), so the release train does not move it.`);
     }
     if (e.kind === "tag") {
       if (e.range === "latest") return st("current", "The dist-tag latest always gives the newest version.");
