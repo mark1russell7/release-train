@@ -188,8 +188,8 @@ export function changesetNames(text: string): string[] {
 }
 
 /**
- * This function tells if a changeset raises the version of a package: the changeset names the package, or names a package
- * of a `fixed` group of the package. In a fixed group each package gets the new version. A `*` in a group item matches
+ * This function tells if a changeset raises the version of a package. The changeset names the package, or it names a
+ * package of a `fixed` group of the package. In a fixed group each package gets the new version. A `*` in a group item matches
  * any text with no "/", as in Changesets. A `linked` group raises only the packages that a changeset names, so it does
  * not count here.
  */
