@@ -9,7 +9,7 @@ import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pen
 
 export { redactName };
 import type { ApplyReport } from "./apply.ts";
-import { addCost, budgetGate, DEFAULT_WAIT_MINUTES, goOnUrgent, needOfRuns, rateGuard } from "./budget.ts";
+import { addCost, budgetGate, DEFAULT_PART, DEFAULT_WAIT_MINUTES, goOnUrgent, needOfRuns, rateGuard } from "./budget.ts";
 import { collect, listAccounts, pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { writeDb } from "./db.ts";
@@ -74,6 +74,8 @@ export interface CliOptions {
    * 0 turns off the gate. Null: the need comes from the last full applies in the state file (`needOfRuns`).
    */
   rateNeed: number | null;
+  /** `apply`: the part of the hourly limit of each token that the train uses, above 0 and at most 1 (`DEFAULT_PART`). */
+  ratePart: number;
   /** `apply`: the longest wait for the reset of the rate limit, in minutes. */
   rateWait: number;
   /** `apply`: the public packages with a security fix. Their updates go first and pass the limit of pushes. */
@@ -138,6 +140,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     workflows: "auto",
     maxPushes: MAX_PUSHES,
     rateNeed: null,
+    ratePart: DEFAULT_PART,
     rateWait: DEFAULT_WAIT_MINUTES,
     urgent: null,
     takeReplaced: false,
@@ -203,6 +206,11 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       const v = Number(value());
       if (!Number.isInteger(v) || v < 0) throw new Error(`--rate-need needs a whole number of 0 or more.`);
       o.rateNeed = v;
+    }
+    else if (a === "--rate-part") {
+      const v = Number(value());
+      if (!(v > 0 && v <= 1)) throw new Error(`--rate-part needs a number above 0 and at most 1.`);
+      o.ratePart = v;
     }
     else if (a === "--rate-wait") {
       const v = Number(value());
@@ -538,6 +546,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     // The read is only the first value of the live budget: the meter adds the headers of each answer to the tracker.
     const gate = await budgetGate({
       need: runNeed.need,
+      part: o.ratePart,
       maxWaitMs: o.rateWait * 60_000,
       read: () => readRateLimit(gh0),
       tracker: meter.rate,
@@ -575,6 +584,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       tracker: meter.rate,
       need: gateRecord.outcome === "urgent" ? 0 : runNeed.need,
       share: (credential) => shareOf(credential),
+      part: o.ratePart,
       maxWaitMs: o.rateWait * 60_000,
       waited: gateRecord.outcome === "waited",
       log,

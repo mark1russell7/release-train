@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_NEED, DEFAULT_WAIT_MINUTES } from "./budget.ts";
+import { DEFAULT_NEED, DEFAULT_PART, DEFAULT_WAIT_MINUTES, reserveOf } from "./budget.ts";
 import { applyHolding, hashKey, paceOptions, parseArgs, runApply } from "./cli.ts";
 import type { FetchFn } from "./collect.ts";
 import { keptStore } from "polite-crawler/api";
@@ -150,6 +150,13 @@ describe("the options of the rate budget", () => {
     const o = parseArgs(["apply"]);
     expect(o.rateNeed).toBeNull();
     expect(o.rateWait).toBe(DEFAULT_WAIT_MINUTES);
+    expect(o.ratePart).toBe(DEFAULT_PART);
+  });
+
+  it("reads --rate-part, and refuses a part that is not above 0 and at most 1", () => {
+    expect(parseArgs(["apply", "--rate-part", "0.25"])).toMatchObject({ ratePart: 0.25 });
+    expect(parseArgs(["apply", "--rate-part", "1"])).toMatchObject({ ratePart: 1 });
+    for (const bad of ["0", "1.5", "-0.1", "half"]) expect(() => parseArgs(["apply", "--rate-part", bad])).toThrow("--rate-part needs a number above 0 and at most 1");
   });
 
   it("reads --rate-need and --rate-wait, and refuses a bad value", () => {
@@ -256,7 +263,8 @@ describe("runApply and the rate budget", () => {
       dryRun: false,
       results: [],
       inFlight: [],
-      rateLimit: { start: { remaining: 40 }, end: { remaining: 40 }, routes: [], gate: { outcome: "stop", need: DEFAULT_NEED, left: 40, waitedMs: 0 } },
+      // The need is not more than the part of the limit: 10,200 less the reserve of the default part.
+      rateLimit: { start: { remaining: 40 }, end: { remaining: 40 }, routes: [], gate: { outcome: "stop", need: Math.min(DEFAULT_NEED, 10_200 - reserveOf(10_200, DEFAULT_PART)), left: 40, reserve: reserveOf(10_200, DEFAULT_PART), waitedMs: 0 } },
     });
     const summary = readFileSync(summaryFile, "utf8");
     expect(summary).toContain("The run stops, and a later run does the work.");
@@ -278,9 +286,9 @@ describe("runApply and the rate budget", () => {
     const now = Date.parse("2026-11-15T12:00:00Z");
     let counted = 0;
     const fetch: FetchFn = async (url) => {
-      // A stale read at the start: it shows a large budget, so the gate lets the run go on.
+      // A stale read at the start: it shows a new window, so the gate lets the run go on, also with the reserve of the default part.
       if (url.endsWith("/rate_limit")) {
-        return new Response(JSON.stringify({ resources: { core: { limit: 10_250, used: 276, remaining: 9974, reset: now / 1000 + 34 * 60 } } }), { status: 200 });
+        return new Response(JSON.stringify({ resources: { core: { limit: 10_250, used: 0, remaining: 10_250, reset: now / 1000 + 34 * 60 } } }), { status: 200 });
       }
       if (!url.startsWith("https://api.github.com/")) return new Response("{}", { status: 404 });
       counted++;

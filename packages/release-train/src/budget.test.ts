@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { addCost, budgetGate, budgetStep, COST_RUNS, DEFAULT_NEED, goOnUrgent, guardLine, MIN_COST_RUNS, needOfRuns, RESET_MARGIN_MS, RETRY_MARGIN_MS, rateGuard } from "./budget.ts";
+import { addCost, budgetGate, budgetStep, COST_RUNS, DEFAULT_NEED, DEFAULT_PART, goOnUrgent, guardLine, MIN_COST_RUNS, needOfRuns, RESET_MARGIN_MS, RETRY_MARGIN_MS, rateGuard, reserveOf } from "./budget.ts";
 import type { FetchFn } from "./collect.ts";
 import type { RateLimitRead } from "./github.ts";
 import { credentialOf, RateStop, rateTracker, requestMeter } from "./meter.ts";
@@ -68,6 +68,35 @@ describe("budgetStep", () => {
   });
 });
 
+describe("the part of the limit that the train uses", () => {
+  it("leaves the limit less the part, rounded down, and refuses a part that is not above 0 and at most 1", () => {
+    expect(DEFAULT_PART).toBe(0.5);
+    expect(reserveOf(10_750, 0.5)).toBe(5375);
+    expect(reserveOf(10_201, 0.5)).toBe(5101);
+    expect(reserveOf(10_200, 1)).toBe(0);
+    for (const part of [0, -0.5, 1.5, Number.NaN]) expect(() => reserveOf(10_200, part)).toThrow(RangeError);
+  });
+
+  it("counts only the requests above the reserve as left, and takes the part as the largest need", () => {
+    // The reserve of 10,200 at the part 0.5 is 5,100.
+    expect(budgetStep(readOf(8700, 50), 3600, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5)).toEqual({ action: "go" });
+    expect(budgetStep(readOf(8699, 50), 3600, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5)).toEqual({ action: "stop", ms: 50 * MINUTE });
+    expect(budgetStep(readOf(8699, 12), 3600, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5)).toEqual({ action: "wait", ms: 12 * MINUTE + RESET_MARGIN_MS });
+    // A need above the part becomes the part, so a run goes in a new window.
+    expect(budgetStep(readOf(10_200, 60), DEFAULT_NEED, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5)).toEqual({ action: "go" });
+    // A need of 0 turns off the gate, also with a part.
+    expect(budgetStep(readOf(0, 50), 0, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5)).toEqual({ action: "go" });
+  });
+
+  it("holds the second run of a window, so four runs of 2,700 requests do not use 0.75 of the limit in one hour", () => {
+    // 2026-11-21: four runs in one hour used 8,053 of 10,750 requests. With the part 0.5, the run after the first one waits.
+    const limit = 10_750;
+    expect(budgetStep(readOf(limit, 55, limit), 2700, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5)).toEqual({ action: "go" });
+    expect(budgetStep(readOf(limit - 2700, 40, limit), 2700, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5)).toEqual({ action: "stop", ms: 40 * MINUTE });
+    expect(budgetStep(readOf(limit - 2700, 40, limit), 2700, NOW, MAX_WAIT)).toEqual({ action: "go" });
+  });
+});
+
 describe("the need of a run from the runs before it", () => {
   it("is the default with fewer than the fewest runs", () => {
     expect(needOfRuns([]).need).toBe(DEFAULT_NEED);
@@ -115,6 +144,19 @@ describe("budgetGate", () => {
     expect(gate.read?.remaining).toBe(9000);
     expect(gate.record).toMatchObject({ outcome: "go", need: 6000, left: 9000, waitedMs: 0 });
     expect(gate.record.note).toBe("Rate budget: 9000 requests are left, and a run needs 6000. The run goes on.");
+  });
+
+  it("keeps the reserve of the part, and tells it in the note", async () => {
+    const time = fakeTime();
+    const go = await budgetGate({ need: 3600, part: 0.5, maxWaitMs: MAX_WAIT, read: reads(readOf(9000, 30)).read, now: time.now, sleep: time.sleep });
+    expect(go.record).toMatchObject({ outcome: "go", need: 3600, left: 9000, reserve: 5100, waitedMs: 0 });
+    expect(go.record.note).toBe(
+      "Rate budget: 9000 requests are left, 5100 of them stay for the other users of the token (the train uses the part 0.5 of the limit of 10200), and a run needs 3600. The run goes on.",
+    );
+    const stop = await budgetGate({ need: 3600, part: 0.5, maxWaitMs: MAX_WAIT, read: reads(readOf(8000, 45)).read, now: time.now, sleep: time.sleep });
+    expect(stop.record).toMatchObject({ outcome: "stop", reserve: 5100 });
+    const off = await budgetGate({ need: 0, part: 0.5, maxWaitMs: MAX_WAIT, read: reads(readOf(10, 45)).read, now: time.now, sleep: time.sleep });
+    expect(off.record).toMatchObject({ outcome: "go", need: 0, reserve: 0 });
   });
 
   it("waits once until the reset plus the margin, reads again and goes on, when the reset is near", async () => {
@@ -245,7 +287,7 @@ function answers(...list: Response[]): { fetch: FetchFn; count: () => number } {
 }
 
 /** The guard of a run on a meter, with a fake time and a log. */
-function guarded(f: FetchFn, o: { need: number; seed?: RateLimitRead; waited?: boolean }) {
+function guarded(f: FetchFn, o: { need: number; seed?: RateLimitRead; waited?: boolean; part?: number }) {
   const time = fakeTime();
   const lines: string[] = [];
   const meter = requestMeter(f, API, time.now);
@@ -258,6 +300,7 @@ function guarded(f: FetchFn, o: { need: number; seed?: RateLimitRead; waited?: b
     sleep: time.sleep,
     log: (line) => lines.push(line),
     ...(o.waited ? { waited: true } : {}),
+    ...(o.part !== undefined ? { part: o.part } : {}),
   });
   return { guard, time, lines, meter };
 }
@@ -266,6 +309,25 @@ function guarded(f: FetchFn, o: { need: number; seed?: RateLimitRead; waited?: b
 const rejection = (p: Promise<unknown>): Promise<unknown> => p.then(() => new Error("no rejection"), (e: unknown) => e);
 
 describe("rateGuard", () => {
+  it("keeps the reserve of the part after the run sent its need, so the part is a ceiling of the window", async () => {
+    // The reserve of 10,250 at the part 0.5 is 5,125. The run needs 2, and its window has 5,128 left.
+    const api = answers(answerOf(LIMIT - 5127, 30), answerOf(LIMIT - 5126, 30), answerOf(LIMIT - 5125, 30));
+    const { guard, lines } = guarded(api.fetch, { need: 2, part: 0.5, seed: readOf(5128, 30, LIMIT) });
+    for (let i = 1; i <= 3; i++) expect((await guard.fetch(PULL(i))).status).toBe(200);
+    const error = await rejection(guard.fetch(PULL(4)));
+    expect(error).toBeInstanceOf(RateStop);
+    expect((error as RateStop).message).toContain("5125 requests are left until");
+    expect((error as RateStop).message).toContain("5125 of them stay for the other users of the token, and the run needs 1 more.");
+    expect(api.count()).toBe(3);
+    expect(lines).toHaveLength(1);
+  });
+
+  it("keeps no reserve for a run with no need", async () => {
+    const api = answers(answerOf(LIMIT - 9, 30));
+    const { guard } = guarded(api.fetch, { need: 0, part: 0.5, seed: readOf(10, 30, LIMIT) });
+    expect((await guard.fetch(PULL(1))).status).toBe(200);
+  });
+
   it("waits one time for the reset after a stale first read and a 403, and sends the request again", async () => {
     const api = answers(answerOf(LIMIT, 12, 403), answerOf(3, 72));
     const { guard, time, lines } = guarded(api.fetch, { need: 6000, seed: readOf(LIMIT - 276, 34, LIMIT) });
