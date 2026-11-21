@@ -21,10 +21,12 @@ import {
   paceHours,
   shareOf,
   surfaceChanged,
+  surfaceOf,
   syncItems,
+  treePathsChanged,
   syncMonotone,
 } from "./candidate-policy.ts";
-import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateNeed, CandidatePolicy, PlanChangeChoice } from "./candidate-policy.ts";
+import type { CandidateCode, CandidateDecision, CandidateFacts, CandidateItem, CandidateNeed, CandidatePolicy, PlanChangeChoice, TreeEntry } from "./candidate-policy.ts";
 
 const H = 3_600_000;
 const NOW = Date.parse("2026-11-11T12:00:00Z");
@@ -199,6 +201,78 @@ describe("surfaceChanged", () => {
   it("counts a list that GitHub cut short as a change", () => {
     expect(surfaceChanged({ files: ["a"], cut: true }, { files: [], cut: false })).toBe(true);
     expect(surfaceChanged({ files: ["a"], cut: false }, { files: ["b"], cut: true })).toBe(true);
+  });
+});
+
+describe("surfaceOf", () => {
+  it("gives the files of the candidate, and the files of pnpm only with a lockfile", () => {
+    expect(surfaceOf(["package.json"])).toEqual(["package.json"]);
+    expect(surfaceOf(["packages/a/package.json", "pnpm-lock.yaml"])).toEqual([".npmrc", "packages/a/package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]);
+  });
+});
+
+describe("treePathsChanged", () => {
+  // Made-up trees: a root with one folder, each by its sha.
+  const blob = (path: string, sha: string, mode = "100644"): TreeEntry => ({ path, mode, type: "blob", sha });
+  const dir = (path: string, sha: string): TreeEntry => ({ path, mode: "040000", type: "tree", sha });
+  const reader = (trees: Record<string, TreeEntry[] | null>) => {
+    const reads: string[] = [];
+    const read = async (t: string) => {
+      reads.push(t);
+      return t in trees ? trees[t] : null;
+    };
+    return { read, reads };
+  };
+  const trees = {
+    base: [blob("package.json", "p1"), blob("pnpm-lock.yaml", "l1"), dir("packages", "d1"), dir("docs", "x1")],
+    d1: [dir("a", "a1")],
+    a1: [blob("package.json", "ap1")],
+  };
+
+  it("gives no change when each file of the paths has the same sha, and reads no folder with the same sha", async () => {
+    const { read, reads } = reader({ ...trees, main: [blob("package.json", "p1"), blob("pnpm-lock.yaml", "l1"), dir("packages", "d1"), dir("docs", "x2")] });
+    expect(await treePathsChanged(read, "base", "main", ["package.json", "pnpm-lock.yaml", "packages/a/package.json"])).toBe(false);
+    expect(reads.sort()).toEqual(["base", "main"]);
+  });
+
+  it("finds a changed file deep in a folder", async () => {
+    const { read } = reader({ ...trees, main: [blob("package.json", "p1"), dir("packages", "d2")], d2: [dir("a", "a2")], a2: [blob("package.json", "ap2")] });
+    expect(await treePathsChanged(read, "base", "main", ["packages/a/package.json"])).toBe(true);
+  });
+
+  it("gives no change when only other files of a changed folder changed", async () => {
+    const { read } = reader({ ...trees, main: [dir("packages", "d2")], d2: [dir("a", "a2")], a2: [blob("package.json", "ap1"), blob("README.md", "r1")] });
+    expect(await treePathsChanged(read, "base", "main", ["packages/a/package.json"])).toBe(false);
+  });
+
+  it("counts a file that is in one tree only, and a new mode, as a change", async () => {
+    expect(await treePathsChanged(reader({ ...trees, main: [] }).read, "base", "main", ["package.json"])).toBe(true);
+    expect(await treePathsChanged(reader({ ...trees, main: [blob("package.json", "p1", "100755")] }).read, "base", "main", ["package.json"])).toBe(true);
+    expect(await treePathsChanged(reader({ ...trees, main: [dir("packages", "d1")] }).read, "base", "main", ["packages/b/new.ts", "package.json"])).toBe(true);
+  });
+
+  it("reads a folder that is in one tree only against an empty tree", async () => {
+    const { read, reads } = reader({ ...trees, main: [blob("package.json", "p1"), dir("packages", "d1"), dir("tools", "t1")], t1: [blob("x.ts", "x1")] });
+    expect(await treePathsChanged(read, "base", "main", ["tools/x.ts"])).toBe(true);
+    expect(reads).toContain("t1");
+    expect(await treePathsChanged(reader({ ...trees, main: [dir("tools", "t1")], t1: [blob("y.ts", "y1")] }).read, "base", "main", ["tools/x.ts"])).toBe(false);
+  });
+
+  it("gives null when a needed read failed and no change was found", async () => {
+    expect(await treePathsChanged(reader({ ...trees, main: null }).read, "base", "main", ["package.json"])).toBeNull();
+    const deep = reader({ base: trees.base, d1: trees.d1, main: [blob("package.json", "p1"), dir("packages", "d2")], d2: null });
+    expect(await treePathsChanged(deep.read, "base", "main", ["packages/a/package.json"])).toBeNull();
+  });
+
+  it("gives a change before a failed read of another folder", async () => {
+    const { read } = reader({ base: trees.base, main: [blob("package.json", "p2"), dir("packages", "d2")], d2: null });
+    expect(await treePathsChanged(read, "base", "main", ["package.json", "packages/a/package.json"])).toBe(true);
+  });
+
+  it("gives no change for no paths, with no read", async () => {
+    const { read, reads } = reader({});
+    expect(await treePathsChanged(read, "base", "main", [])).toBe(false);
+    expect(reads).toEqual([]);
   });
 });
 

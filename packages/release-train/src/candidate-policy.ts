@@ -141,7 +141,10 @@ export interface CandidateFacts {
   behind?: number | null;
   /** True when the default branch changed a file of the surface of the candidate since the merge base. */
   surfaceChanged?: boolean;
-  /** True when GitHub cut a list of files of the surface check short. Then `surfaceChanged` is true, and the check has no read. */
+  /**
+   * True when GitHub cut a list of files of the surface check short, and no read of the git trees replaced it. Then
+   * `surfaceChanged` is true, and the check has no read.
+   */
   surfaceCut?: boolean;
   /** The count of the workflow runs of other branches that are queued or in progress. A run older than `stuckCiHours` does not count. */
   otherRuns?: number;
@@ -345,7 +348,7 @@ function green(p: CandidatePolicy, f: CandidateFacts, o: OpenCandidate, planChan
   const behind = f.behind === null || f.behind > 0;
   if (behind) {
     if (f.surfaceChanged === undefined) return { need: "surface" };
-    if (f.surfaceChanged && f.surfaceCut) return stale("surface-list-cut", "GitHub cut a list of files of the surface check at 300 files, so the check has no read and counts a change");
+    if (f.surfaceChanged && f.surfaceCut) return stale("surface-list-cut", "GitHub cut a list of files of the surface check at 300 files, and no read of the git trees replaced it, so the check counts a change");
     if (f.surfaceChanged) return stale("surface-changed", "the default branch changed a file of the surface of the candidate");
   }
   // 4b: a change of the plan. A missing or empty mark gives no read, and no read is not monotone. The mark of an update
@@ -627,12 +630,67 @@ export function commitHealth(runs: readonly RunHealth[] | null | undefined): Com
 const LOCK_FILES = ["pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc"];
 
 /**
- * This function tells if the default branch changed a file of the surface of a candidate. The surface is the files of the
- * candidate, and the files of pnpm when the candidate changes the lockfile. A list that GitHub cut short counts as a change.
+ * This function gives the surface of a candidate: the files of the candidate, and the files of pnpm when the candidate
+ * changes the lockfile.
+ */
+export function surfaceOf(files: readonly string[]): string[] {
+  const surface = new Set(files);
+  if (files.some((f) => f === "pnpm-lock.yaml" || f.endsWith("/pnpm-lock.yaml"))) for (const f of LOCK_FILES) surface.add(f);
+  return [...surface].sort();
+}
+
+/**
+ * This function tells if the default branch changed a file of the surface of a candidate. A list that GitHub cut short
+ * counts as a change.
  */
 export function surfaceChanged(candidate: { files: readonly string[]; cut: boolean }, main: { files: readonly string[]; cut: boolean }): boolean {
   if (candidate.cut || main.cut) return true;
-  const surface = new Set(candidate.files);
-  if (candidate.files.some((f) => f === "pnpm-lock.yaml" || f.endsWith("/pnpm-lock.yaml"))) for (const f of LOCK_FILES) surface.add(f);
+  const surface = new Set(surfaceOf(candidate.files));
   return main.files.some((f) => surface.has(f));
+}
+
+/** One entry of a git tree: a file (blob), a folder (tree) or a submodule (commit). */
+export interface TreeEntry {
+  path: string;
+  mode: string;
+  type: string;
+  sha: string;
+}
+
+/** A reader of one level of a git tree, by the sha of the tree or of a commit, or by a branch. Null: the read failed. */
+export type TreeRead = (treeish: string) => Promise<readonly TreeEntry[] | null>;
+
+/**
+ * This function tells if a file of `paths` is different in the git trees `from` and `to`. It reads the two trees one
+ * level at a time, along the paths only. Two folders with the same sha have the same files, so the read stops there. A
+ * file that is in one tree only, or that has a different sha or mode, is a change. A treeish of null is an empty tree,
+ * with no read. Null: a read failed, and no change was found before it.
+ */
+export async function treePathsChanged(read: TreeRead, from: string | null, to: string | null, paths: readonly string[]): Promise<boolean | null> {
+  if (paths.length === 0 || (from === null && to === null)) return false;
+  const [a, b] = await Promise.all([from === null ? [] : read(from), to === null ? [] : read(to)]);
+  if (a === null || b === null) return null;
+  const byName = (list: readonly TreeEntry[]) => new Map(list.map((e) => [e.path, e]));
+  const ta = byName(a);
+  const tb = byName(b);
+  // The paths below each entry of this level. An empty rest is the entry itself.
+  const below = new Map<string, string[]>();
+  for (const p of paths) {
+    const i = p.indexOf("/");
+    const name = i < 0 ? p : p.slice(0, i);
+    below.set(name, [...(below.get(name) ?? []), i < 0 ? "" : p.slice(i + 1)]);
+  }
+  const same = (name: string): boolean => `${ta.get(name)?.mode} ${ta.get(name)?.sha}` === `${tb.get(name)?.mode} ${tb.get(name)?.sha}`;
+  // The files of this level first: a change found here needs no read of a deeper level.
+  for (const [name, rests] of below) if (rests.includes("") && !same(name)) return true;
+  const folder = (e: TreeEntry | undefined): string | null => (e?.type === "tree" ? e.sha : null);
+  const reads: Promise<boolean | null>[] = [];
+  for (const [name, rests] of below) {
+    const deeper = rests.filter((r) => r !== "");
+    const fa = folder(ta.get(name));
+    const fb = folder(tb.get(name));
+    if (deeper.length > 0 && fa !== fb) reads.push(treePathsChanged(read, fa, fb, deeper));
+  }
+  const found = await Promise.all(reads);
+  return found.includes(true) ? true : found.includes(null) ? null : false;
 }
