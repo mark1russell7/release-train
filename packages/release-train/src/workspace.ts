@@ -232,8 +232,8 @@ export const TRAIN_ONLY_VARIABLES: readonly string[] = [
 export const CLONE_EVENT_FILE: string = ".git/release-train-event.json";
 
 /**
- * This function gives the text of the event file of a clone. It has the fields of the event of a run in that repository that
- * the scripts read: the full name and the visibility of the repository.
+ * This function gives the text of the event file of a clone. The scripts read two fields of the event of a run in that
+ * repository: the full name and the visibility of the repository.
  */
 export function cloneEvent(repository: string, isPrivate: boolean): string {
   return `${JSON.stringify({ repository: { full_name: repository, private: isPrivate } })}\n`;
