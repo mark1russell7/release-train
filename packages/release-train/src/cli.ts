@@ -455,7 +455,7 @@ async function planSync(p: Plan, accounts: Accounts, workflows: WorkflowsMode, l
     const files = filesOf.get(r.name) ?? null;
     if (!files) return null;
     const releaseInFlight = pending.has(r.name) || (r.pendingChangesets ?? 0) > 0;
-    const result = await syncRepo(files, { ...runFacts, repo: r.name, account: r.account, releaseInFlight }, SYNC_RULES, workflows !== "no");
+    const result = await syncRepo(files, { ...runFacts, repo: r.name, account: r.account, releaseInFlight, private: r.private }, SYNC_RULES, workflows !== "no");
     return { repo: r.name, private: r.private, result };
   });
   return items.filter((i): i is SyncPlanItem => i !== null);
