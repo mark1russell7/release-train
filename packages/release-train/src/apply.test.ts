@@ -44,7 +44,7 @@ import { RateStop } from "./meter.ts";
 import { plan } from "./plan.ts";
 import { UPDATE_SCRIPT } from "./types.ts";
 import type { Manifest, NpmInfo, RepoSnapshot, Resolved } from "./types.ts";
-import { API_REPORT_PACKAGE, CONVENTIONS, ageExcluded, apiReportUpdateArgs, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
+import { API_REPORT_PACKAGE, CLONE_EVENT_FILE, CONVENTIONS, ageExcluded, apiReportUpdateArgs, cloneEvent, editManifest, gitUpdater, lockChanges, releaseAgePolicy, replaceRange } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 const OWNER = "example-owner";
@@ -1603,6 +1603,7 @@ describe("gitUpdater and conventions fix", () => {
     const cmds: string[] = [];
     const trees: string[] = [];
     const fixEnv: NodeJS.ProcessEnv[] = [];
+    const events: string[] = [];
     let message = "";
     const run: RunFn = async (cmd, args, opts) => {
       cmds.push(`${cmd} ${args.join(" ")}`);
@@ -1611,6 +1612,8 @@ describe("gitUpdater and conventions fix", () => {
         const devDependencies = { [CONVENTIONS]: "^0.8.0", ...(prettier ? { prettier: "^3.0.0" } : {}) };
         writeFileSync(join(opts.cwd, "package.json"), `${JSON.stringify({ name: "x", ...scripts, devDependencies }, null, 2)}\n`);
         writeFileSync(join(opts.cwd, "tsconfig.test.json"), "old");
+        mkdirSync(join(opts.cwd, ".git"), { recursive: true });
+        writeFileSync(join(opts.cwd, ".git", "HEAD"), "ref: refs/heads/main\n");
       }
       if (cmd === "git" && args[0] === "write-tree") {
         trees.push(readFileSync(join(opts.cwd, "tsconfig.test.json"), "utf8"));
@@ -1637,6 +1640,8 @@ describe("gitUpdater and conventions fix", () => {
       }
       if (cmd === "pnpm" && args[0] === "dlx") {
         fixEnv.push(opts.env ?? {});
+        const event = opts.env?.["GITHUB_EVENT_PATH"];
+        events.push(event !== undefined && existsSync(event) ? readFileSync(event, "utf8") : "");
         if (typecheck !== undefined) {
           writeFileSync(join(opts.cwd, "tsconfig.test.json"), "fixed");
           writeFileSync(join(opts.cwd, "vitest.config.ts"), "export default {};\n");
@@ -1649,11 +1654,11 @@ describe("gitUpdater and conventions fix", () => {
     };
     const up = gitUpdater({ owner: OWNER, token: "t", author: { name: "a", email: "a@b" }, run, fetch: async () => new Response("{}", { status: 200 }) });
     const result = await up.update(u, { defaultBranch: "main", rebuild: false });
-    return { cmds, fixEnv, message, result };
+    return { cmds, fixEnv, events, message, result };
   };
 
   it("starts the fix of the target version with the repository of the clone, and keeps its files in the commit", async () => {
-    const { cmds, fixEnv, message, result } = await start(update("0.8.2"));
+    const { cmds, fixEnv, events, message, result } = await start(update("0.8.2"));
     // typed-files needs the typescript of the repository: an install with no scripts, just before the fix
     const fix = cmds.indexOf(`pnpm dlx ${CONVENTIONS}@0.8.2 fix --json`);
     expect(fix).toBeGreaterThan(0);
@@ -1665,6 +1670,10 @@ describe("gitUpdater and conventions fix", () => {
     expect(fixEnv[0]).not.toHaveProperty("GITHUB_SHA");
     for (const name of ["GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT"]) expect(fixEnv[0], name).not.toHaveProperty(name);
     expect(Object.keys(fixEnv[0] ?? {}).filter((key) => key.startsWith("GIT_CONFIG_"))).toEqual([]);
+    // The event file names the clone and its visibility, not the train: a rule of conventions reads the visibility there
+    const event = fixEnv[0]?.["GITHUB_EVENT_PATH"] ?? "";
+    expect(event.replace(/\\/g, "/").endsWith(`/${CLONE_EVENT_FILE}`)).toBe(true);
+    expect(events[0]).toBe(cloneEvent(`${OWNER}/lib-repo`, update("0.8.2").private));
     expect(result).toMatchObject({ status: "pushed", fixed: [".github/workflows/ci.yml", "vitest.config.ts"] });
     expect(message).toContain("- conventions fix: .github/workflows/ci.yml, vitest.config.ts");
     // A new file of the fix is not tracked, so `git add -u` does not stage it: the train stages each file of the fix by name
