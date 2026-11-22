@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { addSummaryJob, withOneJob } from "@mark1russell7/conventions";
 import { BUSY_LIMIT, RUN_MS, TRAIN_LABEL, apply, applySummary, bodyFingerprint, busyRunners, publicReport, syncPrBody } from "./apply.ts";
 import type { Updater } from "./apply.ts";
 import { CANDIDATE_POLICY } from "./candidate-policy.ts";
@@ -327,6 +328,77 @@ describe("callers", () => {
     expect(outcome(r, "callers")).toMatchObject({ state: "report", changes: [] });
     expect(outcome(r, "callers")?.needs).toHaveLength(2);
     expect(r.fingerprint).toBe("");
+  });
+});
+
+describe("summary-job", () => {
+  const gate = ["name: CI", "on:", "  pull_request:", "jobs:", "  test:", "    runs-on: ubuntu-latest", "    steps:", "      - run: echo test", ""].join("\n");
+  const scans = [
+    "name: Security",
+    "on:",
+    "  pull_request:",
+    "jobs:",
+    "  security:",
+    `    uses: ${T}/.github/workflows/reusable-security.yml@${OLD}`,
+    "  summary:",
+    "    name: Security OK",
+    "    if: ${{ !cancelled() }}",
+    "    needs: [security]",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - run: echo ok",
+    "",
+  ].join("\n");
+  const pub = (extra: Partial<SyncFacts> = {}): SyncFacts => facts({ private: false, ...extra });
+
+  it("adds the summary job of the conventions rule to a gate workflow of a public repository with no conventions check", async () => {
+    const r = await syncRepo(mem({ ".github/workflows/ci.yml": gate }), pub());
+    const expected = addSummaryJob(gate, ".github/workflows/ci.yml");
+    if (!("text" in expected)) throw new Error(expected.reason);
+    expect(outcome(r, "summary-job")).toMatchObject({ state: "applied", needs: [] });
+    expect(r.writes[".github/workflows/ci.yml"]).toBe(expected.text);
+    expect(r.writes[".github/workflows/ci.yml"]).toContain("CI OK");
+  });
+
+  it("puts one job Security OK in place of a caller of reusable-security.yml and its summary job", async () => {
+    const r = await syncRepo(mem({ ".github/workflows/security.yml": scans }), pub());
+    const expected = withOneJob(scans);
+    if (!("text" in expected)) throw new Error(expected.reason);
+    expect(r.writes[".github/workflows/security.yml"]).toBe(expected.text);
+    expect(r.writes[".github/workflows/security.yml"]).not.toContain("reusable-security.yml");
+    expect(r.writes[".github/workflows/security.yml"]).toContain("Security OK");
+  });
+
+  it("leaves a repository with the conventions check, a private repository and a repository of unknown visibility", async () => {
+    const withCheck = { ".github/workflows/ci.yml": gate, "package.json": JSON.stringify({ devDependencies: { "@mark1russell7/conventions": "^0.50.4" } }) };
+    for (const [files, f] of [
+      [withCheck, pub()],
+      [{ ".github/workflows/ci.yml": gate }, facts({ private: true })],
+      [{ ".github/workflows/ci.yml": gate }, facts()],
+    ] as const) {
+      const r = await syncRepo(mem(files), f);
+      expect(outcome(r, "summary-job")).toBeUndefined();
+      expect(r.writes).toEqual({});
+    }
+  });
+
+  it("leaves a gate with a summary job, a gate that does not start on a pull request and a workflow that is not a gate", async () => {
+    const done = addSummaryJob(gate, ".github/workflows/ci.yml");
+    if (!("text" in done)) throw new Error(done.reason);
+    const files = {
+      ".github/workflows/ci.yml": done.text,
+      ".github/workflows/security.yml": gate.replace("  pull_request:", "  push:"),
+      ".github/workflows/pages.yml": gate,
+    };
+    const r = await syncRepo(mem(files), pub());
+    expect(outcome(r, "summary-job")).toBeUndefined();
+    expect(r.writes).toEqual({});
+  });
+
+  it("waits for the Workflows permission of the App", async () => {
+    const r = await syncRepo(mem({ ".github/workflows/ci.yml": gate }), pub(), undefined, false);
+    expect(outcome(r, "summary-job")).toMatchObject({ state: "held", waits: [WORKFLOWS_WAIT] });
+    expect(r.writes).toEqual({});
   });
 });
 
