@@ -3,15 +3,9 @@
     {
       "package": "@mark1russell7/collections",
       "repo": "client",
-      "reason": "Version 0.7.0 of collections removes Option, Some, None, Ok, Err and Result, and 0.10.0 removes 83 more names. @procedures/collections exports these names from its root. Thus the update is a breaking change of the client group, and it ships as its own MINOR after a release that marks the names deprecated.",
+      "reason": "client takes collections ^0.10.0 since the deprecation release, so the removal of 0.7.0 and 0.10.0 is done. The hold stays for the next minor (0.11.x): @procedures/collections exports the names of its root again, and the client owner checks 0.11 for removed names before the update ships, as its own MINOR if it breaks. Renewed 2026-11-24.",
       "ruling": "https://github.com/mark1russell7/client/blob/556d0a827684e4d7cee70fe35b908e643b088d8d/packages/documentation/SERVER-LAYERS.md#releases-of-the-server-stack",
-      "until": "2026-11-22"
-    },
-    {
-      "package": "@mark1russell7/rational",
-      "reason": "The next version of rational, 0.1.3, ships in the npm sitting of 2026-11-21 with the other packages of its repository (roadmap A17 of algebra). Its only change on main since 0.1.2 is a test helper and a new dev dependency (rigor-generators), so the code of the package does not change.",
-      "ruling": "https://github.com/mark1russell7/algebra/pull/150",
-      "until": "2026-11-22"
+      "until": "2026-12-07"
     }
   ]
 }
