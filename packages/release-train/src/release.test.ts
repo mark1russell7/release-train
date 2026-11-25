@@ -11,7 +11,7 @@ import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import { addChangelogSection, awaitRelease, changesetText, dispatchReleased, decideBump, decisionBreaks, namesModule, setManifestVersion, typedFiles } from "./release.ts";
 import type { Manifest, NpmInfo, RepoSnapshot } from "./types.ts";
-import { changesetName, cloneEnv, CREDENTIAL_NAME, gitUpdater, needsGitAuth, reportBuildArgs, TRAIN_ONLY_VARIABLES, UPDATE_SCRIPT } from "./workspace.ts";
+import { changesetName, cloneEnv, cloneEvent, CREDENTIAL_NAME, gitUpdater, needsGitAuth, reportBuildArgs, TRAIN_ONLY_VARIABLES, UPDATE_SCRIPT } from "./workspace.ts";
 import type { RunFn } from "./workspace.ts";
 
 /** This function makes a gzip tar file with the given files. */
@@ -147,6 +147,7 @@ describe("cloneEnv", () => {
     GITHUB_STEP_SUMMARY: "/run/summary",
     GITHUB_RUN_ID: "42",
     GITHUB_EVENT_NAME: "schedule",
+    GITHUB_EVENT_PATH: "/run/event.json",
   };
   const clone = { repository: "ex/lib-repo", workspace: "/tmp/rt-1", branch: "main", sha: "0123456789abcdef0123456789abcdef01234567" };
 
@@ -172,6 +173,12 @@ describe("cloneEnv", () => {
 
   it("gives no GITHUB_SHA when the commit of the clone is not known, so a tool reads HEAD", () => {
     for (const sha of [undefined, ""]) expect(cloneEnv(train, { ...clone, sha }), String(sha)).not.toHaveProperty("GITHUB_SHA");
+  });
+
+  it("gives the event file of the clone in place of the event of the train, and no event file when there is none", () => {
+    expect(cloneEnv(train, { ...clone, event: "/tmp/rt-1/.git/release-train-event.json" })["GITHUB_EVENT_PATH"]).toBe("/tmp/rt-1/.git/release-train-event.json");
+    for (const event of [undefined, ""]) expect(cloneEnv(train, { ...clone, event }), String(event)).not.toHaveProperty("GITHUB_EVENT_PATH");
+    expect(JSON.parse(cloneEvent("ex/lib-repo", true))).toEqual({ repository: { full_name: "ex/lib-repo", private: true } });
   });
 });
 

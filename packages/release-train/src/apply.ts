@@ -2398,7 +2398,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
     const syncOne = async (repo: string, record: DecisionRecord): Promise<void> => {
       const isPrivate = privateOf.get(repo) ?? true;
       const existing = syncOpen.get(repo) ?? null;
-      const facts: SyncFacts = { ...facts0, repo, account: accountOf(repo), releaseInFlight: pending.has(repo) || changesets.has(repo) };
+      const facts: SyncFacts = { ...facts0, repo, account: accountOf(repo), releaseInFlight: pending.has(repo) || changesets.has(repo), private: isPrivate };
       const commonOf = (r: SyncResult) => ({
         repo,
         private: isPrivate,
