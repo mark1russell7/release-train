@@ -8,7 +8,7 @@
  * entries that a run used, so it does not grow with answers that no run asks for again.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { KEPT_SEAL_SECRET_MIN, keptFetch, keptStore, openKept, sealKept } from "polite-crawler/api";
+import { KEPT_SEAL_SECRET_MIN, keptFetch, keptKey, keptStore, openKept, sealKept } from "polite-crawler/api";
 import type { FetchLike, Kept, KeptMemory, KeptStore } from "polite-crawler/api";
 import type { FetchFn } from "./collect.ts";
 
@@ -35,15 +35,44 @@ async function toResponse(answer: Awaited<ReturnType<FetchLike>>): Promise<Respo
   return new Response(body, { status: answer.status, statusText: answer.statusText, headers });
 }
 
+/** A full commit SHA: 40 hexadecimal digits. A branch name or a short SHA can point at another commit later. */
+const SHA = "[0-9a-f]{40}";
+
+/**
+ * The GET paths of the API whose answer is fixed by a full commit SHA in the URL. The answer of such a path cannot change, so a
+ * kept answer is the answer, and the run sends no request for it, not even a 304. The status and the check runs of a commit
+ * change, so they are not here. Each pattern is the path after `/repos/{owner}/{repo}/`.
+ */
+const PINNED: readonly RegExp[] = [
+  new RegExp(String.raw`^contents/[^?]*\?(?:[^#]*&)?ref=${SHA}(?:&|$)`),
+  new RegExp(String.raw`^git/(?:trees|blobs)/${SHA}(?:\?|$)`),
+  new RegExp(String.raw`^commits/${SHA}(?:\?|$)`),
+  new RegExp(String.raw`^compare/${SHA}\.{2,3}${SHA}(?:\?|$)`),
+];
+
+/** This function tells if the answer of a GET of the API is fixed by a full commit SHA in its URL. */
+export function pinnedToCommit(url: string, apiBase: string = "https://api.github.com"): boolean {
+  const match = /^\/repos\/[^/]+\/[^/]+\/(.+)$/.exec(url.startsWith(apiBase) ? url.slice(apiBase.length) : "");
+  return match !== null && PINNED.some((pattern) => pattern.test(match[1] ?? ""));
+}
+
 /**
  * This function makes a fetch with kept answers for the GitHub API. Some GET requests go through `keptFetch`: a GET of the API
  * with no body and with its headers as a plain record. It sends the validators of the kept answer. A 304 then gives the kept
  * answer as a 200.
  * Each other request goes to `fetch` as it is. The fetch follows a redirect, as before: a moved repository answers 301.
  *
+ * A GET whose URL is pinned to a commit (`pinnedToCommit`) and that has a kept answer gets that answer with no request.
+ * The answer came from a read of the train with the same tokens. `onPinned` counts these answers for the report.
+ *
  * Put this fetch above the meter: then the meter counts each real 304, and the guard sees the kept answer.
  */
-export function keptGitHubFetch(fetch: FetchFn, store: KeptStore, apiBase: string = "https://api.github.com"): FetchFn {
+export function keptGitHubFetch(
+  fetch: FetchFn,
+  store: KeptStore,
+  apiBase: string = "https://api.github.com",
+  onPinned: (url: string) => void = () => {},
+): FetchFn {
   const inner: FetchLike = (url, init) => {
     // The kept fetch asks for a manual redirect. The train follows each redirect, so that field does not go on.
     const { redirect: _manual, signal, ...rest } = init;
@@ -56,6 +85,13 @@ export function keptGitHubFetch(fetch: FetchFn, store: KeptStore, apiBase: strin
     const headers = init?.headers ?? {};
     if (method !== "GET" || !url.startsWith(prefix) || (init?.body ?? null) !== null || !plainHeaders(headers)) {
       return fetch(url, init);
+    }
+    if (pinnedToCommit(url, apiBase)) {
+      const known = store.get(keptKey(url, headers));
+      if (known !== undefined) {
+        onPinned(url);
+        return new Response(NULL_BODY.has(known.status) ? null : known.body, { status: known.status, headers: known.headers });
+      }
     }
     const answer = await kept(url, { method, headers, redirect: "manual", signal: init?.signal ?? NO_SIGNAL });
     return answer instanceof Response ? answer : toResponse(answer);

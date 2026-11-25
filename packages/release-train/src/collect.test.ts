@@ -1,4 +1,5 @@
 // All names in these tests are made up. No test uses the network.
+import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,8 @@ import { retryAfterDelay, type Clock } from "@mark1russell7/service";
 import { collect, HttpError, listRepos, manifestFolder, nextLink, patchVersion, rateLimited, rateLimitText, rateLimitWait, runtimeRanges, tokenKind } from "./collect.ts";
 import type { FetchFn, GhRepo, PageRead } from "./collect.ts";
 import { docId, writeDb } from "./db.ts";
+import { keptGitHubFetch } from "./kept.ts";
+import { keptStore } from "polite-crawler/api";
 import { buildGraph, publicView } from "./graph.ts";
 import { matchWorkspaces, parseNpmLock, parsePnpmLock, parseSpec } from "./parse.ts";
 import { plan } from "./plan.ts";
@@ -225,6 +228,61 @@ describe("the workspace globs of conventions and the copy of release-train 0.2.9
       "**/test/** test true",
     ]);
     expect(same).toBe(globs.length * paths.length - 8);
+  });
+});
+
+/** The SHA of the blob of a text, as git makes it. */
+const blobSha = (text: string): string => createHash("sha1").update(`blob ${Buffer.byteLength(text)} ${text}`).digest("hex");
+
+/**
+ * A fetch over fakeFetch whose trees give the SHA of each blob, and that serves each blob by its SHA with its ETag. It
+ * answers 304 to a matching If-None-Match, as GitHub does.
+ */
+function blobFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls: string[]): FetchFn {
+  const inner = fakeFetch(repos, npm, []);
+  const texts = new Map(repos.flatMap((r) => Object.values(r.files).map((text) => [blobSha(text), text] as const)));
+  return async (url, init) => {
+    calls.push(url);
+    const blob = //git/blobs/([0-9a-f]{40})$/.exec(new URL(url).pathname);
+    if (blob) {
+      const text = texts.get(blob[1] ?? "");
+      if (text === undefined) return new Response("", { status: 404 });
+      const etag = `"${blob[1]}"`;
+      const match = (init?.headers as Record<string, string> | undefined)?.["if-none-match"] === etag;
+      return match ? new Response(null, { status: 304, headers: { etag } }) : new Response(text, { headers: { etag } });
+    }
+    const res = await inner(url, init);
+    if (!//git/trees//.test(url) || !res.ok) return res;
+    const body = (await res.json()) as { tree: { path: string; type: string; sha?: string }[] };
+    const files = repos.find((r) => url.includes(`/${r.name}/`))?.files ?? {};
+    for (const e of body.tree) if (e.type === "blob") e.sha = blobSha(files[e.path] ?? "");
+    return new Response(JSON.stringify(body), { status: res.status, headers: res.headers });
+  };
+}
+
+describe("the reads of the files of a tree", () => {
+  it("reads each file by its blob, and a second run with the kept answers sends no read of a file that did not change", async () => {
+    const npm = { "@ex/core": "1.4.0", "@ex/skip": "1.0.0", "@ex/hidden": "1.0.0", "vendored-lib": "9.0.0" };
+    const first: string[] = [];
+    const store = keptStore();
+    const one = await collect({ owner: "example-owner", token: "t", fetch: keptGitHubFetch(blobFetch(REPOS, npm, first), store), publicOnly: true, concurrency: 2 });
+    expect(first.some((c) => c.includes("/contents/"))).toBe(false);
+    const blobs = first.filter((c) => c.includes("/git/blobs/"));
+    // core-repo: package.json, pnpm-workspace.yaml, two package.json files of the workspace, the lockfile. app-repo: package.json
+    // and the lockfile. npm-repo: package.json and the lockfile. vendor-repo: package.json.
+    expect(blobs).toHaveLength(10);
+
+    // The gate: with the kept answers of the first run, no file of an unchanged tree costs a request.
+    const second: string[] = [];
+    const two = await collect({ owner: "example-owner", token: "t", fetch: keptGitHubFetch(blobFetch(REPOS, npm, second), keptStore(store.used())), publicOnly: true, concurrency: 2 });
+    expect(second.filter((c) => c.includes("/git/blobs/"))).toEqual([]);
+    expect(two.repos).toEqual(one.repos);
+
+    // A changed file has a new blob: only that file is read again.
+    const changed = REPOS.map((r) => r.name === "app-repo" ? { ...r, files: { ...r.files, "package.json": JSON.stringify({ name: "app", private: true, dependencies: { "@ex/core": "^1.4.0" } }) } } : r);
+    const third: string[] = [];
+    await collect({ owner: "example-owner", token: "t", fetch: keptGitHubFetch(blobFetch(changed, npm, third), keptStore(store.used())), publicOnly: true, concurrency: 2 });
+    expect(third.filter((c) => c.includes("/git/blobs/"))).toHaveLength(1);
   });
 });
 
