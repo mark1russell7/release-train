@@ -35,6 +35,99 @@ export function reserveOf(limit: number, part: number): number {
   return limit - Math.floor(limit * part);
 }
 
+/**
+ * The GitHub requests that the train sent in one window of the rate limit of its home token. The state keeps them from
+ * one run to the next (state.ts). The runs of the group `train` do not overlap, so the sum of a window is exact.
+ */
+export interface SpentWindow {
+  /** The reset of the window, in seconds after the epoch. */
+  reset: number;
+  /** The limit of the window. */
+  limit: number;
+  /** The requests that GitHub counts: each answer but a 304. */
+  requests: number;
+}
+
+/** The largest difference in seconds of the reset of two reads of one window (as `WINDOW_SLACK_S` of meter.ts). */
+export const SPENT_SLACK_S = 60;
+
+/** The largest count of windows that the state keeps. A window stays only until its reset. */
+export const SPENT_MAX = 24;
+
+/** This function tells if a kept window and a read of the rate limit are of one window. */
+const sameSpent = (w: SpentWindow, reset: number, limit: number): boolean => w.limit === limit && Math.abs(w.reset - reset) <= SPENT_SLACK_S;
+
+/**
+ * This function gives the requests that the runs before this run sent in the window of a read, from the windows of the
+ * state. It gives null when the state has no windows: then the gate counts all used requests as the use of the train.
+ *
+ * On 2026-11-24, the run at 18:54Z found 4,246 requests used, and 2,282 of them were of the run at 18:39Z. The gate
+ * counted the 4,246 against the part of the train, so the run stopped with 1,154 requests for a need of 2,700.
+ */
+export function priorUse(spent: readonly SpentWindow[] | undefined, read: Pick<RateLimitRead, "limit" | "reset">): number | null {
+  if (spent === undefined) return null;
+  const reset = Date.parse(read.reset);
+  if (!Number.isFinite(reset)) return null;
+  const s = Math.floor(reset / 1000);
+  return spent.filter((w) => sameSpent(w, s, read.limit)).reduce((sum, w) => sum + w.requests, 0);
+}
+
+/**
+ * This function gives the requests of a window that the train can still use.
+ *
+ * - With no known use of the train (null), each used request counts against the part of the train.
+ * - With a known use of the train, only that use counts against the part. The use of the other users counts against
+ *   the reserve. When the others use more than the reserve, the rest comes out of the part. Thus the result is the
+ *   smaller of the requests left and the part less the use of the train.
+ */
+export function freeOf(read: Pick<RateLimitRead, "limit" | "used" | "remaining">, reserve: number, trainUsed: number | null): number {
+  if (trainUsed === null) return read.remaining - reserve;
+  const own = Math.min(read.used, Math.max(0, trainUsed));
+  return Math.min(read.remaining, read.limit - reserve - own);
+}
+
+/** One answer of the meter, as `spentOfSamples` needs it. */
+interface SpentSample {
+  used: number;
+  remaining?: number | null;
+  reset: number;
+  status: number;
+  token?: number;
+}
+
+/**
+ * This function gives the windows of the counted requests of one token in the samples of a run. GitHub does not count
+ * an answer 304, so the function does not count it either. A sample with no remaining count has no limit, so it is out.
+ */
+export function spentOfSamples(samples: readonly SpentSample[], token: number): SpentWindow[] {
+  const out: SpentWindow[] = [];
+  for (const s of samples) {
+    if ((s.token ?? 0) !== token || s.status === 304 || s.remaining == null) continue;
+    const limit = s.used + s.remaining;
+    const known = out.find((w) => sameSpent(w, s.reset, limit));
+    if (known) known.requests += 1;
+    else out.push({ reset: s.reset, limit, requests: 1 });
+  }
+  return out;
+}
+
+/**
+ * This function adds the windows of a run to the windows of the state. It drops each window whose reset is at or before
+ * `now` (in milliseconds), and it keeps the last `SPENT_MAX` windows, with the earliest reset first.
+ */
+export function addSpent(spent: readonly SpentWindow[], run: readonly SpentWindow[], now: number): SpentWindow[] {
+  const out = spent.map((w) => ({ ...w }));
+  for (const w of run) {
+    const known = out.find((k) => sameSpent(k, w.reset, w.limit));
+    if (known) known.requests += w.requests;
+    else out.push({ ...w });
+  }
+  return out
+    .filter((w) => w.reset * 1000 > now)
+    .sort((a, b) => a.reset - b.reset)
+    .slice(-SPENT_MAX);
+}
+
 /** The count of the last full applies that the state keeps for the need of a run. */
 export const COST_RUNS = 20;
 
@@ -106,6 +199,11 @@ export interface GateRecord {
    * only the requests left above this count. Absent in the reports of the versions before 0.5.0 and when the read failed.
    */
   reserve?: number;
+  /**
+   * The requests of the window that the runs before this run sent ({@link priorUse}). Absent when the state has no
+   * windows, in the reports of the versions before this field, and when the read failed.
+   */
+  prior?: number;
   /** The reset time of the first read, as an ISO text. Null when the read failed. */
   reset: string | null;
   /** The time of the wait for the reset, in milliseconds. */
@@ -128,11 +226,21 @@ export type BudgetStep = { action: "go" } | { action: "wait"; ms: number } | { a
  * @param marginMs - The time after the reset before the next read.
  * @param part - The part of the limit that the train uses ({@link DEFAULT_PART}). The default 1 gives the whole limit to the
  *   train. The requests of the reserve ({@link reserveOf}) do not count as left.
+ * @param trainUsed - The requests of the window that the runs before this run sent ({@link priorUse}). Null: not known,
+ *   so each used request counts against the part ({@link freeOf}).
  */
-export function budgetStep(read: RateLimitRead, need: number, now: number, maxWaitMs: number, marginMs: number = RESET_MARGIN_MS, part: number = 1): BudgetStep {
+export function budgetStep(
+  read: RateLimitRead,
+  need: number,
+  now: number,
+  maxWaitMs: number,
+  marginMs: number = RESET_MARGIN_MS,
+  part: number = 1,
+  trainUsed: number | null = null,
+): BudgetStep {
   if (need <= 0) return { action: "go" };
   const reserve = reserveOf(read.limit, part);
-  if (read.remaining - reserve >= Math.min(need, read.limit - reserve)) return { action: "go" };
+  if (freeOf(read, reserve, trainUsed) >= Math.min(need, read.limit - reserve)) return { action: "go" };
   const untilReset = Math.max(0, Date.parse(read.reset) - now);
   return untilReset <= maxWaitMs ? { action: "wait", ms: untilReset + marginMs } : { action: "stop", ms: untilReset };
 }
@@ -150,6 +258,11 @@ export interface GateOptions {
    * limit. With a need of 0, the gate keeps no reserve.
    */
   part?: number;
+  /**
+   * The windows of the requests that the runs before this run sent with the token of the gate (state.ts). With them,
+   * only the use of the train counts against its part ({@link freeOf}). Absent: each used request counts against it.
+   */
+  spent?: readonly SpentWindow[];
   /** This function reads the rate limit. A failed read gives null. */
   read: () => Promise<RateLimitRead | null>;
   /**
@@ -221,12 +334,16 @@ export async function budgetGate(o: GateOptions): Promise<GateResult> {
   const part = o.part ?? 1;
   const reserve = o.need > 0 ? reserveOf(basis.limit, part) : 0;
   const need = Math.min(o.need, basis.limit - reserve);
-  const step = budgetStep(basis, o.need, now(), o.maxWaitMs, o.marginMs, part);
-  const base = { need, left: basis.remaining, reserve, reset: basis.reset };
+  const prior = o.need > 0 ? priorUse(o.spent, basis) : null;
+  const step = budgetStep(basis, o.need, now(), o.maxWaitMs, o.marginMs, part, prior);
+  const base = { need, left: basis.remaining, reserve, ...(prior !== null ? { prior } : {}), reset: basis.reset };
+  const others = prior === null ? 0 : Math.max(0, basis.used - prior);
   const short =
-    reserve > 0
-      ? `Rate budget: ${basis.remaining} requests are left, ${reserve} of them stay for the other users of the token (the train uses the part ${part} of the limit of ${basis.limit}), and a run needs ${need}.`
-      : `Rate budget: ${basis.remaining} requests are left, and a run needs ${need}.`;
+    reserve > 0 && prior !== null
+      ? `Rate budget: ${basis.remaining} requests are left. The runs before this run used ${prior} requests of this window, and the other users of the token used ${others}. The train uses the part ${part} of the limit of ${basis.limit}, so ${Math.max(0, freeOf(basis, reserve, prior))} requests are left to the train, and a run needs ${need}.`
+      : reserve > 0
+        ? `Rate budget: ${basis.remaining} requests are left, ${reserve} of them stay for the other users of the token (the train uses the part ${part} of the limit of ${basis.limit}), and a run needs ${need}.`
+        : `Rate budget: ${basis.remaining} requests are left, and a run needs ${need}.`;
   if (step.action === "go") return { read: first, record: { ...base, outcome: "go", waitedMs: 0, note: `${short} The run goes on.` } };
   if (step.action === "stop") {
     const note = `${short} The reset at ${basis.reset} is ${minutes(step.ms)} minutes away, after the longest wait of ${minutes(o.maxWaitMs)} minutes. The run stops, and a later run does the work.`;
@@ -265,6 +382,14 @@ export interface GuardOptions {
    * its share. Thus the part is a ceiling of the train in each window. A token with no share keeps no reserve.
    */
   part?: number;
+  /**
+   * The windows of the requests that the runs before this run sent with the token `home` (state.ts). With them, only the
+   * use of the train counts against its part for that token ({@link freeOf}). That use is the runs before and each
+   * request that the guard sent with the token. Absent: each used request counts against the part, for each token.
+   */
+  spent?: readonly SpentWindow[];
+  /** The credential of the token of `spent` (`credentialOf` of meter.ts). The default is "": no token. */
+  home?: string;
   /** The longest wait for the reset, in milliseconds. */
   maxWaitMs: number;
   /** True when the run waited one time already, at the gate of its start. Then each shortage stops the run. */
@@ -383,10 +508,19 @@ export function rateGuard(inner: FetchFn, o: GuardOptions): RateGuard {
     const share = Math.min(1, Math.max(0, o.share?.(credential) ?? 1));
     const need = Math.ceil(o.need * share);
     const reserve = need > 0 ? reserveOf(live.limit, o.part ?? 1) : 0;
-    const want = Math.max(1, Math.min(need, live.limit - reserve) - (sentBy.get(credential) ?? 0));
-    if (live.remaining - reserve >= want) return;
+    const sent = sentBy.get(credential) ?? 0;
+    const want = Math.max(1, Math.min(need, live.limit - reserve) - sent);
+    const prior = o.spent !== undefined && credential === (o.home ?? "") ? priorUse(o.spent, live) : null;
+    const trainUsed = prior === null ? null : prior + sent;
+    const free = freeOf(live, reserve, trainUsed);
+    if (free >= want) return;
     const many = new Set(o.tracker.windows().map((w) => w.token)).size > 1;
-    const kept = reserve > 0 ? `, ${reserve} of them stay for the other users of the token` : "";
+    const kept =
+      reserve > 0 && trainUsed !== null
+        ? `, ${Math.max(0, free)} of them are left to the train`
+        : reserve > 0
+          ? `, ${reserve} of them stay for the other users of the token`
+          : "";
     const cause = many
       ? `Rate guard: ${live.remaining} requests of token ${o.tracker.token(credential)} are left until ${live.reset}${kept}, and its share of the run needs ${want} more.`
       : `Rate guard: ${live.remaining} requests are left until ${live.reset}${kept}, and the run needs ${want} more.`;

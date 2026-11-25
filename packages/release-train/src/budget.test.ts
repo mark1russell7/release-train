@@ -1,7 +1,28 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { addCost, budgetGate, budgetStep, COST_RUNS, DEFAULT_NEED, DEFAULT_PART, goOnUrgent, guardLine, MIN_COST_RUNS, needOfRuns, RESET_MARGIN_MS, RETRY_MARGIN_MS, rateGuard, reserveOf } from "./budget.ts";
+import {
+  addCost,
+  addSpent,
+  budgetGate,
+  budgetStep,
+  COST_RUNS,
+  DEFAULT_NEED,
+  DEFAULT_PART,
+  freeOf,
+  goOnUrgent,
+  guardLine,
+  MIN_COST_RUNS,
+  needOfRuns,
+  priorUse,
+  RESET_MARGIN_MS,
+  RETRY_MARGIN_MS,
+  rateGuard,
+  reserveOf,
+  SPENT_MAX,
+  spentOfSamples,
+  type SpentWindow,
+} from "./budget.ts";
 import type { FetchFn } from "./collect.ts";
 import type { RateLimitRead } from "./github.ts";
 import { credentialOf, RateStop, rateTracker, requestMeter } from "./meter.ts";
@@ -94,6 +115,88 @@ describe("the part of the limit that the train uses", () => {
     expect(budgetStep(readOf(limit, 55, limit), 2700, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5)).toEqual({ action: "go" });
     expect(budgetStep(readOf(limit - 2700, 40, limit), 2700, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5)).toEqual({ action: "stop", ms: 40 * MINUTE });
     expect(budgetStep(readOf(limit - 2700, 40, limit), 2700, NOW, MAX_WAIT)).toEqual({ action: "go" });
+  });
+});
+
+/** The reset of a window after the given minutes, in seconds after the epoch, as the state keeps it. */
+const resetS = (resetInMinutes: number): number => Math.floor((NOW + resetInMinutes * MINUTE) / 1000);
+
+describe("the use of the train in a window of the rate limit", () => {
+  it("sums the requests of the runs before in the window of a read, and gives null with no windows", () => {
+    const read = readOf(6554, 40, 10_800);
+    const spent: SpentWindow[] = [
+      { reset: resetS(40) - 30, limit: 10_800, requests: 2000 },
+      { reset: resetS(40) + 2, limit: 10_800, requests: 282 },
+      // Another limit, and a window that is more than 60 s away, are other windows.
+      { reset: resetS(40), limit: 10_200, requests: 900 },
+      { reset: resetS(40) + 61, limit: 10_800, requests: 700 },
+    ];
+    expect(priorUse(spent, read)).toBe(2282);
+    expect(priorUse([], read)).toBe(0);
+    expect(priorUse(undefined, read)).toBeNull();
+  });
+
+  it("counts only the use of the train against its part, and the use of the others against the reserve", () => {
+    const reserve = reserveOf(10_800, 0.5);
+    const read = readOf(6554, 40, 10_800);
+    // No known use: each used request counts against the part, as before.
+    expect(freeOf(read, reserve, null)).toBe(6554 - 5400);
+    // The train used 2,282 and the others 1,964, below the reserve of 5,400: the part has 3,118 left.
+    expect(freeOf(read, reserve, 2282)).toBe(3118);
+    // The others used 8,000, above the reserve: the rest comes out of the part, and only the requests left count.
+    expect(freeOf(readOf(1800, 40, 10_800), reserve, 1000)).toBe(1800);
+    // A use of the train above the used count of the read is the used count.
+    expect(freeOf(readOf(10_000, 40, 10_800), reserve, 5000)).toBe(5400 - 800);
+    // With no reserve, the free requests are the requests left.
+    expect(freeOf(read, 0, 2282)).toBe(6554);
+  });
+
+  it("lets the second run of a window go when the two runs fit in the part (Train 2026-11-24 18:54Z)", async () => {
+    // The run at 18:54Z found 4,246 used of 10,800. The run at 18:39Z used 2,282 of them. A run needs 2,700.
+    const read = readOf(6554, 40, 10_800);
+    const time = fakeTime();
+    const spent = [{ reset: resetS(40), limit: 10_800, requests: 2282 }];
+    const gate = await budgetGate({ need: 2700, part: 0.5, maxWaitMs: MAX_WAIT, spent, read: reads(read).read, now: time.now, sleep: time.sleep });
+    expect(gate.record.outcome).toBe("go");
+    expect(gate.record.prior).toBe(2282);
+    expect(gate.record.note).toBe(
+      "Rate budget: 6554 requests are left. The runs before this run used 2282 requests of this window, and the other users of the token used 1964. The train uses the part 0.5 of the limit of 10800, so 3118 requests are left to the train, and a run needs 2700. The run goes on.",
+    );
+    // With no windows in the state, the gate counts the 4,246 against the part, and the run stops, as on 2026-11-24.
+    const old = await budgetGate({ need: 2700, part: 0.5, maxWaitMs: MAX_WAIT, read: reads(read).read, now: time.now, sleep: time.sleep });
+    expect(old.record.outcome).toBe("stop");
+    expect(old.record.prior).toBeUndefined();
+  });
+
+  it("still holds the part: a run waits when the runs before and its need are above the part", () => {
+    const limit = 10_800;
+    const at = (requests: number) => budgetStep(readOf(limit - requests, 40, limit), 2700, NOW, MAX_WAIT, RESET_MARGIN_MS, 0.5, requests);
+    expect(at(2700)).toEqual({ action: "go" });
+    expect(at(2701)).toEqual({ action: "stop", ms: 40 * MINUTE });
+  });
+
+  it("counts the answers of one token by window, but not a 304, another token or an answer with no remaining count", () => {
+    const s = (reset: number, used: number, status = 200, token = 0, remaining: number | null = 10_800 - used) => ({ at: NOW, reset, used, remaining, status, token });
+    const samples = [s(1000, 1), s(1001, 2), s(1000, 3, 304), s(1000, 4, 200, 1), s(1000, 5, 200, 0, null), s(5000, 1), s(1000, 6, 404)];
+    expect(spentOfSamples(samples, 0)).toEqual([
+      { reset: 1000, limit: 10_800, requests: 3 },
+      { reset: 5000, limit: 10_800, requests: 1 },
+    ]);
+  });
+
+  it("adds the windows of a run to the state, drops the windows that reset, and keeps the last windows", () => {
+    const before: SpentWindow[] = [
+      { reset: resetS(-5), limit: 10_800, requests: 3000 },
+      { reset: resetS(40), limit: 10_800, requests: 2282 },
+    ];
+    expect(addSpent(before, [{ reset: resetS(40) + 1, limit: 10_800, requests: 2400 }, { reset: resetS(100), limit: 10_800, requests: 10 }], NOW)).toEqual([
+      { reset: resetS(40), limit: 10_800, requests: 4682 },
+      { reset: resetS(100), limit: 10_800, requests: 10 },
+    ]);
+    const many = Array.from({ length: SPENT_MAX + 5 }, (_, i) => ({ reset: resetS(10 + i * 2), limit: 10_800, requests: 1 }));
+    const kept = addSpent([], many, NOW);
+    expect(kept).toHaveLength(SPENT_MAX);
+    expect(kept[0]?.reset).toBe(resetS(10 + 5 * 2));
   });
 });
 
@@ -287,7 +390,7 @@ function answers(...list: Response[]): { fetch: FetchFn; count: () => number } {
 }
 
 /** The guard of a run on a meter, with a fake time and a log. */
-function guarded(f: FetchFn, o: { need: number; seed?: RateLimitRead; waited?: boolean; part?: number }) {
+function guarded(f: FetchFn, o: { need: number; seed?: RateLimitRead; waited?: boolean; part?: number; spent?: SpentWindow[] }) {
   const time = fakeTime();
   const lines: string[] = [];
   const meter = requestMeter(f, API, time.now);
@@ -301,6 +404,7 @@ function guarded(f: FetchFn, o: { need: number; seed?: RateLimitRead; waited?: b
     log: (line) => lines.push(line),
     ...(o.waited ? { waited: true } : {}),
     ...(o.part !== undefined ? { part: o.part } : {}),
+    ...(o.spent !== undefined ? { spent: o.spent } : {}),
   });
   return { guard, time, lines, meter };
 }
@@ -320,6 +424,22 @@ describe("rateGuard", () => {
     expect((error as RateStop).message).toContain("5125 of them stay for the other users of the token, and the run needs 1 more.");
     expect(api.count()).toBe(3);
     expect(lines).toHaveLength(1);
+  });
+
+  it("counts the runs before and its own requests against the part, when the state has the windows", async () => {
+    // The reserve of 10,250 at the part 0.5 is 5,125. The runs before used 5,122 of the 5,150 used requests of the window.
+    const spent = [{ reset: resetS(30), limit: LIMIT, requests: 5122 }];
+    const api = answers(answerOf(5151, 30), answerOf(5152, 30), answerOf(5153, 30));
+    const { guard } = guarded(api.fetch, { need: 2, part: 0.5, seed: readOf(LIMIT - 5150, 30, LIMIT), spent });
+    for (let i = 1; i <= 3; i++) expect((await guard.fetch(PULL(i))).status).toBe(200);
+    const error = await rejection(guard.fetch(PULL(4)));
+    expect(error).toBeInstanceOf(RateStop);
+    expect((error as RateStop).message).toContain("5097 requests are left until");
+    expect((error as RateStop).message).toContain(", 0 of them are left to the train, and the run needs 1 more.");
+    expect(api.count()).toBe(3);
+    // With no windows, each used request counts against the part, so the first request stops.
+    const old = guarded(answers().fetch, { need: 2, part: 0.5, seed: readOf(LIMIT - 5150, 30, LIMIT) });
+    expect(await rejection(old.guard.fetch(PULL(1)))).toBeInstanceOf(RateStop);
   });
 
   it("keeps no reserve for a run with no need", async () => {

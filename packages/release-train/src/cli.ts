@@ -9,7 +9,7 @@ import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pen
 
 export { redactName };
 import type { ApplyReport } from "./apply.ts";
-import { addCost, budgetGate, DEFAULT_PART, DEFAULT_WAIT_MINUTES, goOnUrgent, needOfRuns, rateGuard } from "./budget.ts";
+import { addCost, addSpent, budgetGate, DEFAULT_PART, DEFAULT_WAIT_MINUTES, goOnUrgent, needOfRuns, rateGuard, spentOfSamples } from "./budget.ts";
 import { collect, listAccounts, pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { writeDb } from "./db.ts";
@@ -544,9 +544,19 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     // The gate reads the rate limit (GitHub does not count GET /rate_limit). With too few requests left, it waits for the
     // reset on a timer that keeps Node alive, or it gives a stop. Its last read is the read at the start of the run.
     // The read is only the first value of the live budget: the meter adds the headers of each answer to the tracker.
+    // The requests of the runs before this run in each window of the home token. With them, the gate counts only the use of
+    // the train against its part. Thus a second run in a window goes when the two runs fit in the part.
+    const spentBefore = read?.state.spent;
+    // The windows of the state with the requests of this run. Each end of a run with a state file writes them.
+    const spentNow = () => addSpent(spentBefore ?? [], spentOfSamples(meter.samples(), meter.rate.token(authorizationOf(tok))), now());
+    const keepSpent = (): void => {
+      if (o.state !== undefined && read !== null) writeFileSync(o.state, `${JSON.stringify({ ...read.state, spent: spentNow() })}
+`);
+    };
     const gate = await budgetGate({
       need: runNeed.need,
       part: o.ratePart,
+      ...(spentBefore ? { spent: spentBefore } : {}),
       maxWaitMs: o.rateWait * 60_000,
       read: () => readRateLimit(gh0),
       tracker: meter.rate,
@@ -561,7 +571,9 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       urgent = await urgentNames(o, gh0, log);
       if (urgent === null || urgent.length === 0) {
         if (inActions) process.stdout.write(`::notice::${gateRecord.note}\n`);
-        // The state file stays as the cache gave it. The step "Wait for a release" reads the report: it has no version in flight.
+        // The state file keeps its data, with the requests of this run in their windows. The step "Wait for a release" reads
+        // the report: it has no version in flight.
+        keepSpent();
         return finish({
           owner: o.owner,
           at: new Date(now()).toISOString(),
@@ -585,6 +597,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       need: gateRecord.outcome === "urgent" ? 0 : runNeed.need,
       share: (credential) => shareOf(credential),
       part: o.ratePart,
+      ...(spentBefore ? { spent: spentBefore, home } : {}),
       maxWaitMs: o.rateWait * 60_000,
       waited: gateRecord.outcome === "waited",
       log,
@@ -606,8 +619,9 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       guard: guard.record(),
     });
     // A stop of the guard before the plan: the data is not complete, so the run makes no write. As at a stop of the gate,
-    // the state file stays as the cache gave it, and the report has no version in flight.
+    // the state file keeps its data with the requests of this run, and the report has no version in flight.
     const stopEarly = async (stop: RateStop): Promise<number> => {
+      keepSpent();
       if (inActions) process.stdout.write(`::notice::${stop.message}\n`);
       return finish({ owner: o.owner, at: new Date(now()).toISOString(), dryRun: o.dryRun, results: [], inFlight: [], rateLimit: await rateReport() });
     };
@@ -673,7 +687,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       const requests = meter.routes().reduce((sum, r) => sum + r.count - r.notModified, 0);
       const prior = read?.state.costs ?? [];
       const costs = !o.dryRun && o.only === null && !applied ? addCost(prior, requests) : prior;
-      writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen(), costs })}\n`);
+      writeFileSync(o.state, `${JSON.stringify({ version: 1, npm: data.npmTimes ?? {}, seen: starts.seen(), costs, spent: spentNow() })}\n`);
       const c = starts.counts();
       log(`need starts: ${c.npm} from npm, ${c.state} from the state, ${c.sync} sync waits from the state`);
     }
