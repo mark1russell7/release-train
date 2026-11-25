@@ -255,17 +255,6 @@ export function tokenKind(token: string): TokenKind {
  * Another token reads the public repositories. An error of the read throws, because a different list is not a correct answer.
  */
 export async function listRepos(read: PageRead, opts: { owner: string; token: string | null; publicOnly: boolean }): Promise<GhRepo[]> {
-  // A file of a tree, read by the SHA of its blob. The answer of a blob cannot change, so a kept answer of an earlier run is
-  // the answer and the run sends no request for it (kept.ts, pinnedToCommit). The file is also the file of the tree that
-  // the run read, and not of a later commit of the branch.
-  const ghBlob = async (repo: string, sha: string): Promise<string | null> => {
-    const url = `${api}/repos/${slug(repo)}/git/blobs/${sha}`;
-    const res = await gh(url, { headers: ghHeaders("application/vnd.github.raw", accountOf.get(repo) ?? accounts.home) });
-    if (res.status === 404) return null;
-    if (!res.ok) throw failure(res, url);
-    return res.text();
-  };
-
   const paginate = async <T>(first: string): Promise<T[]> => {
     const all: T[] = [];
     let url: string | null = first;
@@ -439,6 +428,17 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
 
   const ghRaw = async (repo: string, path: string, ref: string): Promise<string | null> => {
     const url = `${api}/repos/${slug(repo)}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`;
+    const res = await gh(url, { headers: ghHeaders("application/vnd.github.raw", accountOf.get(repo) ?? accounts.home) });
+    if (res.status === 404) return null;
+    if (!res.ok) throw failure(res, url);
+    return res.text();
+  };
+
+  // A file of a tree, read by the SHA of its blob. The answer of a blob cannot change, so a kept answer of an earlier run is
+  // the answer and the run sends no request for it (kept.ts, pinnedToCommit). The file is also the file of the tree that
+  // the run read, and not of a later commit of the branch.
+  const ghBlob = async (repo: string, sha: string): Promise<string | null> => {
+    const url = `${api}/repos/${slug(repo)}/git/blobs/${sha}`;
     const res = await gh(url, { headers: ghHeaders("application/vnd.github.raw", accountOf.get(repo) ?? accounts.home) });
     if (res.status === 404) return null;
     if (!res.ok) throw failure(res, url);

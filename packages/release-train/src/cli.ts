@@ -517,6 +517,8 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
   let guardStop: ((stop: RateStop) => Promise<number>) | null = null;
   // The kept answers of the run, and if the run was complete. The `finally` block seals them.
   let kept: KeptRun | null = null;
+  // A GET pinned to a commit with a kept answer sends no request (kept.ts, pinnedToCommit). The meter does not see it.
+  let pinnedAnswers = 0;
   let keptComplete = false;
   const keptSecret = process.env["RELEASE_TRAIN_KEPT_KEY"] ?? "";
   try {
@@ -538,8 +540,6 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
         log(kept.note ?? `kept answers: ${kept.opened.length} from the run before`);
       }
     }
-    // A GET pinned to a commit with a kept answer sends no request (kept.ts, pinnedToCommit). The meter does not see it.
-    let pinnedAnswers = 0;
     const keptOrMeter = kept === null ? meter.fetch : keptGitHubFetch(meter.fetch, kept.store, undefined, () => void pinnedAnswers++);
     // This client has no guard. The gate, the urgent names at a stop of the gate and the reads of the rate limit use it.
     const gh0 = gitHub({ token: tok, fetch: meter.fetch });
