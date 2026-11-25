@@ -33,6 +33,14 @@ describe("the state of the train", () => {
     expect(readState(file(JSON.stringify(before))).state.costs).toEqual([]);
     expect(readState(file(JSON.stringify({ ...state, costs: [2600, -1, 2.5, "9", 0, 3000] }))).state.costs).toEqual([2600, 3000]);
     expect(readState(file(JSON.stringify({ ...state, costs: "many" }))).state.costs).toEqual([]);
+    // A state before the field spent has no windows, so the gate counts each used request against the part.
+    expect(readState(file(JSON.stringify(state))).state.spent).toBeUndefined();
+    const spent = [{ reset: 1_800_000_000, limit: 10_800, requests: 2282 }];
+    expect(readState(file(JSON.stringify({ ...state, spent }))).state.spent).toEqual(spent);
+    // A bad window is not a window, and a field that is not a list gives no windows.
+    const bad = [{ reset: 1, limit: 0, requests: 1 }, { reset: 1, limit: 10, requests: -1 }, { reset: "1", limit: 10, requests: 1 }, null, 3];
+    expect(readState(file(JSON.stringify({ ...state, spent: [...bad, ...spent] }))).state.spent).toEqual(spent);
+    expect(readState(file(JSON.stringify({ ...state, spent: "many" }))).state.spent).toBeUndefined();
     for (const [text, part] of [
       [null, "No state file"],
       ["{", "is not JSON"],
