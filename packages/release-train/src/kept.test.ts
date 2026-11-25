@@ -6,7 +6,7 @@ import { keptStore } from "polite-crawler/api";
 import type { Kept } from "polite-crawler/api";
 import { afterEach, describe, expect, it } from "vitest";
 import type { FetchFn } from "./collect.ts";
-import { keptGitHubFetch, keptSecretProblem, openTrainKept, sealTrainKept } from "./kept.ts";
+import { keptGitHubFetch, keptSecretProblem, openTrainKept, pinnedToCommit, sealTrainKept } from "./kept.ts";
 
 const API = "https://api.github.com";
 const FILE = `${API}/repos/acme/widget/contents/package.json`;
@@ -39,7 +39,69 @@ function server(): { fetch: FetchFn; seen: Seen[]; body: { text: string; etag: s
 
 const get = { method: "GET", headers: { accept: "application/vnd.github+json", authorization: "Bearer one" } };
 
+const SHA = "0123456789abcdef0123456789abcdef01234567";
+const SHA2 = "fedcba9876543210fedcba9876543210fedcba98";
+
+describe("pinnedToCommit", () => {
+  it.each([
+    [`${API}/repos/acme/widget/git/blobs/${SHA}`, true],
+    [`${API}/repos/acme/widget/git/trees/${SHA}?recursive=1`, true],
+    [`${API}/repos/acme/widget/commits/${SHA}`, true],
+    [`${API}/repos/acme/widget/compare/${SHA}...${SHA2}`, true],
+    [`${API}/repos/acme/widget/contents/a/package.json?ref=${SHA}`, true],
+    [`${API}/repos/acme/widget/contents/package.json?x=1&ref=${SHA}`, true],
+  ])("%s is pinned", (url, pinned) => expect(pinnedToCommit(url)).toBe(pinned));
+
+  it.each([
+    // A branch, a short SHA or a capital SHA can name another commit later.
+    `${API}/repos/acme/widget/git/trees/main?recursive=1`,
+    `${API}/repos/acme/widget/contents/package.json?ref=main`,
+    `${API}/repos/acme/widget/contents/package.json?ref=${SHA.slice(0, 7)}`,
+    `${API}/repos/acme/widget/contents/package.json?ref=${SHA}x`,
+    `${API}/repos/acme/widget/git/blobs/${SHA.toUpperCase()}`,
+    `${API}/repos/acme/widget/compare/main...${SHA}`,
+    // The status and the check runs of a commit change.
+    `${API}/repos/acme/widget/commits/${SHA}/status`,
+    `${API}/repos/acme/widget/commits/${SHA}/check-runs`,
+    `${API}/repos/acme/widget/pulls/1/files`,
+    // Another host, or a path that is not of a repository.
+    `https://example.test/repos/acme/widget/git/blobs/${SHA}`,
+    // A host whose name starts with the name of the API host.
+    `${API}.example.test/repos/acme/widget/git/blobs/${SHA}`,
+    `${API}/git/blobs/${SHA}`,
+  ])("%s is not pinned", (url) => expect(pinnedToCommit(url)).toBe(false));
+});
+
 describe("keptGitHubFetch", () => {
+  it("gives the kept answer of a pinned URL with no request, and counts it", async () => {
+    const BLOB = `${API}/repos/acme/widget/git/blobs/${SHA}`;
+    const s = server();
+    const pinned: string[] = [];
+    const store = keptStore();
+    const f = keptGitHubFetch(s.fetch, store, API, (url) => pinned.push(url));
+    const first = await f(BLOB, get);
+    expect(first.status).toBe(200);
+    expect(s.seen).toHaveLength(1);
+    expect(pinned).toEqual([]);
+    const second = await f(BLOB, { ...get, headers: { ...get.headers, authorization: "Bearer two" } });
+    expect(s.seen).toHaveLength(1);
+    expect(pinned).toEqual([BLOB]);
+    expect(second.status).toBe(200);
+    expect(await second.text()).toBe(s.body.text);
+    expect(second.headers.get("etag")).toBe('W/"v1"');
+    // The store records the entry as used, so the next seal keeps it.
+    expect(store.used().map(([key]) => key)).toEqual([`application/vnd.github+json ${BLOB}`]);
+  });
+
+  it("sends a request for a pinned URL with no kept answer, and for a pinned URL with another accept header", async () => {
+    const BLOB = `${API}/repos/acme/widget/git/blobs/${SHA}`;
+    const s = server();
+    const f = keptGitHubFetch(s.fetch, keptStore());
+    await f(BLOB, get);
+    await f(BLOB, { ...get, headers: { ...get.headers, accept: "application/vnd.github.raw" } });
+    expect(s.seen).toHaveLength(2);
+  });
+
   it("sends the validator of the kept answer, and a 304 gives the kept body as a 200", async () => {
     const s = server();
     const f = keptGitHubFetch(s.fetch, keptStore());

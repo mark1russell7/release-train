@@ -187,7 +187,12 @@ export interface GhRepo {
 interface TreeEntry {
   path: string;
   type: string;
+  /** The SHA of the object. A fixture can leave it out: then the file is read by the branch. */
+  sha?: string;
 }
+
+/** This function tells if a text is a full SHA of a git object. */
+const fullSha = (sha: string | undefined): sha is string => sha !== undefined && /^[0-9a-f]{40}$/.test(sha);
 
 /** This error holds the HTTP status of a failed request. Its text names the cause of a rate limit, from `rateLimitText`. */
 export class HttpError extends Error {
@@ -429,6 +434,17 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     return res.text();
   };
 
+  // A file of a tree, read by the SHA of its blob. The answer of a blob cannot change, so a kept answer of an earlier run is
+  // the answer and the run sends no request for it (kept.ts, pinnedToCommit). The file is also the file of the tree that
+  // the run read, and not of a later commit of the branch.
+  const ghBlob = async (repo: string, sha: string): Promise<string | null> => {
+    const url = `${api}/repos/${slug(repo)}/git/blobs/${sha}`;
+    const res = await gh(url, { headers: ghHeaders("application/vnd.github.raw", accountOf.get(repo) ?? accounts.home) });
+    if (res.status === 404) return null;
+    if (!res.ok) throw failure(res, url);
+    return res.text();
+  };
+
   const paginate = async <T>(first: string): Promise<T[]> => {
     const all: T[] = [];
     let url: string | null = first;
@@ -450,6 +466,8 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   interface Partial1 {
     snap: RepoSnapshot;
     lockPath: string | null;
+    /** The SHA of the blob of each file of the tree, by path. */
+    blobs: ReadonlyMap<string, string | undefined>;
   }
   const phase1 = await pool(ghRepos, limit, async (r): Promise<Partial1 | null> => {
     const snap: RepoSnapshot = {
@@ -473,16 +491,22 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
       throw e;
     }
     if (tree.truncated) snap.warnings.push("The git tree is too large. GitHub gave only a part of it.");
-    const blobs = new Set(tree.tree.filter((t) => t.type === "blob").map((t) => t.path));
+    const blobs = new Map(tree.tree.filter((t) => t.type === "blob").map((t) => [t.path, t.sha] as const));
+    // Each file of the tree is read by its blob. A file that is not in the tree needs no read.
+    const read = (path: string): Promise<string | null> => {
+      if (!blobs.has(path)) return Promise.resolve(null);
+      const sha = blobs.get(path);
+      return fullSha(sha) ? ghBlob(r.name, sha) : ghRaw(r.name, path, r.default_branch);
+    };
     if (!blobs.has("package.json")) return null;
-    const rootText = await ghRaw(r.name, "package.json", r.default_branch);
+    const rootText = await read("package.json");
     if (rootText === null) return null;
     let root: Manifest;
     try {
       root = JSON.parse(rootText) as Manifest;
     } catch {
       snap.warnings.push("The root package.json is not valid JSON.");
-      return { snap, lockPath: null };
+      return { snap, lockPath: null, blobs };
     }
     snap.manifests.push({ path: "", manifest: root });
     snap.packageManager = typeof root.packageManager === "string" ? root.packageManager : null;
@@ -490,12 +514,12 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
 
     let globs: string[] = manifestWorkspaces(root);
     if (blobs.has("pnpm-workspace.yaml")) {
-      const ws = await ghRaw(r.name, "pnpm-workspace.yaml", r.default_branch);
+      const ws = await read("pnpm-workspace.yaml");
       snap.pnpmWorkspace = ws;
       if (ws) globs = [...globs, ...parsePnpmWorkspace(ws)];
     }
     if (globs.length > 0) {
-      const dirs = [...blobs]
+      const dirs = [...blobs.keys()]
         .filter((p) => p.endsWith("/package.json"))
         .map((p) => p.slice(0, -"/package.json".length));
       const wsDirs = matchWorkspaces(globs, dirs);
@@ -503,7 +527,7 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
       const links = matchWorkspaces(globs, tree.tree.filter((t) => t.type === "commit").map((t) => t.path));
       if (links.length > 0) snap.submodules = links;
       const files = await pool(wsDirs, limit, async (d): Promise<ManifestFile | null> => {
-        const text = await ghRaw(r.name, `${d}/package.json`, r.default_branch);
+        const text = await read(`${d}/package.json`);
         if (text === null) return null;
         try {
           return { path: d, manifest: JSON.parse(text) as Manifest };
@@ -521,8 +545,8 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
     else if (blobs.has("package-lock.json")) [lockKind, lockPath] = ["npm", "package-lock.json"];
     else if (blobs.has("yarn.lock")) lockKind = "yarn";
     snap.lockKind = lockKind;
-    snap.pendingChangesets = [...blobs].filter((b) => b.startsWith(".changeset/") && b.endsWith(".md") && b !== ".changeset/README.md").length;
-    return { snap, lockPath };
+    snap.pendingChangesets = [...blobs.keys()].filter((b) => b.startsWith(".changeset/") && b.endsWith(".md") && b !== ".changeset/README.md").length;
+    return { snap, lockPath, blobs };
   });
   const snaps = phase1.filter((p): p is Partial1 => p !== null);
 
@@ -533,14 +557,15 @@ export async function collect(opts: CollectOptions): Promise<Collected> {
   }
 
   // Phase 2: the lockfiles, only for a repository that depends on a package of the owner.
-  await pool(snaps, limit, async ({ snap, lockPath }) => {
+  await pool(snaps, limit, async ({ snap, lockPath, blobs }) => {
     if (!lockPath) return;
     const used = new Set<string>();
     for (const { manifest: m } of snap.manifests) {
       for (const t of DEP_TYPES) for (const n of Object.keys(m[t] ?? {})) if (owned.has(n)) used.add(n);
     }
     if (used.size === 0) return;
-    const text = await ghRaw(snap.name, lockPath, snap.defaultBranch);
+    const lockSha = blobs.get(lockPath);
+    const text = fullSha(lockSha) ? await ghBlob(snap.name, lockSha) : await ghRaw(snap.name, lockPath, snap.defaultBranch);
     if (text === null) return;
     try {
       snap.resolved =

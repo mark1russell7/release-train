@@ -517,6 +517,8 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
   let guardStop: ((stop: RateStop) => Promise<number>) | null = null;
   // The kept answers of the run, and if the run was complete. The `finally` block seals them.
   let kept: KeptRun | null = null;
+  // A GET pinned to a commit with a kept answer sends no request (kept.ts, pinnedToCommit). The meter does not see it.
+  let pinnedAnswers = 0;
   let keptComplete = false;
   const keptSecret = process.env["RELEASE_TRAIN_KEPT_KEY"] ?? "";
   try {
@@ -538,7 +540,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
         log(kept.note ?? `kept answers: ${kept.opened.length} from the run before`);
       }
     }
-    const keptOrMeter = kept === null ? meter.fetch : keptGitHubFetch(meter.fetch, kept.store);
+    const keptOrMeter = kept === null ? meter.fetch : keptGitHubFetch(meter.fetch, kept.store, undefined, () => void pinnedAnswers++);
     // This client has no guard. The gate, the urgent names at a stop of the gate and the reads of the rate limit use it.
     const gh0 = gitHub({ token: tok, fetch: meter.fetch });
     // The gate reads the rate limit (GitHub does not count GET /rate_limit). With too few requests left, it waits for the
@@ -703,7 +705,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       try {
         const sealed = await sealTrainKept(o.kept, kept, keptSecret, keptComplete);
         const merged = keptComplete ? "" : ", with the entries of the run before";
-        log(`kept answers: sealed ${sealed.entries} entries, ${Math.ceil(sealed.bytes / 1024)} KiB${merged}`);
+        log(`kept answers: sealed ${sealed.entries} entries, ${Math.ceil(sealed.bytes / 1024)} KiB${merged}; ${pinnedAnswers} pinned to a commit with no request`);
       } catch (error) {
         // The next run then opens the file of the cache before, or none. A failed seal does not fail the run.
         log(`kept answers: the seal failed: ${error instanceof Error ? error.message : String(error)}`);
