@@ -39,8 +39,8 @@ async function toResponse(answer: Awaited<ReturnType<FetchLike>>): Promise<Respo
 const SHA = "[0-9a-f]{40}";
 
 /**
- * The GET paths of the API whose answer is fixed by a full commit SHA in the URL. The answer of such a path cannot change, so a
- * kept answer is the answer, and the run sends no request for it, not even a 304. The status and the check runs of a commit
+ * The GET paths of the API whose answer is fixed by a full commit SHA in the URL. The answer of such a path cannot change.
+ * So a kept answer is the answer, and the run sends no request for it, not even a 304. The status and the check runs of a commit
  * change, so they are not here. Each pattern is the path after `/repos/{owner}/{repo}/`.
  */
 const PINNED: readonly RegExp[] = [
