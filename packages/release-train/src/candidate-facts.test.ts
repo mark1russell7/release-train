@@ -142,6 +142,39 @@ describe("candidateReader", () => {
     expect(await main.r.read("surface", target())).toEqual({ surfaceChanged: true, surfaceCut: true });
   });
 
+  describe("a surface read when GitHub cut the list of the default branch", () => {
+    const many = Array.from({ length: COMPARE_FILES_MAX }, (_, i) => ({ filename: `src/f${i}.ts` }));
+    const blob = (path: string, sha: string) => ({ path, mode: "100644", type: "blob", sha });
+    const routes = (mainTree: [number, unknown], mainFiles = many) => ({
+      [`GET ${base}/data-repo/compare/main...sha7`]: (): [number, unknown] => [200, { behind_by: 400, files: [{ filename: "package.json" }, { filename: "pnpm-lock.yaml" }], merge_base_commit: { sha: "mb1" } }],
+      [`GET ${base}/data-repo/compare/mb1...main`]: (): [number, unknown] => [200, { files: mainFiles }],
+      [`GET ${base}/data-repo/git/trees/mb1`]: (): [number, unknown] => [200, { tree: [blob("package.json", "p1"), blob("pnpm-lock.yaml", "l1"), { path: "src", mode: "040000", type: "tree", sha: "s1" }], truncated: false }],
+      [`GET ${base}/data-repo/git/trees/main`]: (): [number, unknown] => mainTree,
+    });
+
+    it("gives no change when the surface files have the same blobs, with 2 reads of the trees", async () => {
+      const { r, calls } = reader(routes([200, { tree: [blob("package.json", "p1"), blob("pnpm-lock.yaml", "l1"), { path: "src", mode: "040000", type: "tree", sha: "s2" }], truncated: false }]));
+      expect(await r.read("surface", target())).toEqual({ surfaceChanged: false });
+      expect(calls.filter((c) => c.includes("/git/trees/"))).toHaveLength(2);
+    });
+
+    it("gives a real change when a surface file has a new blob", async () => {
+      const { r } = reader(routes([200, { tree: [blob("package.json", "p1"), blob("pnpm-lock.yaml", "l2")], truncated: false }]));
+      expect(await r.read("surface", target())).toEqual({ surfaceChanged: true });
+    });
+
+    it("gives a real change with no read of the trees when the part of the list that GitHub gave has a surface file", async () => {
+      const { r, calls } = reader(routes([500, { message: "no" }], [...many.slice(1), { filename: ".npmrc" }]));
+      expect(await r.read("surface", target())).toEqual({ surfaceChanged: true });
+      expect(calls.some((c) => c.includes("/git/trees/"))).toBe(false);
+    });
+
+    it("keeps the cut read when a read of the trees failed or GitHub cut a tree", async () => {
+      expect(await reader(routes([500, { message: "no" }])).r.read("surface", target())).toEqual({ surfaceChanged: true, surfaceCut: true });
+      expect(await reader(routes([200, { tree: [], truncated: true }])).r.read("surface", target())).toEqual({ surfaceChanged: true, surfaceCut: true });
+    });
+  });
+
   it("reads the last push from the head commit of the open pull request", async () => {
     const { r } = reader({ [`GET ${base}/data-repo/commits/sha7`]: () => [200, { commit: { committer: { date: iso(NOW - 3 * H) } } }] });
     expect(await r.read("lastPush", target())).toEqual({ lastPushAt: NOW - 3 * H });

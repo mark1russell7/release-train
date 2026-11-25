@@ -1,6 +1,6 @@
 import { COMPARE_FILES_MAX, ciState, latestRuns } from "./apply.ts";
-import { commitHealth, jobMinutes, surfaceChanged } from "./candidate-policy.ts";
-import type { CandidateCi, CandidateFacts, CandidateNeed, CandidatePolicy, CommitHealth, JobCost, MainHealth, RunHealth } from "./candidate-policy.ts";
+import { commitHealth, jobMinutes, surfaceChanged, surfaceOf, treePathsChanged } from "./candidate-policy.ts";
+import type { CandidateCi, CandidateFacts, CandidateNeed, CandidatePolicy, CommitHealth, JobCost, MainHealth, RunHealth, TreeEntry } from "./candidate-policy.ts";
 import { accountFn, type AccountOf } from "./accounts.ts";
 import type { GhResponse, GitHub } from "./github.ts";
 
@@ -104,6 +104,12 @@ export function candidateReader(gh: GitHub, owner: string | AccountOf, policy: C
     return { behind: res.data.behind_by, files, cut: files.length >= COMPARE_FILES_MAX, mergeBase: res.data.merge_base_commit?.sha ?? null };
   };
 
+  /** One level of a git tree, by a commit, a tree or a branch. Null: the read failed, or GitHub cut the tree. */
+  const treeOf = (repo: string) => async (treeish: string): Promise<readonly TreeEntry[] | null> => {
+    const res = await get<{ tree?: TreeEntry[]; truncated?: boolean }>(`${at(repo)}/git/trees/${encodeURIComponent(treeish)}`);
+    return res.ok && Array.isArray(res.data?.tree) && res.data.truncated !== true ? res.data.tree : null;
+  };
+
   const runsOf = async (repo: string, sha: string): Promise<WorkflowRun[] | null> => {
     const res = await get<{ workflow_runs?: WorkflowRun[] }>(`${at(repo)}/actions/runs?head_sha=${sha}&per_page=100`);
     return res.ok && res.data ? (res.data.workflow_runs ?? []) : null;
@@ -148,7 +154,15 @@ export function candidateReader(gh: GitHub, owner: string | AccountOf, policy: C
       if (!res.ok || !res.data) return { surfaceChanged: true };
       const main = (res.data.files ?? []).map((f) => f.filename);
       const mainCut = main.length >= COMPARE_FILES_MAX;
-      // A cut list counts as a change. The fact surfaceCut lets the reason tell this case from a real change.
+      if (mainCut && !c.cut) {
+        // GitHub cut the list of the default branch, but the surface is known. A surface file in the part of the list
+        // that GitHub gave is a real change. Else the git trees of the merge base and of the default branch tell it.
+        const surface = surfaceOf(c.files);
+        if (surfaceChanged({ files: c.files, cut: false }, { files: main, cut: false })) return { surfaceChanged: true };
+        const changed = await treePathsChanged(treeOf(t.repo), c.mergeBase, t.defaultBranch, surface);
+        if (changed !== null) return { surfaceChanged: changed };
+      }
+      // A cut list with no read of the trees counts as a change. The fact surfaceCut lets the reason tell this case from a real change.
       return { surfaceChanged: surfaceChanged(c, { files: main, cut: mainCut }), ...(c.cut || mainCut ? { surfaceCut: true } : {}) };
     },
     async otherRuns(t) {
