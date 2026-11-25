@@ -705,7 +705,7 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
       try {
         const sealed = await sealTrainKept(o.kept, kept, keptSecret, keptComplete);
         const merged = keptComplete ? "" : ", with the entries of the run before";
-        log(`kept answers: ${pinnedAnswers} pinned to a commit with no request; sealed ${sealed.entries} entries, ${Math.ceil(sealed.bytes / 1024)} KiB${merged}`);
+        log(`kept answers: sealed ${sealed.entries} entries, ${Math.ceil(sealed.bytes / 1024)} KiB${merged}; ${pinnedAnswers} pinned to a commit with no request`);
       } catch (error) {
         // The next run then opens the file of the cache before, or none. A failed seal does not fail the run.
         log(`kept answers: the seal failed: ${error instanceof Error ? error.message : String(error)}`);

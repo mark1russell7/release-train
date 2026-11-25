@@ -232,7 +232,7 @@ describe("the workspace globs of conventions and the copy of release-train 0.2.9
 });
 
 /** The SHA of the blob of a text, as git makes it. */
-const blobSha = (text: string): string => createHash("sha1").update(`blob ${Buffer.byteLength(text)} ${text}`).digest("hex");
+const blobSha = (text: string): string => createHash("sha1").update(`blob ${Buffer.byteLength(text)}\0${text}`).digest("hex");
 
 /**
  * A fetch over fakeFetch whose trees give the SHA of each blob, and that serves each blob by its SHA with its ETag. It
@@ -243,7 +243,7 @@ function blobFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls:
   const texts = new Map(repos.flatMap((r) => Object.values(r.files).map((text) => [blobSha(text), text] as const)));
   return async (url, init) => {
     calls.push(url);
-    const blob = //git/blobs/([0-9a-f]{40})$/.exec(new URL(url).pathname);
+    const blob = /\/git\/blobs\/([0-9a-f]{40})$/.exec(new URL(url).pathname);
     if (blob) {
       const text = texts.get(blob[1] ?? "");
       if (text === undefined) return new Response("", { status: 404 });
@@ -252,7 +252,7 @@ function blobFetch(repos: FakeRepo[], npm: Record<string, string | null>, calls:
       return match ? new Response(null, { status: 304, headers: { etag } }) : new Response(text, { headers: { etag } });
     }
     const res = await inner(url, init);
-    if (!//git/trees//.test(url) || !res.ok) return res;
+    if (!/\/git\/trees\//.test(url) || !res.ok) return res;
     const body = (await res.json()) as { tree: { path: string; type: string; sha?: string }[] };
     const files = repos.find((r) => url.includes(`/${r.name}/`))?.files ?? {};
     for (const e of body.tree) if (e.type === "blob") e.sha = blobSha(files[e.path] ?? "");
