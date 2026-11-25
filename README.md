@@ -366,6 +366,7 @@ The command makes no write. It reports these items:
 | Item | Limit | Meaning |
 |---|---|---|
 | A kept version | 2 days | The source differs from the latest version, and the version number on the default branch is the same. No release starts. |
+| A pending changeset | 2 days | A kept version, and a changeset on the default branch raises it. The release waits for the release workflow of the repository. |
 | A missing release | 2 days | The default branch has a new version, and npm does not have it. |
 | A red train pull request | 1 day | An open pull request of the train has a failed check. |
 
@@ -376,6 +377,7 @@ The `files` list of the package tells which changes count. The source of a packa
 - A `package.json` counts when a field that a user gets changes, as `dependencies` or `exports`. A change of `devDependencies` or `scripts` does not count.
 - The age of a red pull request starts at its first block. A merge closes a train pull request, so a new head does not reset this age.
 - The age starts at the first commit after the release that changes such a file. The command reads at most 60 commits of each package. Then the age shows "over".
+- A changeset raises a package when its front matter names the package, or names a package of the same `fixed` group of `.changeset/config.json`. The row then names the changeset files. A `linked` group does not count, because it raises only the packages that a changeset names. A failed read of the changesets keeps the reason "a kept version". The reason does not change the gate.
 - A row under its limit is in the report too, so a kept version shows on its first day.
 - `--gate` gives the exit code 1 when a row is over its limit with no hold. The workflow `lag.yml` uses this option once each day, so a lag makes the workflow red.
 - `--public-only`, `--json` and `--out <file>` work as in the other commands. Without `--public-only`, the output has private names. So a run without it stays on a local computer.
