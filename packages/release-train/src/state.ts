@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import semver from "semver";
+import type { SpentWindow } from "./budget.ts";
 import type { NpmInfo } from "./types.ts";
 
 /** The publish times of one npm package, with the `modified` time of its npm document at the read. */
@@ -25,6 +26,12 @@ export interface TrainState {
    * that the rate guard did not stop. The need of a run comes from these counts (`needOfRuns` in `budget.ts`).
    */
   costs: number[];
+  /**
+   * The GitHub requests that the runs sent with the home token in each window of its rate limit that has not reset. The
+   * gate counts only these requests against the part of the train (`priorUse` in `budget.ts`). A state before this field
+   * has none: then the gate counts each used request against the part.
+   */
+  spent?: SpentWindow[];
 }
 
 /** This function gives a state with no data. */
@@ -35,6 +42,15 @@ export function emptyState(): TrainState {
 /** This function gives the valid counts of a field `costs`: whole numbers above 0. A state before this field has none. */
 function costsOf(value: unknown): number[] {
   return Array.isArray(value) ? value.filter((n): n is number => Number.isInteger(n) && n > 0) : [];
+}
+
+/** This function gives the valid windows of a field `spent`, or undefined when the field is not a list. */
+function spentOf(value: unknown): SpentWindow[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const whole = (n: unknown): n is number => Number.isInteger(n) && (n as number) >= 0;
+  return value
+    .filter((w): w is SpentWindow => typeof w === "object" && w !== null && whole(w.reset) && whole(w.limit) && whole(w.requests) && w.limit > 0)
+    .map((w) => ({ reset: w.reset, limit: w.limit, requests: w.requests }));
 }
 
 /**
@@ -53,7 +69,8 @@ export function readState(file: string): { state: TrainState; note: string | nul
     if (data.version !== 1 || typeof data.npm !== "object" || data.npm === null || typeof data.seen !== "object" || data.seen === null) {
       return { state: emptyState(), note: `The state file ${file} has an unknown format: this run starts the state again.` };
     }
-    return { state: { version: 1, npm: data.npm, seen: data.seen, costs: costsOf(data.costs) }, note: null };
+    const spent = spentOf(data.spent);
+    return { state: { version: 1, npm: data.npm, seen: data.seen, costs: costsOf(data.costs), ...(spent ? { spent } : {}) }, note: null };
   } catch {
     return { state: emptyState(), note: `The state file ${file} is not JSON: this run starts the state again.` };
   }

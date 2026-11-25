@@ -4,6 +4,7 @@ import type { FetchFn } from "./collect.ts";
 import type { GitHub } from "./github.ts";
 import { matchWorkspaces, parsePnpmWorkspace } from "./parse.ts";
 import { escapeRegExp as escapeRe } from "@mark1russell7/text";
+import { addSummaryJob, hasSummaryJob, securityCallers, startsOnPullRequest, SUMMARY_GATES, withOneJob } from "@mark1russell7/conventions";
 import { SITE_CONFIG_PATH } from "@mark1russell7/site-pages/config";
 import { moveSiteConfig, type WorkflowText } from "./site-config.ts";
 import { assignDays, configDay, pullRequestJobs, PRESET_DAY, renovateSchedule, usesSharedPreset, withSchedule, type DayInput, type RenovateConfig, type RenovateDay } from "./renovate.ts";
@@ -67,6 +68,8 @@ export interface SyncFacts extends RunFacts {
   account?: string | undefined;
   /** This value is true when a version of the repository is in flight. Then `release.yml` keeps its pins. */
   releaseInFlight: boolean;
+  /** This value is true for a private repository. Absent: the visibility is not known, and a rule for public repositories only changes nothing. */
+  private?: boolean | undefined;
 }
 
 /** The file changes of one rule. A path in `remove` is a file or a folder. */
@@ -666,8 +669,57 @@ const siteConfigRule: SyncRule = {
   },
 };
 
+/** This function tells if the root `package.json` gives the conventions check, with any range. */
+async function hasConventions(files: RepoFiles): Promise<boolean> {
+  const root = (await readJson(files, "package.json"))?.value;
+  return root?.devDependencies?.[CONVENTIONS] !== undefined || root?.dependencies?.[CONVENTIONS] !== undefined;
+}
+
+/**
+ * Rule 8: a public repository with no conventions check gets the summary checks of the rules `summary-job` and
+ * `security-one-job` of conventions. The rule uses the functions of those rules. A workflow that calls the deprecated
+ * `reusable-security.yml` gets one job `Security OK` in its place. A gate workflow (`SUMMARY_GATES`) that starts on a
+ * pull request gets a summary job `<Name> OK` that needs each of its jobs. Then the ruleset of `main` can name only the
+ * summary checks.
+ *
+ * A repository with the conventions check gets the same changes from `conventions fix` at each update of the train. Its
+ * own version of the rules applies there, so this rule leaves it. A private repository has no ruleset that needs the
+ * summary checks. There, each new job adds one more paid minute to each run, so this rule leaves it too.
+ */
+const summaryJobRule: SyncRule = {
+  id: "summary-job",
+  why: "The ruleset of `main` needs only the summary checks (`CI OK`, `Security OK`), so a new job of a gate workflow stops a merge when it fails, with no change to the ruleset.",
+  except: [TEMPLATE_REPO],
+  async check(files, f) {
+    if (f.private !== false || (await hasConventions(files))) return null;
+    const write: Record<string, string> = {};
+    const changes: string[] = [];
+    const needs: string[] = [];
+    for (const path of files.paths.filter((p) => WORKFLOW_FILE.test(p)).sort()) {
+      const text = await files.read(path);
+      if (text === null) continue;
+      if (securityCallers(text).length > 0) {
+        const one = withOneJob(text);
+        if ("text" in one) {
+          write[path] = one.text;
+          changes.push(`\`${path}\` gets one job \`Security OK\` in place of its caller of \`reusable-security.yml\` and its summary job.`);
+        } else needs.push(`\`${path}\` calls \`reusable-security.yml\`. A person must change it to one job \`Security OK\`, because ${one.reason}.`);
+        continue;
+      }
+      if (!SUMMARY_GATES.includes(path.slice(path.lastIndexOf("/") + 1)) || !startsOnPullRequest(text) || hasSummaryJob(text)) continue;
+      const added = addSummaryJob(text, path);
+      if ("text" in added) {
+        write[path] = added.text;
+        changes.push(`\`${path}\` gets a summary job \`<Name> OK\` that needs each of its jobs.`);
+      } else needs.push(`\`${path}\` has no summary job. A person must add one, because ${added.reason}.`);
+    }
+    if (changes.length === 0 && needs.length === 0) return null;
+    return { changes, ...(changes.length > 0 ? { edit: { write } } : {}), ...(needs.length > 0 ? { needs } : {}) };
+  },
+};
+
 /** The sync rules, in the sequence of their application. A later rule reads the files after the changes of the earlier rules. */
-export const SYNC_RULES: readonly SyncRule[] = [pinsRule, releaseScriptsRule, templateCliRule, coverageRule, callersRule, renovateDayRule, siteConfigRule];
+export const SYNC_RULES: readonly SyncRule[] = [pinsRule, releaseScriptsRule, templateCliRule, coverageRule, callersRule, renovateDayRule, siteConfigRule, summaryJobRule];
 
 /** This function gives the file of a `uses:` value for the job count. The file is a local workflow or a shared workflow of the template. */
 function usesReader(files: RepoFiles, f: RunFacts): (uses: string) => Promise<string | null> {

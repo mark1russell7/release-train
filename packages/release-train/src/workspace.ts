@@ -202,6 +202,8 @@ export interface CloneIdentity {
   readonly branch: string;
   /** The commit of the clone. When it is undefined or empty, the environment has no `GITHUB_SHA`, so a tool reads `HEAD`. */
   readonly sha?: string | undefined;
+  /** The event file of the clone (`cloneEvent`). When it is undefined, the environment has no `GITHUB_EVENT_PATH`. */
+  readonly event?: string | undefined;
 }
 
 /**
@@ -221,7 +223,21 @@ export const TRAIN_ONLY_VARIABLES: readonly string[] = [
   "GITHUB_OUTPUT",
   "GITHUB_STATE",
   "GITHUB_STEP_SUMMARY",
+  // The event of the train names the repository of the train and its visibility. A rule of conventions reads the
+  // visibility there, so a private clone was public to it. The clone gets its own event file (`cloneEvent`).
+  "GITHUB_EVENT_PATH",
 ];
+
+/** The event file of a clone, in its `.git` folder: git lists no file there, and the folder of the clone goes after the update. */
+export const CLONE_EVENT_FILE: string = ".git/release-train-event.json";
+
+/**
+ * This function gives the text of the event file of a clone. The scripts read two fields of the event of a run in that
+ * repository: the full name and the visibility of the repository.
+ */
+export function cloneEvent(repository: string, isPrivate: boolean): string {
+  return `${JSON.stringify({ repository: { full_name: repository, private: isPrivate } })}\n`;
+}
 
 /**
  * This function gives the environment of a script of a clone. The repository, the commit, the ref and the folder are those of
@@ -239,6 +255,7 @@ export function cloneEnv(env: Readonly<NodeJS.ProcessEnv>, clone: CloneIdentity)
     GITHUB_REF_TYPE: "branch",
   });
   if (clone.sha !== undefined && clone.sha !== "") e["GITHUB_SHA"] = clone.sha;
+  if (clone.event !== undefined && clone.event !== "") e["GITHUB_EVENT_PATH"] = clone.event;
   return e;
 }
 
@@ -575,9 +592,16 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
   };
 
   /** The environment of a script of the repository has no token. It names the repository, the commit, the branch and the folder of the clone (`cloneEnv`). */
-  const scriptEnv = async (dir: string, repo: string, branch: string): Promise<NodeJS.ProcessEnv> => {
+  // With `isPrivate`, the clone gets an event file with its visibility. Without it, the scripts get no event file, and a
+  // rule that needs the visibility has no read.
+  const scriptEnv = async (dir: string, repo: string, branch: string, isPrivate?: boolean): Promise<NodeJS.ProcessEnv> => {
     const head = await run("git", ["rev-parse", "HEAD"], { cwd: dir, env });
-    return cloneEnv(env, { repository: slug(repo), workspace: dir, branch, sha: head.code === 0 ? head.stdout.trim() : undefined });
+    let event: string | undefined;
+    if (isPrivate !== undefined && existsSync(join(dir, ".git", "HEAD"))) {
+      event = join(dir, CLONE_EVENT_FILE);
+      writeFileSync(event, cloneEvent(slug(repo), isPrivate));
+    }
+    return cloneEnv(env, { repository: slug(repo), workspace: dir, branch, sha: head.code === 0 ? head.stdout.trim() : undefined, event });
   };
 
   /** This function gives the install of one clone: the packages with no install scripts, at most one time. */
@@ -914,7 +938,7 @@ export function gitUpdater(o: GitUpdaterOptions): Updater & SyncUpdater & Versio
 
         // 2. The version script of each package with a new version. A script can change the version of another package of
         // the workspace, so the lockfile gets the new versions.
-        const fixEnv = await scriptEnv(dir, u.repo, ctx.defaultBranch);
+        const fixEnv = await scriptEnv(dir, u.repo, ctx.defaultBranch, u.private);
         const install = installer(dir, u, fixEnv);
         const hooks = await versionScripts(dir, u, bumped, fixEnv, install);
         if (hooks.error !== null) return fail(hooks.error);
