@@ -52,7 +52,9 @@ const PINNED: readonly RegExp[] = [
 
 /** This function tells if the answer of a GET of the API is fixed by a full commit SHA in its URL. */
 export function pinnedToCommit(url: string, apiBase: string = "https://api.github.com"): boolean {
-  const match = /^\/repos\/[^/]+\/[^/]+\/(.+)$/.exec(url.startsWith(apiBase) ? url.slice(apiBase.length) : "");
+  // The prefix ends with "/", so that a host such as "api.github.com.example" does not match.
+  const prefix = `${apiBase}/`;
+  const match = /^repos\/[^/]+\/[^/]+\/(.+)$/.exec(url.startsWith(prefix) ? url.slice(prefix.length) : "");
   return match !== null && PINNED.some((pattern) => pattern.test(match[1] ?? ""));
 }
 

@@ -66,6 +66,8 @@ describe("pinnedToCommit", () => {
     `${API}/repos/acme/widget/pulls/1/files`,
     // Another host, or a path that is not of a repository.
     `https://example.test/repos/acme/widget/git/blobs/${SHA}`,
+    // A host whose name starts with the name of the API host.
+    `${API}.example.test/repos/acme/widget/git/blobs/${SHA}`,
     `${API}/git/blobs/${SHA}`,
   ])("%s is not pinned", (url) => expect(pinnedToCommit(url)).toBe(false));
 });
