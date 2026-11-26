@@ -12,6 +12,7 @@ import { buildGraph } from "./graph.ts";
 import { plan } from "./plan.ts";
 import {
   CLI_COPY_SCRIPT,
+  PERMISSIONS_WAIT,
   SYNC_BRANCH,
   SYNC_KIND,
   WORKFLOWS_WAIT,
@@ -25,6 +26,7 @@ import {
   printWidthOf,
   renovateDays,
   renovateInput,
+  syncBody,
   syncFacts,
   syncFingerprint,
   syncRepo,
@@ -72,6 +74,21 @@ const release = (sha: string) =>
     "",
   ].join("\n");
 const scripts = { "scripts/release/pack.mjs": "x", "scripts/release/tags.mjs": "y" };
+/** A release workflow whose job `version` grants only `contents: write` and `pull-requests: write` to the called workflow. */
+const releaseVersion = (sha: string) =>
+  [
+    "permissions: {}",
+    "jobs:",
+    "  version:",
+    `    uses: ${T}/.github/workflows/reusable-release-version.yml@${sha} # main`,
+    "    permissions:",
+    "      contents: write",
+    "      pull-requests: write",
+    "",
+  ].join("\n");
+/** The called workflow as at template commit 8ad943e (it asks for `actions: write`), or as at c348dc5 (it does not). */
+const calledVersion = (asksActions: boolean) =>
+  ["on:", "  workflow_call:", "jobs:", "  version:", "    runs-on: ubuntu-latest", "    permissions:", "      contents: write", "      pull-requests: write", ...(asksActions ? ["      actions: write"] : []), "    steps:", "      - run: echo", ""].join("\n");
 const rootPkg = (s: Record<string, string>, dev: Record<string, string> = { "a-tool": "^1.0.0", "z-tool": "^1.0.0" }) =>
   `${JSON.stringify({ name: "demo", private: true, scripts: s, devDependencies: dev }, null, 2)}\n`;
 const outcome = (r: Awaited<ReturnType<typeof syncRepo>>, rule: string) => r.outcomes.find((o) => o.rule === rule);
@@ -157,6 +174,35 @@ describe("pins", () => {
       const r = await syncRepo(mem({ ".github/workflows/ci.yml": ci(OLD) }), surfaceFacts(null));
       expect(Object.keys(r.writes)).toEqual([".github/workflows/ci.yml"]);
       expect(await pinsStale(pinsOf(ci(OLD), OWNER), facts())).toBe(true);
+    });
+  });
+
+  describe("the permission gate", () => {
+    const gateFacts = (asksActions: boolean) =>
+      facts({
+        templatePaths: new Set([".github/workflows/reusable-ci.yml", ".github/workflows/reusable-release-version.yml"]),
+        readTemplate: async (p) => (p === ".github/workflows/reusable-release-version.yml" ? calledVersion(asksActions) : p === ".github/workflows/reusable-ci.yml" ? "jobs:\n  ci:\n    runs-on: x\n" : null),
+      });
+
+    it("holds all pins of the repository when a called workflow at the new commit asks for more than its caller grants (8ad943e)", async () => {
+      const files = mem({ ".github/workflows/ci.yml": ci(OLD), ".github/workflows/release.yml": releaseVersion(OLD) });
+      const r = await syncRepo(files, gateFacts(true));
+      expect(r.writes).toEqual({});
+      expect(r.fingerprint).toBe("");
+      const o = outcome(r, "pins");
+      expect(o).toMatchObject({ state: "held", waits: [PERMISSIONS_WAIT] });
+      expect(o?.changes).toHaveLength(2);
+      expect(o?.needs).toHaveLength(1);
+      expect(o?.needs[0]).toContain("`.github/workflows/release.yml` job `version` calls `.github/workflows/reusable-release-version.yml` at `3333333`");
+      expect(o?.needs[0]).toContain("`actions: write` (the caller grants `none`)");
+      expect(syncBody(r)).toContain(PERMISSIONS_WAIT);
+    });
+
+    it("moves the pins when each called job asks only for what its caller grants (c348dc5)", async () => {
+      const files = mem({ ".github/workflows/ci.yml": ci(OLD), ".github/workflows/release.yml": releaseVersion(OLD) });
+      const r = await syncRepo(files, gateFacts(false));
+      expect(Object.keys(r.writes).sort()).toEqual([".github/workflows/ci.yml", ".github/workflows/release.yml"]);
+      expect(outcome(r, "pins")).toMatchObject({ state: "applied", needs: [], waits: [] });
     });
   });
 
@@ -653,6 +699,39 @@ describe("apply with the template sync", () => {
     expect(r.results[0]?.needs?.some((n) => n.includes(WORKFLOWS_WAIT))).toBe(true);
     expect(applySummary(r)).toContain("Template sync: 1 pull requests. Public: demo-repo.");
     expect(applySummary(r)).toContain("Needs a hand (template sync):");
+  });
+
+  it("holds the pins with the cause permissions when a called workflow that it reads from GitHub asks for more than its caller grants", async () => {
+    const run = async (asksActions: boolean) => {
+      const { gh, calls, f } = server(
+        repoRoutes("demo-repo", {
+          [`GET ${base}/demo-repo/git/trees/HEAD`]: () => [200, { tree: [{ path: ".github/workflows/release.yml", type: "blob" }] }],
+          [`GET ${base}/demo-repo/contents/.github/workflows/release.yml`]: () => [200, { content: b64(releaseVersion(OLD)) }],
+          [`GET ${base}/template/commits/main`]: () => [200, { sha: NEW }],
+          [`GET ${base}/template/git/trees/${NEW}`]: () => [200, { tree: [{ path: ".github/workflows/reusable-release-version.yml" }, { path: ".github/workflows/reusable-ci.yml" }] }],
+          [`GET ${base}/template/contents/.github/workflows/reusable-release-version.yml`]: (_b, u) => [200, { content: b64(u.searchParams.get("ref") === NEW ? calledVersion(asksActions) : "jobs: {}\n") }],
+        }),
+      );
+      const facts0 = await syncFacts({ gh, owner: OWNER, fetch: f, registry: "https://registry.example" });
+      if (!facts0) throw new Error("no facts");
+      const up = syncer([]);
+      const r = await apply({ owner: OWNER, plan: onePlan("demo-repo"), gh, updater: noUpdates, dryRun: false, sync: { updater: up, facts: facts0, workflows: "yes" } });
+      return { r, up, calls };
+    };
+    const held = await run(true);
+    expect(held.up.jobs).toEqual([]);
+    expect(held.r.results).toHaveLength(1);
+    expect(held.r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "skipped", pr: null });
+    expect(held.r.results[0]?.detail).toContain(PERMISSIONS_WAIT);
+    expect(held.calls.some((c) => c.path === `${base}/template/contents/.github/workflows/reusable-release-version.yml?ref=${NEW}`)).toBe(true);
+    expect(held.calls.some((c) => c.method !== "GET")).toBe(false);
+    const summary = applySummary(held.r);
+    expect(summary).toContain("Needs a hand (template sync):");
+    expect(summary).toContain("- demo-repo: pins: .github/workflows/release.yml job version calls .github/workflows/reusable-release-version.yml at 3333333. Its job version asks for actions: write (the caller grants none).");
+    // The template without the ask: the pins move, and the sync opens its pull request.
+    const moved = await run(false);
+    expect(moved.up.jobs).toHaveLength(1);
+    expect(moved.r.results[0]).toMatchObject({ kind: SYNC_KIND, state: "opened" });
   });
 
   it("pushes again without the workflow changes when GitHub refuses them, and opens one labeled pull request", async () => {

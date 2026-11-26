@@ -12,6 +12,7 @@ export * from "./github.ts";
 export * from "./workspace.ts";
 export * from "./cli.ts";
 export * from "./sync.ts";
+export * from "./permissions.ts";
 export * from "./renovate.ts";
 export * from "./tags.ts";
 export * from "./holds.ts";

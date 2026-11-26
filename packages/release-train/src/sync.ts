@@ -6,6 +6,7 @@ import { matchWorkspaces, parsePnpmWorkspace } from "./parse.ts";
 import { escapeRegExp as escapeRe } from "@mark1russell7/text";
 import { addSummaryJob, hasSummaryJob, securityCallers, startsOnPullRequest, SUMMARY_GATES, withOneJob } from "@mark1russell7/conventions";
 import { SITE_CONFIG_PATH } from "@mark1russell7/site-pages/config";
+import { gapLine, workflowGaps, type ReadAt } from "./permissions.ts";
 import { moveSiteConfig, type WorkflowText } from "./site-config.ts";
 import { assignDays, configDay, pullRequestJobs, PRESET_DAY, renovateSchedule, usesSharedPreset, withSchedule, type DayInput, type RenovateConfig, type RenovateDay } from "./renovate.ts";
 
@@ -24,6 +25,11 @@ export const TEMPLATE_REPO = "template";
 export const RELEASE_SCRIPTS_COMMIT = "29ea70d75aee6c1a170c7324509c21eead9f52a1";
 /** The text of a rule that waits because the GitHub App cannot change workflow files. */
 export const WORKFLOWS_WAIT = "The change waits for the Workflows permission of the App.";
+/**
+ * The text of the rule `pins` when the permission gate holds the pins (`permissions.ts`). Then a called workflow at the new
+ * commit asks for more permissions than its caller job grants.
+ */
+export const PERMISSIONS_WAIT = "The pins wait: a called workflow of the template at the new commit asks for more permissions than its caller job grants.";
 /** The root script of a repository with a copy of the template CLI in `packages/cli/`. */
 export const CLI_COPY_SCRIPT = "tsx packages/cli/src/index.ts package";
 
@@ -54,6 +60,11 @@ export interface RunFacts {
   changedSince?(sha: string): Promise<string[] | null>;
   /** This function reads a file of the template at `templateSha`, or gives null. Without it, each old pin moves. */
   readTemplate?(path: string): Promise<string | null>;
+  /**
+   * This function reads a file of the template at a commit, or gives null. The permission gate reads the nested calls of a
+   * shared workflow with it. Without it, the gate reads only the files at `templateSha`.
+   */
+  readTemplateAt?(path: string, sha: string): Promise<string | null>;
   /**
    * This function gives the Renovate day of a repository for this run, from `renovateDays`, or null. Without it, the rule
    * `renovate-day` changes nothing.
@@ -89,6 +100,8 @@ export interface RuleResult {
   needs?: string[];
   /** The changes that wait for a later run. */
   waits?: string[];
+  /** This value is true when the rule holds its changes for its needs or waits: the outcome is `held`, and no edit applies. */
+  hold?: boolean;
 }
 
 /** One sync rule. A new rule is a new entry of `SYNC_RULES`: the engine has no code for a specific rule. */
@@ -410,7 +423,23 @@ async function references(files: RepoFiles, needles: readonly string[], manifest
 /** The release workflows of a repository: their pins wait while a version is in flight. */
 const RELEASE_FILES = new Set([".github/workflows/release.yml", ".github/workflows/release.yaml"]);
 
-/** Rule 1: each pin of the template moves to the commit of the template on `main`. */
+/**
+ * This function gives the reader of the permission gate: the files of the template at a commit. It gives null when the run
+ * cannot read the template, as `pinsStale` does. Then the gate examines nothing.
+ */
+function templateReader(f: RunFacts): ReadAt | null {
+  const at = f.readTemplateAt;
+  if (at) return (path, sha) => at(path, sha);
+  const read = f.readTemplate;
+  if (!read) return null;
+  return (path, sha) => (sha === f.templateSha ? read(path) : Promise.resolve(null));
+}
+
+/**
+ * Rule 1: each pin of the template moves to the commit of the template on `main`. Before a move, the permission gate reads
+ * each called workflow at the new commit. A called job can ask for a permission that its caller job does not grant.
+ * Then no pin of the repository moves, and the rule is `held`. Each gap is a need with the caller job, the workflow and the scopes.
+ */
 const pinsRule: SyncRule = {
   id: "pins",
   why: "Each workflow uses the shared workflows and actions of the template commit on `main`.",
@@ -427,6 +456,8 @@ const pinsRule: SyncRule = {
     }
     // All pins move together or none moves, so that the pins of one repository stay one commit.
     const stale = await pinsStale([...texts.values()].flatMap((t) => pinsOf(t, f.owner)), f);
+    const gaps: string[] = [];
+    const read = templateReader(f);
     for (const [path, text] of texts) {
       const r = movePins(text, f.owner, f.templateSha, f.templatePaths);
       for (const m of r.missing) needs.push(`\`${path}\` uses \`${m}\` of the template, but the template on \`main\` does not have it.`);
@@ -437,7 +468,10 @@ const pinsRule: SyncRule = {
       }
       write[path] = r.text;
       changes.push(`\`${path}\`: ${r.moved} ${r.moved === 1 ? "pin moves" : "pins move"} to \`${f.templateSha.slice(0, 7)}\` (\`main\`).`);
+      // The permission gate: each called workflow at the new commit asks only for permissions that its caller job grants.
+      if (read) for (const g of await workflowGaps(r.text, f.owner, read, TEMPLATE_REPO)) gaps.push(gapLine(path, g));
     }
+    if (gaps.length > 0) return { changes, needs: [...needs, ...gaps], waits: [...waits, PERMISSIONS_WAIT], hold: true };
     if (changes.length === 0 && needs.length === 0 && waits.length === 0) return null;
     return { changes, edit: { write }, needs, waits };
   },
@@ -805,9 +839,10 @@ async function evaluate(files: RepoFiles, facts: SyncFacts, rules: readonly Sync
     if (rule.except?.includes(facts.repo)) continue;
     const r = await rule.check(overlay, facts);
     if (!r) continue;
-    const hasEdit = r.changes.length > 0 && editPaths(r.edit).length > 0;
+    const hasEdit = r.hold !== true && r.changes.length > 0 && editPaths(r.edit).length > 0;
     const waits = [...(r.waits ?? [])];
-    let state: RuleState = hasEdit ? "applied" : "report";
+    const holds = r.hold === true && r.changes.length > 0;
+    let state: RuleState = hasEdit ? "applied" : holds ? "held" : "report";
     if (hasEdit && !workflows && editPaths(r.edit).some(isWorkflowPath)) {
       state = "held";
       waits.push(WORKFLOWS_WAIT);
@@ -817,7 +852,7 @@ async function evaluate(files: RepoFiles, facts: SyncFacts, rules: readonly Sync
     }
     const needs = r.needs ?? [];
     if (state === "report" && needs.length === 0 && waits.length === 0) continue;
-    outcomes.push({ rule: rule.id, state, changes: hasEdit ? r.changes : [], needs, waits });
+    outcomes.push({ rule: rule.id, state, changes: hasEdit || holds ? r.changes : [], needs, waits });
   }
   return { overlay, install, outcomes };
 }
@@ -1033,7 +1068,8 @@ export async function syncFacts(o: { gh: GitHub; owner: string; fetch?: FetchFn;
   };
   const changedSince = (sha: string): Promise<string[] | null> => changed(sha, templateSha);
   const readTemplate = (path: string): Promise<string | null> => readAt(path, templateSha);
-  return { owner: o.owner, templateSha, templatePaths, cliVersion, contains, changedSince, readTemplate };
+  const readTemplateAt = (path: string, sha: string): Promise<string | null> => readAt(path, sha);
+  return { owner: o.owner, templateSha, templatePaths, cliVersion, contains, changedSince, readTemplate, readTemplateAt };
 }
 
 /** The work of one template sync in a clone of a repository. */
