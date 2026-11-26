@@ -9,7 +9,8 @@ import { apply, applySummary, busyRunners, hashName, MAX_PUSHES, noReadLine, pen
 
 export { redactName };
 import type { ApplyReport } from "./apply.ts";
-import { addCost, addSpent, budgetGate, DEFAULT_PART, DEFAULT_WAIT_MINUTES, goOnUrgent, needOfRuns, rateGuard, spentOfSamples } from "./budget.ts";
+import { addCost, addSpent, budgetGate, DEFAULT_PART, DEFAULT_WAIT_MINUTES, goOnUrgent, needOfRuns,
+  needOfScope, rateGuard, spentOfSamples } from "./budget.ts";
 import { collect, listAccounts, pool } from "./collect.ts";
 import type { FetchFn } from "./collect.ts";
 import { writeDb } from "./db.ts";
@@ -525,8 +526,8 @@ export async function runApply(o: CliOptions, deps: ApplyDeps = {}): Promise<num
     const accounts = accountsOf(o, tok);
     const read = o.state === undefined ? null : readState(o.state);
     if (read?.note) log(read.note);
-    // A fixed --rate-need wins. Else the need comes from the costs of the last full applies in the state.
-    const runNeed = o.rateNeed !== null ? { need: o.rateNeed, note: null } : needOfRuns(read?.state.costs ?? []);
+    // A fixed --rate-need wins. Else the need comes from the costs of the last full applies in the state, scaled to --only.
+    const runNeed = o.rateNeed !== null ? { need: o.rateNeed, note: null } : needOfScope(needOfRuns(read?.state.costs ?? []), o.only?.length ?? null);
     if (runNeed.note !== null) log(runNeed.note);
     // The meter counts each GitHub request of the run by its route. Each part of the run that takes a fetch gets its fetch.
     const meter = requestMeter(deps.fetch);

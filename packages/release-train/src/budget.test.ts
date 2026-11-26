@@ -14,6 +14,9 @@ import {
   guardLine,
   MIN_COST_RUNS,
   needOfRuns,
+  needOfScope,
+  ONLY_BASE_NEED,
+  ONLY_NEED_PER_REPO,
   priorUse,
   RESET_MARGIN_MS,
   RETRY_MARGIN_MS,
@@ -670,5 +673,20 @@ describe("rateGuard on the answers of Train 44205603365", () => {
       "Rate guard: 4928 requests of token 1 are left until 2026-11-18T00:53:04.000Z, and its share of the run needs 4999 more. The reset at 2026-11-18T00:53:04.000Z is 41.8 minutes away, after the longest wait of 20.0 minutes. The run stops at once, and a later run does the work.",
     );
     expect(guard.record().sent).toBe(3);
+  });
+});
+
+describe("the need of a run with --only", () => {
+  const full = { need: DEFAULT_NEED, note: "default" };
+  it("scales with the repositories of the scope, and stays below the hourly limit of a personal token for a small scope", () => {
+    expect(needOfScope(full, 1).need).toBe(ONLY_BASE_NEED + ONLY_NEED_PER_REPO);
+    expect(needOfScope(full, 1).need).toBeLessThan(5000 * 0.5);
+    expect(needOfScope(full, 3).need).toBe(ONLY_BASE_NEED + 3 * ONLY_NEED_PER_REPO);
+    expect(needOfScope(full, 1).note).toMatch(/1 repository of --only/u);
+  });
+  it("is the need of a full apply with no --only, or when the scope costs more than a full apply", () => {
+    expect(needOfScope(full, null)).toBe(full);
+    expect(needOfScope({ need: 1800, note: "runs" }, 82)).toEqual({ need: 1800, note: "runs" });
+    expect(needOfScope(full, 0).need).toBe(ONLY_BASE_NEED);
   });
 });

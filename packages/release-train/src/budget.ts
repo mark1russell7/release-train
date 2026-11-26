@@ -158,6 +158,34 @@ export function needOfRuns(costs: readonly number[]): RunNeed {
   return { need, note: `Rate need: ${need}, from the last ${last.length} full applies: the worst used ${worst} requests, and the spread is ${spread}.` };
 }
 
+/**
+ * The requests of a run with `--only` before it reads a repository. These are the list of the repositories, the npm reads
+ * and the reads of the rate limit. On 2026-11-26, a run with `--only` of one repository used fewer than 400 requests.
+ */
+export const ONLY_BASE_NEED = 300;
+
+/**
+ * The requests of a run with `--only` for each repository in its scope. On 2026-11-26, the worst full apply of the last 20
+ * used 1,575 requests for 82 repositories: approximately 20 for each. `DEFAULT_NEED` gives approximately 73 for each.
+ * This value is above both.
+ */
+export const ONLY_NEED_PER_REPO = 100;
+
+/**
+ * This function gives the need of a run with `--only` of `count` repositories. The need is `ONLY_BASE_NEED` and
+ * `ONLY_NEED_PER_REPO` for each repository, but not more than the need of a full apply. With no `--only` (null), it gives
+ * the need of a full apply.
+ *
+ * On 2026-11-26, a local run with `--only` of one repository had the default need of 6,000. That is more than the hourly
+ * limit of 5,000 of a personal token, so the gate stopped the run before it read the repository.
+ */
+export function needOfScope(full: RunNeed, count: number | null): RunNeed {
+  if (count === null) return full;
+  const scoped = ONLY_BASE_NEED + ONLY_NEED_PER_REPO * Math.max(0, count);
+  if (scoped >= full.need) return full;
+  return { need: scoped, note: `Rate need: ${scoped}, for ${count} ${count === 1 ? "repository" : "repositories"} of --only (${ONLY_BASE_NEED} and ${ONLY_NEED_PER_REPO} for each). A full apply needs ${full.need}.` };
+}
+
 /** This function adds the GitHub requests of one full apply to the costs, and keeps the last `COST_RUNS`. */
 export function addCost(costs: readonly number[], requests: number): number[] {
   return [...costs, requests].slice(-COST_RUNS);
