@@ -19,7 +19,7 @@ import type { Action, ActionItem, Plan } from "./plan.ts";
 import { UPDATE_SCRIPT, type DepType, type LockKind, type RepoHooks } from "./types.ts";
 import { ownScopes } from "./settings.ts";
 import type { FixDone } from "./version-fix.ts";
-import { SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, TEMPLATE_REPO, apiFiles, renovateDays, syncBody, syncNeeds, syncRepo } from "./sync.ts";
+import { PERMISSIONS_WAIT, SYNC_BRANCH, SYNC_KIND, SYNC_RULES, SYNC_TITLE, TEMPLATE_REPO, apiFiles, renovateDays, syncBody, syncNeeds, syncRepo } from "./sync.ts";
 import type { RepoFiles, RunFacts, SyncFacts, SyncPush, SyncResult, SyncRule, SyncUpdater, WorkflowsMode } from "./sync.ts";
 import type { SyncStarts } from "./state.ts";
 
@@ -453,8 +453,9 @@ export interface CandidatePair {
  * `merge-failed`: GitHub refused the merge of a candidate, and no push follows. Only the mode `one-candidate` gives it.
  * `other-commits`: the branch of the open pull request has a commit that the train did not write, or GitHub did not list its commits. Refer to `otherCommits`.
  * `merge-gate`: the change covers a merge gate of the repository, and its commit status is missing, not `success` or old (see `merge-gates.ts`).
+ * `permissions`: the permission gate holds the pins of the template sync. A called workflow at the new commit asks for more permissions than its caller job grants (see `permissions.ts`).
  */
-export type HeldCause = "limit" | "busy" | "young" | "release-run" | "release-check" | "skip" | "error" | "merge-failed" | "other-commits" | "merge-gate";
+export type HeldCause = "limit" | "busy" | "young" | "release-run" | "release-check" | "skip" | "error" | "merge-failed" | "other-commits" | "merge-gate" | "permissions";
 
 /**
  * A decision of the candidate rules in a count. `not read`: the run read no fact for the branch. In a held pair, the branch
@@ -2419,13 +2420,18 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
         const applied = (r: SyncResult): string[] => r.outcomes.filter((x) => x.state === "applied").map((x) => x.rule);
         /** This function closes the open sync pull request, or reports the problems of a repository with no change. */
         const nothing = async (r: SyncResult): Promise<void> => {
-          s.starts?.done(repo);
+          // The permission gate holds the pins: the need stays, and the report names the cause. An open pull request with
+          // the old pins closes, so no merge moves the pins to a commit whose runs GitHub refuses.
+          const gated = r.outcomes.some((x) => x.state === "held" && x.waits.includes(PERMISSIONS_WAIT));
+          if (gated) record.cause = "permissions";
+          else s.starts?.done(repo);
           const common = commonOf(r);
           if (existing) {
-            if (!o.dryRun) await closeTrainPr(repo, existing, "the template files of this repository are in sync now", SYNC_BRANCH);
-            result({ ...common, state: "closed", pr: prRef(existing), autoMerge: null, ci: null, detail: `${o.dryRun ? "The run closes this pull request: " : ""}The template files are in sync.` });
+            if (!o.dryRun) await closeTrainPr(repo, existing, gated ? "the permission gate holds the pins of the template" : "the template files of this repository are in sync now", SYNC_BRANCH);
+            const why = gated ? `${PERMISSIONS_WAIT} Refer to the needs.` : "The template files are in sync.";
+            result({ ...common, state: "closed", pr: prRef(existing), autoMerge: null, ci: null, detail: `${o.dryRun ? "The run closes this pull request: " : ""}${why}` });
           } else if (common.needs.length > 0) {
-            result({ ...common, state: "skipped", pr: null, autoMerge: null, ci: null, detail: "No template file changes now." });
+            result({ ...common, state: "skipped", pr: null, autoMerge: null, ci: null, detail: gated ? `No template file changes now. ${PERMISSIONS_WAIT}` : "No template file changes now." });
           }
         };
         if (applied(planned).length === 0) {
