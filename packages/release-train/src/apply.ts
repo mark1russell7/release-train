@@ -1102,8 +1102,8 @@ export function otherCommits(
 
 /**
  * This function tells if the opener of a pull request on a train branch is the train itself: a GitHub App (a bot). The train
- * opens each such pull request, so the commits of that App are commits of the train, also in a run with the token of a person
- * (a local run). The opener of a person is never the train: a person can push to a branch that the person opened.
+ * opens each such pull request. Thus the commits of that App are commits of the train, also in a local run with the token of
+ * a person. The opener of a person is not the train: a person can push to a branch that the person opened.
  */
 export function trainOpener(opener: { login: string; type?: string } | null): opener is { login: string; type?: string } {
   return opener !== null && (opener.type === "Bot" || opener.login.endsWith("[bot]"));
