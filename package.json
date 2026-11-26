@@ -16,6 +16,9 @@
     "check:conventions": "conventions check",
     "check:api": "api-report check"
   },
+  "sitePages": {
+    "bareErrors": "fail"
+  },
   "devDependencies": {
     "@mark1russell7/api-report": "^0.5.3",
     "@mark1russell7/conventions": "^0.53.0",
