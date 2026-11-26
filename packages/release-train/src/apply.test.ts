@@ -24,6 +24,7 @@ import {
   latestRuns,
   longestWaitFirst,
   otherCommits,
+  trainOpener,
   othersText,
   plannedHooks,
   prBody,
@@ -2596,6 +2597,22 @@ describe("a commit of another author on a train branch", () => {
     // GitHub did not list each commit after the default branch, or gave no count.
     expect(otherCommits({ ahead_by: 3, commits: [byTrain("a1")] }, author)).toBeNull();
     expect(otherCommits({ commits: [] }, author)).toBeNull();
+  });
+
+  it("reads the commits of the App that opened the pull request as commits of the train, so a local run and a CI run decide the same", () => {
+    const local = { name: "release-train", email: "release-train@users.noreply.github.com" };
+    const branch = { ahead_by: 2, commits: [byTrain("aaaaaaa1"), byPerson("bbbbbbb2")] };
+    const app = { login: author.name, type: "Bot" };
+    // The CI run has the author of the App. The local run has the default author, and the App opened the pull request.
+    expect(otherCommits(branch, local, app)).toEqual(otherCommits(branch, author, app));
+    expect(otherCommits(branch, local, app)).toEqual(["bbbbbbb by a-person"]);
+    expect(otherCommits({ ahead_by: 1, commits: [byTrain("a1")] }, local, app)).toEqual([]);
+    // With no opener, or a person as opener, the commits of the App stay commits of another author for the local run.
+    expect(otherCommits({ ahead_by: 1, commits: [byTrain("a1")] }, local)).toEqual(["a1 by train-app[bot]"]);
+    expect(otherCommits({ ahead_by: 1, commits: [byPerson("b1")] }, local, { login: "a-person", type: "User" })).toEqual(["b1 by a-person"]);
+    expect(trainOpener({ login: "x[bot]" })).toBe(true);
+    expect(trainOpener({ login: "x", type: "User" })).toBe(false);
+    expect(trainOpener(null)).toBe(false);
   });
 
   it("tells how to keep the commits or let the train build the branch again", () => {

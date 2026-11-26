@@ -737,6 +737,8 @@ interface Pull {
   base: { ref: string };
   labels?: { name: string }[];
   draft?: boolean;
+  /** The author of the pull request. `type` is "Bot" for a GitHub App. */
+  user?: { login: string; type?: string } | null;
 }
 
 interface RepoMeta {
@@ -1084,13 +1086,27 @@ export const OTHERS_MARK = "<!-- release-train:other-commits";
  * a branch with its own user, so such a merge is of the train. The function gives null when the compare does not list each
  * commit after the default branch.
  */
-export function otherCommits(compare: { ahead_by?: number; commits?: readonly CompareCommit[] }, author: { name: string; email: string }): string[] | null {
+export function otherCommits(
+  compare: { ahead_by?: number; commits?: readonly CompareCommit[] },
+  author: { name: string; email: string },
+  opener: { login: string; type?: string } | null = null,
+): string[] | null {
   const listed = compare.commits ?? [];
   if (typeof compare.ahead_by !== "number" || compare.ahead_by > listed.length) return null;
   const email = author.email.toLowerCase();
+  const logins = new Set([author.name, ...(trainOpener(opener) ? [opener.login] : [])]);
   return listed
-    .filter((c) => c.author?.login !== author.name && (c.commit?.author?.email ?? "").toLowerCase() !== email)
+    .filter((c) => !logins.has(c.author?.login ?? "") && (c.commit?.author?.email ?? "").toLowerCase() !== email)
     .map((c) => `${c.sha.slice(0, 7)} by ${c.author?.login ?? c.commit?.author?.name ?? "an unknown author"}`);
+}
+
+/**
+ * This function tells if the opener of a pull request on a train branch is the train itself: a GitHub App (a bot). The train
+ * opens each such pull request, so the commits of that App are commits of the train, also in a run with the token of a person
+ * (a local run). The opener of a person is never the train: a person can push to a branch that the person opened.
+ */
+export function trainOpener(opener: { login: string; type?: string } | null): opener is { login: string; type?: string } {
+  return opener !== null && (opener.type === "Bot" || opener.login.endsWith("[bot]"));
 }
 
 /**
@@ -1747,7 +1763,7 @@ async function applySteps(o: ApplyOptions, sofar: ApplySoFar): Promise<ApplyRepo
   const othersHold = async (repo: string, pr: Pull, defaultBranch: string, mode: CandidateMode): Promise<{ text: string; comment: boolean } | null> => {
     if (!o.author) return null;
     const res = await gh.request<{ ahead_by?: number; commits?: CompareCommit[] }>("GET", `${at(repo)}/compare/${encodeURIComponent(defaultBranch)}...${pr.head.sha}`);
-    const others = res.ok && res.data ? otherCommits(res.data, o.author) : null;
+    const others = res.ok && res.data ? otherCommits(res.data, o.author, pr.user ?? null) : null;
     if (others !== null && others.length === 0) return null;
     return { text: othersText(others, defaultBranch, mode === "one-candidate" ? policy.retryLabel : null), comment: others !== null };
   };
