@@ -177,10 +177,10 @@ importers:
     devDependencies:
       '@mark1russell7/api-report':
         specifier: ^0.5.3
-        version: 0.5.22
+        version: 0.5.24
       '@mark1russell7/conventions':
-        specifier: ^0.54.0
-        version: 0.54.0
+        specifier: ^0.55.2
+        version: 0.55.2
       '@mark1russell7/cue':
         specifier: github:mark1russell7/cue#9005ddbd0aac6d10992f638506b14e16b1eb2de8
         version: https://codeload.github.com/mark1russell7/cue/tar.gz/9005ddbd0aac6d10992f638506b14e16b1eb2de8
@@ -189,7 +189,7 @@ importers:
         version: https://codeload.github.com/mark1russell7/ste-lint/tar.gz/aa06c2c28b1c6b2b2e913443bfdf9fa170524905
       '@mark1russell7/template-cli':
         specifier: ^0.1.0
-        version: 0.1.9
+        version: 0.1.12
       publint:
         specifier: ^0.3.25
         version: 0.3.25
@@ -203,14 +203,14 @@ importers:
   packages/release-train:
     dependencies:
       '@mark1russell7/conventions':
-        specifier: ^0.54.0
-        version: 0.54.0
+        specifier: ^0.55.2
+        version: 0.55.2
       '@mark1russell7/service':
         specifier: ^0.9.0
         version: 0.9.0(@opentelemetry/api@1.10.0)(ws@8.22.1)(zod@4.6.7)
       '@mark1russell7/site-pages':
         specifier: ^0.8.0
-        version: 0.8.7
+        version: 0.8.8
       '@mark1russell7/text':
         specifier: ^0.0.20
         version: 0.0.20
@@ -498,10 +498,14 @@ packages:
       zod:
         optional: true
 
-  '@mark1russell7/api-report@0.5.22':
-    resolution: {integrity: sha512-tqkh8twM0NH+sE4bmYQuzryFokw/7qpzWHbvVjT2cQEipB8E5RjKrIW2cldodY996XZd2CE2Vjd8OMJOz6lYfA==}
+  '@mark1russell7/api-report@0.5.24':
+    resolution: {integrity: sha512-8mMv2Nyhmlux0gWVXZgUD3nzO+XUiZ2ZxXB8hDIzB3py46VWZrTQra8J0GuJf8U+nSzZtoImLwzbVI2kyOB9VQ==}
     engines: {node: '>=22'}
     hasBin: true
+
+  '@mark1russell7/code-shape@0.0.1':
+    resolution: {integrity: sha512-qunnV1QThYsI0rXeOFRgaXpZFFw+ZLLnIG0jYioql5WiYrqCPe+eROgLn4l/cRegXU3Y1t4OEnUfW6izovteFA==}
+    engines: {node: '>=22.13'}
 
   '@mark1russell7/coeval@0.34.0':
     resolution: {integrity: sha512-RBffEYCcXuHYuEWUzQw6ebrT86aCsfp3SGvUiKlZ/cfZE7RVNbWLITtUtnPDorD+radOYxDZNSo3kS1LsqBfkg==}
@@ -514,8 +518,8 @@ packages:
     resolution: {integrity: sha512-s2DyC8i8JhP0Ue6oG+dLUHrjwvUjz+UQrrSIViLkDdU0t+LhLChLrkRpcwr/eof62ffOSPXifLVYuzM7alEEPw==}
     engines: {node: '>=22.12'}
 
-  '@mark1russell7/conventions@0.54.0':
-    resolution: {integrity: sha512-pqdCwKE5ejF5Bf0pYvpbykFpzW8zgBh3MCRmpiOzuXgIYCnoEPAHmPFB316BohXS9HMV6o5OJsjfXJPq+gR+Vw==}
+  '@mark1russell7/conventions@0.55.2':
+    resolution: {integrity: sha512-LUOWcKY2a/7Vs/oHtQQjF/aTcmg8iyb1F8E9omW5tH7SoB0J4W60gyktkj5MWw8kkFZhz6ReykPhCgtVrTynHQ==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -622,8 +626,8 @@ packages:
       zod:
         optional: true
 
-  '@mark1russell7/site-pages@0.8.7':
-    resolution: {integrity: sha512-0U814F6nv69ueZ82B+PKkHH/Y8qapXNTFo2KMchvfqBcEkYh+2eQYAGdPzJANR+xni9HJZVpeC2nu+/lCeaEDQ==}
+  '@mark1russell7/site-pages@0.8.8':
+    resolution: {integrity: sha512-08GVIxJmzOmcPoq6dw9q1xR3tB3VRh0fzyJGyFGeMJqQlyWQLQOp2GWmoskCSEekXsrTkxrGTWuZGQ1JgQg02Q==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -637,8 +641,8 @@ packages:
     engines: {node: '>=22'}
     hasBin: true
 
-  '@mark1russell7/template-cli@0.1.9':
-    resolution: {integrity: sha512-7ebtLlCmT6KYhbpoI2SZHXCQC6/7Rc660SvKwQvfslseSQrXMRlmBj+1/F5KOCep6aB+LtvGWg+HmTKi6uZjyQ==}
+  '@mark1russell7/template-cli@0.1.12':
+    resolution: {integrity: sha512-4156Bu2fW/1/Q8Oe4HmHxwOkiqn20MZmCeYHorWiNGbenNvZkB84JP5OK9ghm4koMyiPgKP0gBQUfj/8k/G0Tg==}
     engines: {node: '>=22.12'}
     hasBin: true
 
@@ -1555,9 +1559,11 @@ snapshots:
     optionalDependencies:
       zod: 4.6.7
 
-  '@mark1russell7/api-report@0.5.22':
+  '@mark1russell7/api-report@0.5.24':
     dependencies:
-      '@mark1russell7/conventions': 0.54.0
+      '@mark1russell7/conventions': 0.55.2
+
+  '@mark1russell7/code-shape@0.0.1': {}
 
   '@mark1russell7/coeval@0.34.0(zod@4.6.7)':
     dependencies:
@@ -1582,8 +1588,9 @@ snapshots:
     transitivePeerDependencies:
       - zod
 
-  '@mark1russell7/conventions@0.54.0':
+  '@mark1russell7/conventions@0.55.2':
     dependencies:
+      '@mark1russell7/code-shape': 0.0.1
       '@mark1russell7/text': 0.0.20
       yaml: 2.9.1
 
@@ -1641,7 +1648,7 @@ snapshots:
       ws: 8.22.1
       zod: 4.6.7
 
-  '@mark1russell7/site-pages@0.8.7':
+  '@mark1russell7/site-pages@0.8.8':
     dependencies:
       '@mark1russell7/rigor-statistics': 0.2.9
 
@@ -1651,7 +1658,7 @@ snapshots:
     dependencies:
       typescript: 6.0.3
 
-  '@mark1russell7/template-cli@0.1.9':
+  '@mark1russell7/template-cli@0.1.12':
     dependencies:
       '@clack/prompts': 1.8.1
 
